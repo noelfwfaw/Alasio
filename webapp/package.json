@@ -1,17 +1,22 @@
 {
   "name": "alasio",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Alasio Electron Application",
   "author": "LmeSzinc",
+  "engines": {
+    "node": "^20.19.0 || >=22.12.0"
+  },
   "main": "dist/main/index.js",
   "scripts": {
     "dev": "vite",
-    "build": "vite build && tsx scripts/csp-inline-hash/fix.ts && tsx scripts/pack-asar.ts",
-    "package": "vite build && tsx scripts/csp-inline-hash/fix.ts && electron-builder && tsx scripts/electron-cleanup.ts",
+    "build": "node scripts/sync-version.mjs && vite build && tsx scripts/csp-inline-hash/fix.ts && tsx scripts/pack-asar.ts",
+    "package": "node scripts/sync-version.mjs && vite build && tsx scripts/csp-inline-hash/fix.ts && electron-builder && tsx scripts/electron-cleanup.ts",
     "preview": "vite preview",
-    "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
+    "prepare": "svelte-kit sync || echo ''",
+    "check": "node scripts/sync-version.mjs --check && svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
     "codegen": "tsx scripts/check-format.ts",
+    "test": "vitest run",
     "i18ngen": "tsx scripts/i18n/cli.ts",
     "fix:lucide": "tsx scripts/lucide-per-icon.ts renderer"
   },
@@ -62,6 +67,7 @@
     "vite": "^8.2.2",
     "vite-plugin-electron": "^1.1.1",
     "vite-plugin-electron-renderer": "^0.14.7",
+    "vitest": "^4.1.11",
     "wait-on": "^8.0.5"
   }
 }

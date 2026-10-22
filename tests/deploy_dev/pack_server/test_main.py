@@ -136,8 +136,8 @@ def fake_gen(calls, fail=()):
     """
     Build a fake of PackRepoGen, the step that generates the packs.
 
-    Every run is recorded as ('gen', config, repo), the packs of a repo whose
-    name is in `fail` raise instead.
+    Every run is recorded as ('gen', config, repo, dep_gen), the packs of a
+    repo whose name is in `fail` raise instead.
 
     Args:
         calls (list): Record of the steps of the test
@@ -148,15 +148,19 @@ def fake_gen(calls, fail=()):
     """
 
     class FakeGen:
-        def __init__(self, repo, config):
+        def __init__(self, repo, config, dep_gen=None):
             self.repo = repo
             self.config = config
+            self.dep_gen = dep_gen
 
         def run(self):
             name = self.config.Repo.Repo
             if name in fail:
                 raise RuntimeError(f'fake failure of the packs of "{name}"')
-            calls.append(('gen', self.config, self.repo))
+            calls.append(('gen', self.config, self.repo, self.dep_gen))
+
+        def commit(self):
+            calls.append(('gen-commit', self.config, self.repo, self.dep_gen))
 
     return FakeGen
 
@@ -165,8 +169,8 @@ def fake_dep_gen(calls, fail=()):
     """
     Build a fake of DepGen, the step that generates the dependency packs.
 
-    Every run is recorded as ('dep', config, repo), the packs of a repo whose
-    name is in `fail` raise instead.
+    Every run is recorded as ('dep', config, repo, self), the packs of a repo
+    whose name is in `fail` raise instead.
 
     Args:
         calls (list): Record of the steps of the test
@@ -185,7 +189,10 @@ def fake_dep_gen(calls, fail=()):
             name = self.config.Repo.Repo
             if name in fail:
                 raise RuntimeError(f'fake failure of the dependency packs of "{name}"')
-            calls.append(('dep', self.config, self.repo))
+            calls.append(('dep', self.config, self.repo, self))
+
+        def commit(self):
+            calls.append(('dep-commit', self.config, self.repo, self))
 
     return FakeDepGen
 
@@ -229,17 +236,36 @@ class TestRunConfig:
         monkeypatch.setattr(main, 'DepGen', fake_dep_gen(calls))
         main.PackServer().run_config(FILE)
 
-        assert [(step, config.Repo.Repo, repo) for step, config, repo in calls] == [
+        assert [(step, config.Repo.Repo, repo) for step, config, repo, *_ in calls] == [
             ('repo', 'AzurLaneAutoScript', 'repo AzurLaneAutoScript'),
-            ('gen', 'AzurLaneAutoScript', 'repo AzurLaneAutoScript'),
             ('dep', 'AzurLaneAutoScript', 'repo AzurLaneAutoScript'),
+            ('gen', 'AzurLaneAutoScript', 'repo AzurLaneAutoScript'),
+            ('gen-commit', 'AzurLaneAutoScript', 'repo AzurLaneAutoScript'),
+            ('dep-commit', 'AzurLaneAutoScript', 'repo AzurLaneAutoScript'),
         ]
         # the generators get the repo object of PackRepo.run and the config
-        # the reader returned, not a copy of it
+        # the reader returned, not a copy of it; the DepGen instance of the
+        # run is handed to PackRepoGen
         assert calls[1][2] == calls[0][2]
         assert calls[1][1] is calls[0][1]
         assert calls[2][2] == calls[0][2]
         assert calls[2][1] is calls[0][1]
+        assert calls[2][3] is calls[1][3]
+        assert calls[3][3] is calls[1][3]
+        assert calls[4][3] is calls[1][3]
+
+    def test_dependency_failure_skips_the_tree(self, fs, run_dir, monkeypatch):
+        """A failed dependency generation stops the config before the tree is published."""
+        make_config(run_dir)
+        calls = []
+        monkeypatch.setattr(main, 'PackRepo', fake_repo(calls))
+        monkeypatch.setattr(main, 'PackRepoGen', fake_gen(calls))
+        monkeypatch.setattr(
+            main, 'DepGen', fake_dep_gen(calls, fail=('AzurLaneAutoScript',)))
+
+        with pytest.raises(RuntimeError, match='dependency packs'):
+            main.PackServer().run_config(FILE)
+        assert [step for step, *_ in calls] == ['repo']
 
     def test_invalid_config(self, fs, run_dir, monkeypatch):
         """A config with an empty value fails in the reader, no step is run."""
@@ -266,12 +292,25 @@ class TestPackServerRun:
         with logger.mock_capture_writer() as capture:
             main.PackServer().run()
 
-        assert [step for step, _, _ in calls] == [
-            'repo', 'gen', 'dep', 'repo', 'gen', 'dep']
-        assert [config.Repo.Repo for _, config, _ in calls] == [
+        assert [step for step, *_ in calls] == [
+            'repo', 'dep', 'gen', 'gen-commit', 'dep-commit',
+            'repo', 'dep', 'gen', 'gen-commit', 'dep-commit']
+        assert [config.Repo.Repo for _, config, *_ in calls] == [
             'AzurLaneAutoScript', 'AzurLaneAutoScript', 'AzurLaneAutoScript',
-            'StarRailCopilot', 'StarRailCopilot', 'StarRailCopilot']
-        assert capture.fd.any_contains('Ran 2 configs: 2 done, 0 failed')
+            'AzurLaneAutoScript', 'AzurLaneAutoScript',
+            'StarRailCopilot', 'StarRailCopilot', 'StarRailCopilot',
+            'StarRailCopilot', 'StarRailCopilot']
+        assert capture.concat() == f"""\
+INFO | Write config {run_dir}/config/template.yaml
+INFO | Running 2 configs of "{run_dir}"
+===================== RUNNING CONFIG "LMESZINC_AZURLANEAUTOSCRIPT_MASTER.YAML" =====================
+INFO | RUNNING CONFIG "LMESZINC_AZURLANEAUTOSCRIPT_MASTER.YAML"
+INFO | Config "LmeSzinc_AzurLaneAutoScript_master.yaml" done
+====================== RUNNING CONFIG "LMESZINC_STARRAILCOPILOT_MASTER.YAML" =======================
+INFO | RUNNING CONFIG "LMESZINC_STARRAILCOPILOT_MASTER.YAML"
+INFO | Config "LmeSzinc_StarRailCopilot_master.yaml" done
+INFO | Ran 2 configs: 2 done, 0 failed
+"""
 
     def test_failed_config_does_not_stop_the_rest(self, fs, run_dir, monkeypatch):
         """A config that fails is skipped, the other configs still run, the run fails at the end."""
@@ -291,13 +330,44 @@ class TestPackServerRun:
         assert [name for name, _ in e.value.errors] == [FILE, OTHER]
         assert all(isinstance(error, RuntimeError) for _, error in e.value.errors)
         assert 'Failed to run 2 configs' in str(e.value)
-        # the repo of the third config is fetched, then its packs fail; the
-        # dependency packs of the first config are generated after its packs
-        assert [(step, config.Repo.Repo) for step, config, _ in calls] == [
-            ('repo', 'Alasio'), ('gen', 'Alasio'), ('dep', 'Alasio'), ('repo', 'StarRailCopilot')]
-        assert capture.fd.any_contains(f'Config "{FILE}" failed')
-        assert capture.fd.any_contains(f'Config "{OTHER}" failed')
-        assert capture.fd.any_contains('Ran 3 configs: 1 done, 2 failed')
+        # the dependency packs are generated before the repo packs; the repo
+        # of the third config is fetched, then its repo packs fail
+        assert [(step, config.Repo.Repo) for step, config, *_ in calls] == [
+            ('repo', 'Alasio'), ('dep', 'Alasio'), ('gen', 'Alasio'),
+            ('gen-commit', 'Alasio'), ('dep-commit', 'Alasio'),
+            ('repo', 'StarRailCopilot'), ('dep', 'StarRailCopilot')]
+        assert capture.concat() == f"""\
+INFO | Write config {run_dir}/config/template.yaml
+INFO | Running 3 configs of "{run_dir}"
+=========================== RUNNING CONFIG "LMESZINC_ALASIO_MASTER.YAML" ===========================
+INFO | RUNNING CONFIG "LMESZINC_ALASIO_MASTER.YAML"
+INFO | Config "LmeSzinc_Alasio_master.yaml" done
+===================== RUNNING CONFIG "LMESZINC_AZURLANEAUTOSCRIPT_MASTER.YAML" =====================
+INFO | RUNNING CONFIG "LMESZINC_AZURLANEAUTOSCRIPT_MASTER.YAML"
+ERROR | Config "LmeSzinc_AzurLaneAutoScript_master.yaml" failed
++------------------------------- Traceback (most recent call last) --------------------------------+
+|   File "in run", line 170                                                                        |
+|                                                                                                  |
+|   File "in run_config", line 127                                                                 |
+|                                                                                                  |
+|   File "in run", line 127                                                                        |
++--------------------------------------------------------------------------------------------------+
+RuntimeError: fake failure of the repo "AzurLaneAutoScript"
+
+====================== RUNNING CONFIG "LMESZINC_STARRAILCOPILOT_MASTER.YAML" =======================
+INFO | RUNNING CONFIG "LMESZINC_STARRAILCOPILOT_MASTER.YAML"
+ERROR | Config "LmeSzinc_StarRailCopilot_master.yaml" failed
++------------------------------- Traceback (most recent call last) --------------------------------+
+|   File "in run", line 170                                                                        |
+|                                                                                                  |
+|   File "in run_config", line 133                                                                 |
+|                                                                                                  |
+|   File "in run", line 159                                                                        |
++--------------------------------------------------------------------------------------------------+
+RuntimeError: fake failure of the packs of "StarRailCopilot"
+
+INFO | Ran 3 configs: 1 done, 2 failed
+"""
 
     def test_no_config(self, fs, run_dir, monkeypatch):
         """A run directory without a config file writes the template and runs nothing."""
@@ -307,8 +377,10 @@ class TestPackServerRun:
         with logger.mock_capture_writer() as capture:
             main.PackServer().run()
         assert calls == []
-        assert capture.fd.any_contains('Write config')
-        assert capture.fd.any_contains('No config file')
+        assert capture.concat() == f"""\
+INFO | Write config {run_dir}/config/template.yaml
+WARNING | No config file in "{run_dir}/config", copy "template.yaml" to a config file and fill it
+"""
         # the operator has the template to copy
         assert join_path(run_dir, 'config', PackRepoConfig.TEMPLATE_FILE).isfile()
 
@@ -321,14 +393,28 @@ class TestPackServerRun:
         monkeypatch.setattr(main, 'DepGen', fake_dep_gen(calls))
         with logger.mock_capture_writer() as capture:
             main.PackServer().run()
-        assert capture.fd.any_contains('Write config')
+        assert capture.concat() == f"""\
+INFO | Write config {run_dir}/config/template.yaml
+INFO | Running 1 config of "{run_dir}"
+===================== RUNNING CONFIG "LMESZINC_AZURLANEAUTOSCRIPT_MASTER.YAML" =====================
+INFO | RUNNING CONFIG "LMESZINC_AZURLANEAUTOSCRIPT_MASTER.YAML"
+INFO | Config "LmeSzinc_AzurLaneAutoScript_master.yaml" done
+INFO | Ran 1 config: 1 done, 0 failed
+"""
         assert join_path(run_dir, 'config', PackRepoConfig.TEMPLATE_FILE).isfile()
         # the second run finds the template up to date
         with logger.mock_capture_writer() as capture:
             main.PackServer().run()
-        assert not capture.fd.any_contains('Write config')
-        assert [step for step, _, _ in calls] == [
-            'repo', 'gen', 'dep', 'repo', 'gen', 'dep']
+        assert capture.concat() == f"""\
+INFO | Running 1 config of "{run_dir}"
+===================== RUNNING CONFIG "LMESZINC_AZURLANEAUTOSCRIPT_MASTER.YAML" =====================
+INFO | RUNNING CONFIG "LMESZINC_AZURLANEAUTOSCRIPT_MASTER.YAML"
+INFO | Config "LmeSzinc_AzurLaneAutoScript_master.yaml" done
+INFO | Ran 1 config: 1 done, 0 failed
+"""
+        assert [step for step, *_ in calls] == [
+            'repo', 'dep', 'gen', 'gen-commit', 'dep-commit',
+            'repo', 'dep', 'gen', 'gen-commit', 'dep-commit']
 
     def test_run_dir_is_a_mod(self, fs, run_dir, monkeypatch):
         """The run refuses a mod directory, like the modules it chains."""
@@ -353,7 +439,7 @@ class TestMain:
         monkeypatch.setattr(sys, 'argv', ['main', '--root', str(run_dir)])
         main.main()
         assert env.PROJECT_ROOT == str(run_dir)
-        assert [step for step, _, _ in calls] == ['repo', 'gen', 'dep']
+        assert [step for step, *_ in calls] == ['repo', 'dep', 'gen', 'gen-commit', 'dep-commit']
 
     def test_main_bad_args(self, fs, run_dir, monkeypatch):
         """An argument that is not known raises SystemExit."""

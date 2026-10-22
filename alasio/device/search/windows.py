@@ -1,4 +1,5 @@
 import os
+import winreg
 
 from alasio.device.search.base import *
 from alasio.device.search.windows_reg import *

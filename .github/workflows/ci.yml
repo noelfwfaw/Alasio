@@ -1,0 +1,439 @@
+name: CI
+
+# speedup (3 jobs) ---> python-tests (3 OS x 7 Python = 21 jobs) ----+
+#                                                                    +---> wheel
+# frontend (1) ------------------------------------------------------+
+# webapp   (1) ------------------------------------------------------+
+#
+# The accelerator libraries are compiled once per platform by the speedup job
+# and handed to the python-tests matrix as speedup-<os>, so the 21 test jobs
+# need no compiler.
+
+on:
+  push:
+    branches: [master]
+    paths-ignore:
+      - 'doc/**'
+      - 'ai-doc/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PYTHONUTF8: "1"
+  PY38DEPS_INDEX: https://py38deps.github.io/py38deps/simple/
+  UV_INDEX_STRATEGY: unsafe-best-match
+
+jobs:
+  speedup:
+    name: speedup / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # the artifact is speedup-<os>: python-tests downloads it with the same
+        # matrix.os value, so the two os lists have to stay identical
+        os:
+          - windows-2022
+          - ubuntu-22.04
+          - macos-15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      # cl.exe is not on PATH in the default shell of the runner, vcvars puts
+      # it there and exports the INCLUDE / LIB of the windows sdk with it
+      - name: MSVC environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - uses: astral-sh/setup-uv@v10.3.0
+        with:
+          version: "0.13.2"
+          python-version: "3.8"
+
+      # the build needs a python and a C compiler, nothing else: alasio is
+      # not installed here, build.py imports the standard library only
+      - name: Build the accelerator libraries
+        run: uv run --no-project --python 3.8 python -m alasio_speedup.build
+
+      # check() loads the library, verifies the abi version it declares and
+      # encodes a tiny input: a compile that produced an unusable library
+      # fails here in seconds instead of at the first pack on the server
+      - name: Verify the libraries load
+        run: |
+          uv run --no-project --python 3.8 python - <<'PY'
+          from alasio_speedup import bit2, pathcomb
+          assert bit2.check(), 'bit2 accelerator is not usable'
+          assert pathcomb.check(), 'pathcomb accelerator is not usable'
+          print('alasio_speedup OK')
+          PY
+
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: speedup-${{ matrix.os }}
+          path: |
+            alasio_speedup/*.dll
+            alasio_speedup/*.so
+            alasio_speedup/*.dylib
+          if-no-files-found: error
+          retention-days: 7
+
+  python-tests:
+    name: py${{ matrix.python }} / ${{ matrix.os }}
+    needs: speedup
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - windows-2022
+          - ubuntu-22.04
+          - macos-15
+        python:
+          - "3.8"
+          - "3.9"
+          - "3.10"
+          - "3.11"
+          - "3.12"
+          - "3.13"
+          - "3.14"
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # tests/git reads historical commit objects, a shallow clone makes
+          # those 12 tests fail with a missing sha1. The repository is small
+          # (a few MB packed), the full history costs nothing to fetch.
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          name: speedup-${{ matrix.os }}
+          path: alasio_speedup
+
+      - uses: astral-sh/setup-uv@v10.3.0
+        with:
+          version: "0.13.2"
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            alasio_speedup/pyproject.toml
+
+      - name: Create venv
+        run: uv venv --python "${{ matrix.python }}" .venv
+
+      # py38deps is the backport index of the low python versions, the two
+      # indexes are merged so a package comes from wherever it exists
+      - name: Install dependencies
+        run: |
+          uv pip install --python .venv \
+            --index-url https://pypi.org/simple \
+            --extra-index-url "$PY38DEPS_INDEX" \
+            --index-strategy unsafe-best-match \
+            -e ".[all]" \
+            ./alasio_speedup
+
+      # alasio.speedup never loads the library of the checkout, only the
+      # installed copy: pip does not ship the *.dll / *.so (package-data holds
+      # the sources only), so the prebuilt library is copied in afterwards.
+      # The copy has to land inside the installed package, the loader looks for
+      # the library next to the C source it belongs to.
+      - name: Install the prebuilt libraries into site-packages
+        shell: bash
+        run: |
+          package=$(uv run --no-project --python .venv python -c 'import sysconfig, os; print(os.path.join(sysconfig.get_paths()["purelib"], "alasio_speedup").replace("\\", "/"))')
+          test -f "$package/__init__.py"
+          shopt -s nullglob
+          libs=(alasio_speedup/*.dll alasio_speedup/*.so alasio_speedup/*.dylib)
+          test "${#libs[@]}" -gt 0
+          cp -v "${libs[@]}" "$package/"
+
+      # the installed copy is the one tests and the backend load, the checkout
+      # copy next to it is a different package and says nothing about the tests
+      - name: Verify the accelerator libraries
+        run: |
+          uv run --no-project --python .venv python - <<'PY'
+          from alasio.speedup import ERRORS, accelerator
+          for name in ('bit2', 'pathcomb'):
+              assert accelerator(name) is not None, f'{name}: {ERRORS.get(name)}'
+          print('alasio_speedup OK')
+          PY
+
+      # A collection error would abort the session and hide every module after it,
+      # the matrix is meant to surface all platform issues in a single run
+      - name: Speedup tests
+        run: |
+          uv run --no-project --python .venv python -m pytest tests_speedup -q \
+            --continue-on-collection-errors
+
+      # faulthandler_timeout dumps the stack of every thread when a single test
+      # hangs, the last progress line only says which file the run reached:
+      # without it a hang leaves no evidence behind.
+      - name: Alasio tests
+        timeout-minutes: 20
+        run: |
+          uv run --no-project --python .venv python -m pytest tests -q \
+            --continue-on-collection-errors \
+            -o faulthandler_timeout=180
+
+  # The floors in pyproject.toml are declarations until something runs against
+  # them. This job installs every direct dependency at the lowest version the
+  # requirements allow and runs the same suite, so a floor that is too low (or
+  # a floor bumped for a feature the code does not use) shows up here instead of
+  # in a user's environment. python 3.8 is the interpreter under test because
+  # the low version floors are about it: everything that dropped 3.8 has to come
+  # from the backport index. One job per operating system, so the floors are
+  # checked against the wheels each platform actually has.
+  minimum:
+    name: minimum / py${{ matrix.python }} / ${{ matrix.os }}
+    needs: speedup
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # the artifact is speedup-<os>, the same list as the speedup job
+        include:
+          - os: windows-2022
+            python: "3.8"
+          - os: ubuntu-22.04
+            python: "3.8"
+          - os: macos-15
+            python: "3.8"
+          # python 3.8 takes starlette and httpx2 from the backport index
+          # (1.6.0 and 2.12.0), so the declared floors 1.2.0 and 2.0.0 are only
+          # reachable on 3.10, the first interpreter with a pypi wheel of the
+          # starlette floor.
+          - os: windows-2022
+            python: "3.10"
+          - os: ubuntu-22.04
+            python: "3.10"
+          - os: macos-15
+            python: "3.10"
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # tests/git reads historical commit objects, a shallow clone makes
+          # those 12 tests fail with a missing sha1
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          name: speedup-${{ matrix.os }}
+          path: alasio_speedup
+
+      - uses: astral-sh/setup-uv@v10.3.0
+        with:
+          version: "0.13.2"
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            alasio_speedup/pyproject.toml
+
+      - name: Create venv
+        run: uv venv --python "${{ matrix.python }}" .venv
+
+      # --resolution lowest-direct takes the lowest version of every declared
+      # dependency. A full --resolution lowest is not usable: it resolves the
+      # transitive requirements at their lowest too, which pulls pre-release era
+      # sdists (sortedcontainers 0.5.0 for trio) that do not build at all. The
+      # backport index supplies what dropped python 3.8, their floors included.
+      - name: Install dependencies at their lowest version
+        run: |
+          uv pip install --python .venv \
+            --resolution lowest-direct \
+            --index-url https://pypi.org/simple \
+            --extra-index-url "$PY38DEPS_INDEX" \
+            --index-strategy unsafe-best-match \
+            -e ".[all]" \
+            ./alasio_speedup
+
+      - name: Install the prebuilt libraries into site-packages
+        shell: bash
+        run: |
+          package=$(uv run --no-project --python .venv python -c 'import sysconfig, os; print(os.path.join(sysconfig.get_paths()["purelib"], "alasio_speedup").replace("\\", "/"))')
+          test -f "$package/__init__.py"
+          shopt -s nullglob
+          libs=(alasio_speedup/*.dll alasio_speedup/*.so alasio_speedup/*.dylib)
+          test "${#libs[@]}" -gt 0
+          cp -v "${libs[@]}" "$package/"
+
+      - name: Verify the accelerator libraries
+        run: |
+          uv run --no-project --python .venv python - <<'PY'
+          from alasio.speedup import ERRORS, accelerator
+          for name in ('bit2', 'pathcomb'):
+              assert accelerator(name) is not None, f'{name}: {ERRORS.get(name)}'
+          print('alasio_speedup OK')
+          PY
+
+      - name: Alasio tests
+        timeout-minutes: 20
+        run: |
+          uv run --no-project --python .venv python -m pytest tests -q \
+            --continue-on-collection-errors \
+            -o faulthandler_timeout=180
+
+      # the log of the run records which versions "minimum" meant for this commit
+      - name: Resolved versions
+        if: always()
+        run: uv pip list --python .venv
+
+  frontend:
+    name: frontend
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: pnpm/action-setup@v6.1.0
+        with:
+          version: "10.33.2"
+
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      # the prepare script runs svelte-kit sync, which builds src/i18ngen
+      - run: pnpm install --frozen-lockfile
+        working-directory: frontend
+
+      - run: pnpm test
+        working-directory: frontend
+
+      - run: pnpm run check
+        working-directory: frontend
+
+      - run: pnpm run build
+        working-directory: frontend
+
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: frontend-build
+          path: frontend/build
+          if-no-files-found: error
+          retention-days: 7
+
+  webapp:
+    name: webapp
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    env:
+      # the ci builds the app.asar with vite and pack-asar, it never runs
+      # electron or electron-builder, the 100MB binary is not needed
+      ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: pnpm/action-setup@v6.1.0
+        with:
+          version: "10.33.2"
+
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: webapp/pnpm-lock.yaml
+
+      - run: pnpm install --frozen-lockfile
+        working-directory: webapp
+
+      - run: pnpm test
+        working-directory: webapp
+
+      - run: pnpm run check
+        working-directory: webapp
+
+      - run: pnpm run build
+        working-directory: webapp
+
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: webapp-dist
+          path: webapp/dist
+          if-no-files-found: error
+          retention-days: 7
+
+  wheel:
+    name: wheel
+    needs: [python-tests, minimum, frontend, webapp]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      # the wheel builder reads the commit objects of .git, not the worktree
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - uses: astral-sh/setup-uv@v10.3.0
+        with:
+          version: "0.13.2"
+          python-version: "3.14"
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            alasio_speedup/pyproject.toml
+
+      - name: Create venv
+        run: uv venv --python 3.14 .venv
+
+      - name: Install pack dependencies
+        run: |
+          uv pip install --python .venv \
+            --index-url https://pypi.org/simple \
+            --extra-index-url "$PY38DEPS_INDEX" \
+            --index-strategy unsafe-best-match \
+            -e ".[pack]"
+
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          name: frontend-build
+          path: frontend/build
+
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          name: webapp-dist
+          path: webapp/dist
+
+      # --require-static fails when frontend/build or webapp/dist is missing,
+      # the builder itself only warns and would produce a wheel without them
+      - name: Build wheel
+        run: |
+          uv run --no-project --python .venv python -m alasio.deploy_dev.wheel build \
+            --root . --folder alasio --require-static
+
+      # verifies RECORD / METADATA / WHEEL, the frontend manifest and files,
+      # the app.asar layout and package.json.main, and the sdist structure
+      - name: Verify wheel
+        run: uv run --no-project --python .venv python -m alasio.deploy_dev.wheel verify dist
+
+      - name: Checksums
+        run: sha256sum dist/*.whl dist/*.tar.gz > dist/SHA256SUMS
+
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: alasio-dist
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30

@@ -11,7 +11,7 @@ import pytest
 
 from alasio.deploy.httpclient.probe_mirrors import RangeUnsupportedError
 from alasio.deploy.pack.decode_base import PackDecodeBase, PackDecodeError
-from alasio.deploy.pack.server_file import LatestInfo, ServerFile
+from alasio.deploy.pack.server_file import LatestInfo, ServerFile, ServerFileWithLatestInfo
 from tests.deploy_dev.pack.conftest import (
     COMMIT, WEBSITE_FULL_PACK, WEBSITE_INDEX_PACK, WEBSITE_SERVER, FakeMirrorTable, make_server_file
 )
@@ -146,8 +146,47 @@ class TestPackRequests:
             await server.get_index_pack(COMMIT)
 
     @pytest.mark.trio
+    async def test_get_full_pack(self):
+        """The whole full pack is fetched with one request without a range
+        header and validated before it is returned."""
+        requests = []
+
+        def handler(request):
+            requests.append(request)
+            return httpx2.Response(200, content=WEBSITE_FULL_PACK)
+
+        server = ServerFile('http://test', client=make_aclient(handler))
+        decoder = await server.get_full_pack(COMMIT)
+        assert bytes(decoder.data) == WEBSITE_FULL_PACK
+        assert str(requests[0].url) == f'http://test/{COMMIT}/full.pack'
+        assert 'Range' not in requests[0].headers
+
+    @pytest.mark.trio
+    async def test_get_full_pack_validated(self):
+        """A pack that does not validate is a failure of the mirror, the
+        PackDecodeError is raised (the probe reselects and retries once)."""
+        def handler(request):
+            return httpx2.Response(200, content=b'not a pack')
+
+        server = ServerFile('http://test', client=make_aclient(handler))
+        with pytest.raises(PackDecodeError):
+            await server.get_full_pack(COMMIT)
+
+    @pytest.mark.trio
+    async def test_get_full_pack_checksum(self):
+        """A pack whose index checksum does not match the advertised one is
+        rejected: a mirror that serves another pack under the same path
+        cannot be used."""
+        def handler(request):
+            return httpx2.Response(200, content=WEBSITE_FULL_PACK)
+
+        server = ServerFile('http://test', client=make_aclient(handler))
+        with pytest.raises(PackDecodeError, match='checksum mismatch'):
+            await server.get_full_pack(COMMIT, checksum='00' * 20)
+
+    @pytest.mark.trio
     async def test_get_update_pack(self):
-        """The update pack url is {new}/from_{old}.pack, the pack is validated
+        """The update pack url is {new}/update_{old}.pack, the pack is validated
         before it is returned."""
         requests = []
 
@@ -158,7 +197,7 @@ class TestPackRequests:
         server = ServerFile('http://test', client=make_aclient(handler))
         with pytest.raises(PackDecodeError):
             await server.get_update_pack('old', 'new')
-        assert str(requests[0].url) == 'http://test/new/from_old.pack'
+        assert str(requests[0].url) == 'http://test/new/update_old.pack'
 
     @pytest.mark.trio
     async def test_get_update_pack_error(self):
@@ -181,7 +220,7 @@ class TestPackRequests:
             client=make_aclient(range_handler(requests, WEBSITE_FULL_PACK)))
         checksum = await server.get_update_pack_checksum('old', 'new', size)
         assert checksum == WEBSITE_FULL_PACK[-20:].hex()
-        assert str(requests[0].url) == 'http://test/new/from_old.pack'
+        assert str(requests[0].url) == 'http://test/new/update_old.pack'
         assert requests[0].headers['Range'] == f'bytes={size - 20}-{size - 1}'
 
 
@@ -323,3 +362,27 @@ class TestRequestTimeout:
             'pool': AsyncHttpClient.PROBE_TIMEOUT,
         }]
         assert AsyncHttpClient.DEFAULT_TIMEOUT.read > AsyncHttpClient.PROBE_TIMEOUT
+
+
+class TestServerFileWithLatestInfo:
+    """The server view whose latest info is a preset snapshot."""
+
+    @pytest.mark.trio
+    async def test_returns_the_snapshot_and_keeps_the_server_state(self):
+        """get_latest_info returns the preset without a request; the copied
+        server state keeps the inherited pack requests working."""
+        info = LatestInfo(version='preset', checksum='11' * 20)
+        server = ServerFileWithLatestInfo.create(server=WEBSITE_SERVER, latest_info=info)
+        assert isinstance(server, ServerFile)
+        assert await server.get_latest_info() is info
+
+        decoder = await server.get_index_pack(COMMIT)
+        assert decoder.data.tobytes() == WEBSITE_INDEX_PACK
+
+    def test_create_validates_the_arguments(self):
+        """The factory refuses a non-server and a missing snapshot."""
+        info = LatestInfo(version='preset', checksum='11' * 20)
+        with pytest.raises(TypeError, match='Expected a ServerFile'):
+            ServerFileWithLatestInfo.create(server=object(), latest_info=info)
+        with pytest.raises(ValueError, match='latest_info'):
+            ServerFileWithLatestInfo.create(server=WEBSITE_SERVER, latest_info=None)

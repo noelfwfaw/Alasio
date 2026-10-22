@@ -264,8 +264,8 @@ def mock_serving_app(server, app):
 
     - the bytes of an update pack the server transfers are counted, see
       MockServerFile.update_bytes;
-    - a full pack fetched without a range request is an error: the client
-      walks the packs of a version with range requests only;
+    - the bytes of a full pack fetched without a range request (the full
+      pack path of a rebuild) are counted, see MockServerFile.full_bytes;
     - the urls of the requests are recorded in order, see
       MockServerFile.requests.
 
@@ -287,8 +287,16 @@ def mock_serving_app(server, app):
         server.requests.append(
             f"{scope['scheme']}://{headers.get(b'host', b'').decode()}{path}")
         if scope['method'] == 'GET' and name == 'full.pack' and b'range' not in headers:
-            raise AssertionError(f'Not a range request of a full pack: {path}')
-        if not name.startswith('from_'):
+            # the whole-pack download of the full pack path: the bytes are
+            # counted for the tests that assert what was transferred
+            async def counting_send(message):
+                if message['type'] == 'http.response.body':
+                    server.full_bytes += len(message.get('body', b''))
+                await send(message)
+
+            await app(scope, receive, counting_send)
+            return
+        if not name.startswith('update_'):
             await app(scope, receive, send)
             return
 
@@ -313,7 +321,7 @@ class MockServerFile(ServerFile):
     register_version() / register_update() keep the packs in memory, the app
     of the instance serves them the way a deployment serves them:
     {base url}/latest.pack, {base url}/{version}/full.pack and
-    {base url}/{new_version}/from_{old_version}.pack (the path of the base url
+    {base url}/{new_version}/update_{old_version}.pack (the path of the base url
     is the mount point, so the channel base of a deployment works as it is).
     The files are served by MockStaticFile, the in-memory static file server
     of the tests: the range requests, the 404s and the headers the client sees
@@ -333,6 +341,8 @@ class MockServerFile(ServerFile):
         update_packs (dict[tuple[str, str], bytes]): {(old, new): update pack}
         update_bytes (int): Bytes of the update packs served, the tests assert
             what was transferred (a body, a range, a digest only)
+        full_bytes (int): Bytes of the full packs served without a range
+            request, the tests assert the whole-pack transfer
         latest_version (str): The latest registered version
         requests (list[str]): Urls of the requests served, in order
         static (MockStaticFile): The static file server of the packs
@@ -350,6 +360,9 @@ class MockServerFile(ServerFile):
         # assert what was transferred, the reuse of a kept pack reads the
         # trailing 20 bytes digest only
         self.update_bytes = 0
+        # bytes of the full packs served without a range request (the whole
+        # pack download of the full pack path): the tests assert the transfer
+        self.full_bytes = 0
         # the latest registered version
         self.latest_version = ''
         # urls of the requests served, in order
@@ -418,7 +431,7 @@ class MockServerFile(ServerFile):
             for version, content in self.full_packs.items()
         }
         packs.update({
-            f'{new_version}/from_{old_version}.pack': content
+            f'{new_version}/update_{old_version}.pack': content
             for (old_version, new_version), content in self.update_packs.items()
         })
         # latest.pack: the version in bytes, then the 20 bytes checksum of the

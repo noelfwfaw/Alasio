@@ -19,14 +19,17 @@ functions too (the client awaits them).
 import os
 
 import httpx2
+import msgspec
 import pytest
+import trio
 
+from alasio.deploy.pack import job_update
 from alasio.deploy.pack.decode_base import PackDecodeBase, PackDecodeError
 from alasio.deploy.pack.job_rebuild import RebuildJob
 from alasio.deploy.pack.job_reset import ResetJob
 from alasio.deploy.pack.job_unpack import UnpackJob
-from alasio.deploy.pack.job_update import UpdateJob
-from alasio.deploy.pack.pack_model import IdxInfo
+from alasio.deploy.pack.job_update import UpdateJob, UpdateRecordError
+from alasio.deploy.pack.pack_model import IdxInfo, RefInfo
 from alasio.deploy_dev.pack.pack_full import PackFull
 from alasio.deploy_dev.pack.pack_update import PackUpdate
 from alasio.ext import env
@@ -147,6 +150,16 @@ UPDATE = b''.join(PackUpdate(
 # version and the old one as the old version, which is what tells an
 # update pack from a full pack
 UPDATE_DECODER = PackDecodeBase(UPDATE)
+# a self-consistent update pack of the right version pair but another new
+# index: its old tree is the scenario one, so its index record applies to the
+# local old index
+WRONG_INDEX_NEW = dict(NEW)
+WRONG_INDEX_NEW['other.txt'] = b'other\n'
+WRONG_INDEX_REPO = make_repo({'old': OLD, 'new': WRONG_INDEX_NEW})
+WRONG_INDEX_UPDATE = b''.join(PackUpdate(
+    PackFull(WRONG_INDEX_REPO, commit='new'), 'old').iter_pack_data())
+WRONG_INDEX_CHECKSUM = PackDecodeBase(
+    b''.join(PackFull(WRONG_INDEX_REPO, commit='new').iter_pack_data())).index_checksum
 SERVER = MockServerFile()
 SERVER.register_version('old', OLD_PACK, bytes(OLD_DECODER.extract_index_pack()))
 SERVER.register_version('new', NEW_PACK, bytes(NEW_DECODER.extract_index_pack()))
@@ -928,6 +941,207 @@ WARNING | Failed to update: 1 file(s) stayed in error, the workspace is kept for
 
 
 # ════════════════════════════════════════════════════════════════════════════
+#  index checksum
+# ════════════════════════════════════════════════════════════════════════════
+
+
+async def prepare_record_check():
+    """
+    A job whose update records are prepared and whose trusted index is ready.
+
+    Returns:
+        UpdateJob: The job, its update pack decoded in unpack()
+    """
+    await setup_app()
+    job = UpdateJob(UPDATE, server=SERVER)
+    await job.tmp_manager_init()
+    job.write()
+    await trio.to_thread.run_sync(job.unpack)
+    await job.download()
+    job.index_checksum = NEW_DECODER.index_checksum
+    return job
+
+
+class TestUpdateRecords:
+    """The update pack records cross-checked against the trusted index."""
+
+    @pytest.mark.trio
+    async def test_a_valid_pack_matches(self, app_folder):
+        """The pack generated from the same old and new versions passes."""
+        job = await prepare_record_check()
+        assert await job._validate_update_records()
+
+    @pytest.mark.trio
+    async def test_a_wrong_file_record_is_refused(self, app_folder):
+        """A new-side record that differs from the trusted index is refused."""
+        job = await prepare_record_check()
+        path = next(
+            path for path, info in job._decoder.fileinfo.items()
+            if path != job.index_rel and info.edit != 2)
+        info = job._decoder.fileinfo[path]
+        job._decoder.fileinfo[path] = msgspec.structs.replace(info, size=info.size + 1)
+        with pytest.raises(UpdateRecordError, match='does not match the trusted index'):
+            await job._validate_update_records()
+
+    @pytest.mark.trio
+    async def test_a_deletion_outside_the_old_index_is_refused(self, app_folder):
+        """A deletion of a file neither the old index nor a previous run owns
+        is refused: an update pack may never delete a user file."""
+        job = await prepare_record_check()
+        job._decoder.fileinfo['user.txt'] = IdxInfo(path='user.txt', edit=2)
+        with pytest.raises(UpdateRecordError, match='not a file of the old index'):
+            await job._validate_update_records()
+
+    @pytest.mark.trio
+    async def test_a_deletion_of_a_trusted_file_is_refused(self, app_folder):
+        """A deletion record for a path the trusted index keeps is refused."""
+        job = await prepare_record_check()
+        path = next(path for path in NEW_DECODER.fileinfo if path != job.index_rel)
+        job._decoder.fileinfo[path] = IdxInfo(path=path, edit=2)
+        with pytest.raises(UpdateRecordError, match='trusted index keeps'):
+            await job._validate_update_records()
+
+    @pytest.mark.trio
+    async def test_a_wrong_refinfo_is_refused(self, app_folder):
+        """The old side of the update must describe the local old index."""
+        job = await prepare_record_check()
+        job._decoder.refinfo['user.txt'] = RefInfo(
+            path='user.txt', size=1, sha1=b'\x01' * 20)
+        with pytest.raises(UpdateRecordError, match='does not match the old index'):
+            await job._validate_update_records()
+
+    @pytest.mark.trio
+    async def test_a_wrong_record_fails_before_replace(self, app_folder):
+        """A record mismatch fails the run, keeps the old tree and discards
+        the workspace of the bad pack."""
+
+        class WrongRecordJob(UpdateJob):
+            """An update whose new-side record is altered after unpacking."""
+
+            def unpack(self):
+                super().unpack()
+                path = next(
+                    path for path, info in self._decoder.fileinfo.items()
+                    if path != self.index_rel and info.edit != 2)
+                info = self._decoder.fileinfo[path]
+                self._decoder.fileinfo[path] = msgspec.structs.replace(
+                    info, size=info.size + 1)
+
+        await setup_app()
+        job = WrongRecordJob(
+            UPDATE, server=SERVER,
+            expected_old_version='old', expected_new_version='new')
+        job.index_checksum = NEW_DECODER.index_checksum
+        with logger.mock_capture_writer() as capture:
+            assert not await job.run()
+        assert capture.fd.any_contains('does not match the trusted index')
+        assert capture.fd.any_contains('discarding the workspace')
+        assert read_tree() == OLD_TREE
+        assert not os.path.exists(env.PROJECT_ROOT / '.pack/workspace')
+
+    @pytest.mark.trio
+    async def test_a_dropped_deletion_is_added_from_the_old_index(self, app_folder):
+        """A pack that forgets a deletion cannot leave an old file behind:
+        _validate_remaining() adds the old index path the trusted index lost."""
+
+        class DroppedDeletionJob(UpdateJob):
+            """An update whose deletion record is removed after unpacking."""
+
+            def unpack(self):
+                super().unpack()
+                path = next(
+                    path for path, info in self._decoder.fileinfo.items()
+                    if info.edit == 2 and path != self.index_rel)
+                self._dropped = path
+                del self._decoder.fileinfo[path]
+                self.pending = [
+                    pending for pending in self.pending
+                    if not (pending.info.edit == 2 and pending.info.path == path)
+                ]
+
+        await setup_app()
+        job = DroppedDeletionJob(
+            UPDATE, server=SERVER,
+            expected_old_version='old', expected_new_version='new')
+        job.index_checksum = NEW_DECODER.index_checksum
+        assert await job.run()
+        assert job._dropped in OLD_TREE
+        assert job._dropped not in NEW_TREE
+        assert job._dropped not in read_tree()
+        assert read_tree() == NEW_TREE
+
+
+class TestIndexChecksum:
+    """The index pack prepared by the update is bound to the trusted one."""
+
+    @pytest.mark.trio
+    async def test_the_validated_index_is_cached(self, app_folder, monkeypatch):
+        """The index is read and validated on the first await only, later
+        awaits return the same decoder."""
+        await setup_app()
+        job = UpdateJob(UPDATE, server=SERVER)
+        await job.tmp_manager_init()
+        job.write()
+        await trio.to_thread.run_sync(job.unpack)
+        await job.download()
+        job.index_checksum = NEW_DECODER.index_checksum
+        reads = []
+        read_bytes = job_update.atomic_read_bytes
+
+        def counting_read_bytes(path, *args, **kwargs):
+            reads.append(path)
+            return read_bytes(path, *args, **kwargs)
+
+        monkeypatch.setattr(job_update, 'atomic_read_bytes', counting_read_bytes)
+        assert reads == []
+        first = await job._get_validated_index
+        assert first.index_checksum == NEW_DECODER.index_checksum
+        assert reads == [job.workspace.joinpath(job.NEW_INDEX)]
+        assert await job._get_validated_index is first
+        assert reads == [job.workspace.joinpath(job.NEW_INDEX)]
+
+    @pytest.mark.trio
+    async def test_another_index_is_refused_before_replace(self, app_folder):
+        """A pack that carries the right version pair but another index fails
+        after preparing the records and before any target file changes."""
+        await setup_app()
+        job = UpdateJob(
+            WRONG_INDEX_UPDATE, server=SERVER,
+            expected_old_version='old', expected_new_version='new')
+        job.index_checksum = NEW_DECODER.index_checksum
+        with logger.mock_capture_writer() as capture:
+            assert not await job.run()
+        assert capture.concat() == f"""\
+INFO | Updating files to "{env.PROJECT_ROOT}"
+WARNING | Failed to update: The update pack produces an index pack with checksum "{WRONG_INDEX_CHECKSUM}", expected "{NEW_DECODER.index_checksum}", discarding the workspace
+"""
+        assert not os.path.exists(env.PROJECT_ROOT / '.pack/workspace')
+        assert read_tree() == OLD_TREE
+        assert file_read_bytes(env.PROJECT_ROOT / '.pack/index.pack') == \
+            bytes(OLD_DECODER.extract_index_pack())
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  expected version pair
+# ════════════════════════════════════════════════════════════════════════════
+
+
+class TestVersionPair:
+    """The version pair the update pack records inside."""
+
+    @pytest.mark.parametrize("old, new, message", [
+        ('other', 'new', 'updates from'),
+        ('old', 'other', 'installs'),
+    ])
+    def test_an_update_pack_of_another_pair_is_rejected(self, old, new, message):
+        """A self-consistent pack of another version pair is refused before
+        any record is prepared."""
+        job = UpdateJob(UPDATE, expected_old_version=old, expected_new_version=new)
+        with pytest.raises(ValueError, match=message):
+            job.unpack()
+
+
+# ════════════════════════════════════════════════════════════════════════════
 #  source repair
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -1214,10 +1428,10 @@ class TestDownload:
             f.write(b'# Website\r\n')
 
         # the copy record is served from the leftover tmp without a
-        # download; the missing readme.md is downloaded by the remaining
-        # check, the first copy is the second download (the leftover was
-        # already claimed as the tmp file of the second copy): one
-        # download less than without the leftover
+        # download; the second copy is downloaded by the update job, the
+        # missing readme.md is repaired by the remaining check from the
+        # content the downloads registered: two downloads less than
+        # without the leftover
         original = SERVER.get_file_data
         calls = []
 
@@ -1234,7 +1448,10 @@ class TestDownload:
         assert file_read_bytes(env.PROJECT_ROOT / 'docs/readme_copy.txt') == b'# Website\r\n'
         # the missing unchanged source is repaired by the remaining check
         assert file_read_bytes(env.PROJECT_ROOT / 'docs/readme.md') == b'# Website\n'
-        assert len(calls) == 2
+        # only the second copy is downloaded: the first copy reads the
+        # leftover, the remaining check reads the content the download
+        # phase registered (see ResetJob._read_available())
+        assert len(calls) == 1
         assert not os.path.exists(env.PROJECT_ROOT / '.pack/workspace')
 
     @pytest.mark.trio
@@ -1348,7 +1565,7 @@ class TestCallerFlow:
     @pytest.mark.trio
     async def test_a_new_flow_converges_a_failed_run(self, app_folder):
         """A flow is always a new one: the job file of a previous run is a
-        record (its records join the deletion base, R19), never a task to
+        record (its records join the deletion base), never a task to
         resume -- a fresh UpdateJob of the same pack converges the tree."""
         await setup_app()
         # the state a failed run leaves: the job file of the update pack
@@ -1388,7 +1605,7 @@ INFO | Update done
 
     def test_failure_keeps_job_file(self, app_folder):
         """job.pack survives a failed run: the next flow takes its records
-        as a deletion base (R19) and its tmp files as a cache."""
+        as a deletion base and its tmp files as a cache."""
         decoder = PackDecodeBase(UPDATE)
         index_end = 5 + len(decoder.index_section)
         bad = bytearray(UPDATE)
@@ -1472,7 +1689,7 @@ async def unpack_intermediate():
 
 
 class TestIntermediateLeftovers:
-    """R19: the files of an intermediate version, recorded by nothing.
+    """The files of an intermediate version, recorded by nothing.
 
     A flow that fails half way applies the files it computed and does not
     commit the local index: a file that only the intermediate version has

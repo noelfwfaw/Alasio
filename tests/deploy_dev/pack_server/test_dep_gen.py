@@ -7,9 +7,8 @@ the wheels of the pinned versions are served by an in-memory PyPI mirror
 come from the memory, no socket is bound. The channel is verified with the
 decode side of the library: the full pack of the target decodes to the install
 tree of its wheel, the update packs are applied to an unpacked old version
-with UpdateJob and compared against the tree of the new version, and
-latest.pack carries the version and the index pack checksum of the full pack.
-Only the target version has a full pack, see the module docstring of dep_gen.
+with UpdateJob and compared against the tree of the new version. Only the
+target version has a full pack, see the module docstring of dep_gen.
 """
 import os
 
@@ -18,15 +17,19 @@ import pytest
 from alasio.deploy.pack.decode_base import PackDecodeBase
 from alasio.deploy.pack.job_unpack import UnpackJob
 from alasio.deploy.pack.job_update import UpdateJob
-from alasio.deploy.pack.server_file import LatestInfo
+from alasio.deploy.pack.packdep import PACKDEP_PATH, decode_packdep
 from alasio.deploy_dev.pack import pack_wheel
 from alasio.deploy_dev.pack._pack_cache import PackCache
+from alasio.deploy_dev.pack.encode_packdep import encode_packdep
 from alasio.deploy_dev.pack.pack_wheel import PackWheel
 from alasio.deploy_dev.pack_server import dep_gen
 from alasio.deploy_dev.pack_server.dep_gen import DepGen
+from alasio.deploy_dev.pack_server.fetch_wheel import WheelNotFoundError
 from alasio.deploy_dev.pack_server.model import (
     LookbackConfig, PackRepoModel, PythonDepsConfig, PythonMirrorInfo, RepoConfig
 )
+from alasio.deploy_dev.pack_server.pack_gen import PackRepoGen
+from alasio.deploy_dev.pack_server.parse_entry import ENTRY_FILE
 from alasio.ext import env
 from alasio.ext.path import PathStr
 from alasio.ext.path.atomic import atomic_write, file_read_bytes
@@ -41,7 +44,7 @@ from tests.deploy_dev.pack_server.test_fetch_wheel import MockMirror
 # starlette about the timeout argument is noise here, see the mock
 pytestmark = pytest.mark.filterwarnings(
     'ignore::starlette.exceptions.StarletteDeprecationWarning')
-from tests.deploy_dev.simple_pip.conftest import build_wheel, site_packages
+from tests.deploy.simple_pip.conftest import build_wheel, site_packages
 
 # the dependency files of the mock repo: httpx is pinned to a new version on
 # every commit, demo is pinned but not a managed name of the config, so it is
@@ -51,6 +54,28 @@ REQUIREMENTS = {
     'c2': 'httpx==0.27.8\ndemo==1.0\n',
     'c3': 'httpx==0.28.1\ndemo==1.0\n',
 }
+
+# entry of the mock repo: by default it declares the dependency the tests
+# build a channel of, see entry_source
+DEFAULT_ENTRY = "entry = ModEntryInfo(name='m', pack_update_deps={'httpx': None})\n"
+
+
+def entry_source(*names):
+    """
+    Build the source of a mod entry declaring pack_update_deps.
+
+    Args:
+        *names (str): Names to declare, none for an entry without the
+            declaration
+
+    Returns:
+        str: Source of the entry module
+    """
+    if not names:
+        return "entry = ModEntryInfo(name='m')\n"
+    body = ', '.join(f"'{name}': None" for name in names)
+    return f"entry = ModEntryInfo(name='m', pack_update_deps={{{body}}})\n"
+
 
 # folder of the packs of the config in the run directory, see PackRepoModel
 REPO_FOLDER = 'pack/Author_Repo_master'
@@ -126,7 +151,7 @@ def join_path(root, *parts):
     return path
 
 
-def make_repo(requirements, branch='master'):
+def make_repo(requirements, branch='master', entry=DEFAULT_ENTRY):
     """
     Build a mock repo of a linear commit chain with a requirements file.
 
@@ -134,6 +159,10 @@ def make_repo(requirements, branch='master'):
         requirements (dict): {commit: content of requirements.txt}, the
             oldest commit first, the parent of a commit is the one before it
         branch (str): Branch of the head. Defaults to 'master'.
+        entry (str | dict | None): Source of the mod entry. A str is
+            registered at every commit, a dict is {commit: source} (a commit
+            without an entry is not registered), None registers no entry.
+            Defaults to DEFAULT_ENTRY, an entry declaring httpx.
 
     Returns:
         MockGitRepo: Repo, the head of the branch is the newest commit
@@ -142,6 +171,9 @@ def make_repo(requirements, branch='master'):
     parent = None
     for index, (commit, content) in enumerate(requirements.items()):
         repo.register_file(commit, 'requirements.txt', content.encode('utf-8'))
+        source = entry.get(commit) if isinstance(entry, dict) else entry
+        if source is not None:
+            repo.register_file(commit, ENTRY_FILE, source.encode('utf-8'))
         repo.register_commit(
             commit, parents=[parent] if parent else None,
             author_name='Author', author_time=index, message=f'commit {commit}')
@@ -151,14 +183,12 @@ def make_repo(requirements, branch='master'):
     return repo
 
 
-def make_config(mirror, pack_update=('httpx',), requirement_files=('requirements.txt',)):
+def make_config(mirror, requirement_files=('requirements.txt',)):
     """
     Build a pack config with the PythonDeps group of the tests.
 
     Args:
         mirror (str | list): PythonDepsConfig.PypiMirror
-        pack_update (Iterable[str]): PythonDepsConfig.PackUpdate. Defaults to
-            ('httpx',)
         requirement_files (Iterable[str]): PythonDepsConfig.RequirementFiles.
             Defaults to ('requirements.txt',)
 
@@ -176,7 +206,6 @@ def make_config(mirror, pack_update=('httpx',), requirement_files=('requirements
         PythonDeps=PythonDepsConfig(
             RequirementFiles=list(requirement_files),
             PypiMirror=mirror,
-            PackUpdate=list(pack_update),
         ),
     )
 
@@ -252,6 +281,19 @@ def pack_file(run_dir, *parts):
     return join_path(run_dir, DEP_FOLDER, *parts)
 
 
+def run_commit(repo, config, client):
+    """
+    Run and commit a DepGen, the normal flow after the repo is published.
+
+    Returns:
+        DepGen: The generator that ran
+    """
+    gen = DepGen(repo, config, client=client)
+    gen.run()
+    gen.commit()
+    return gen
+
+
 def read_tree(root):
     """
     Read a folder of the test as {relative path: content}.
@@ -290,26 +332,79 @@ class TestSample:
         ]
 
     def test_unmanaged_name(self, fs, run_dir, mirror):
-        """A pinned name that PackUpdate does not list is not sampled."""
-        gen = DepGen(make_repo(REQUIREMENTS), make_config(mirror.base, pack_update=['demo']))
+        """A pinned name the mod entry does not declare is not sampled."""
+        gen = DepGen(
+            make_repo(REQUIREMENTS, entry=entry_source('demo')),
+            make_config(mirror.base))
         assert list(gen.sample) == ['demo']
         assert [dep.version for dep in gen.sample['demo']] == ['1.0']
 
     def test_name_without_pin(self, fs, run_dir, mirror):
-        """A managed name the window does not pin is reported, nothing is built of it."""
+        """A declared name the window does not pin is reported, nothing is built of it."""
         with logger.mock_capture_writer() as capture:
-            gen = DepGen(make_repo(REQUIREMENTS), make_config(mirror.base, pack_update=['requests']))
+            gen = DepGen(
+                make_repo(REQUIREMENTS, entry=entry_source('requests')),
+                make_config(mirror.base))
             assert gen.sample == {}
-        assert capture.fd.any_contains(
-            'Dependency "requests" is not pinned to a version in the lookback window')
+        assert capture.concat() == """\
+INFO | Using pack_update_deps of module/config/const.py at c3: requests
+WARNING | Dependency "requests" is not pinned to a version in the lookback window, nothing is built of it; a dependency of the mod entry pack_update_deps must be pinned with "==" in a dependency file of the config
+"""
 
     def test_name_is_normalized(self, fs, run_dir, mirror):
-        """The names of the config and of the files are compared PEP 503 normalized."""
+        """The names of the entry and of the files are compared PEP 503 normalized."""
         requirements = {'c1': 'ruamel.yaml==0.18.6\n'}
-        gen = DepGen(make_repo(requirements), make_config(mirror.base, pack_update=['ruamel_yaml']))
+        gen = DepGen(
+            make_repo(requirements, entry=entry_source('ruamel_yaml')),
+            make_config(mirror.base))
         sample = gen.sample
         assert list(sample) == ['ruamel-yaml']
         assert [(dep.version, dep.target) for dep in sample['ruamel-yaml']] == [('0.18.6', True)]
+
+    def test_entry_without_pack_update_deps(self, fs, run_dir, mirror):
+        """An entry without pack_update_deps declares no dependency."""
+        gen = DepGen(
+            make_repo(REQUIREMENTS, entry=entry_source()),
+            make_config(mirror.base))
+        assert gen.sample == {}
+
+    def test_entry_missing(self, fs, run_dir, mirror):
+        """A repo without an entry builds no dependency, the reason is logged."""
+        with logger.mock_capture_writer() as capture:
+            gen = DepGen(make_repo(REQUIREMENTS, entry=None), make_config(mirror.base))
+            assert gen.sample == {}
+        assert capture.concat() == """\
+INFO | No pack_update_deps declared by module/config/const.py at c3, no dependency pack is built
+"""
+
+    def test_entry_broken(self, fs, run_dir, mirror):
+        """A dynamic declaration fails the sample, no dependency is silently dropped."""
+        entry = "entry = ModEntryInfo(name='m', pack_update_deps=get_deps())\n"
+        gen = DepGen(make_repo(REQUIREMENTS, entry=entry), make_config(mirror.base))
+        with pytest.raises(ValueError, match='unsupported call'):
+            _ = gen.sample
+
+    def test_entry_latest_only(self, fs, run_dir, mirror):
+        """The names are declared by the entry of the latest commit only."""
+        entries = {
+            'c1': entry_source('demo'),
+            'c2': entry_source('httpx'),
+            'c3': entry_source('httpx'),
+        }
+        gen = DepGen(make_repo(REQUIREMENTS, entry=entries), make_config(mirror.base))
+        assert list(gen.sample) == ['httpx']
+
+    def test_no_requirement_files(self, fs, run_dir, mirror, monkeypatch):
+        """A config without dependency files does not read the entry."""
+        gen = DepGen(
+            make_repo(REQUIREMENTS),
+            make_config(mirror.base, requirement_files=()))
+
+        def fail(commit):
+            raise AssertionError('the entry must not be read')
+
+        monkeypatch.setattr(gen.entry, 'pack_update_deps', fail)
+        assert gen.sample == {}
 
 
 class TestMirror:
@@ -343,8 +438,10 @@ class TestRun:
         """The wheels are fetched and the channel of the dependency is written."""
         register_wheels(mirror)
         repo = make_repo(REQUIREMENTS)
+        gen = DepGen(repo, make_config(mirror.base), client=mirror.client)
         with logger.mock_capture_writer() as capture:
-            DepGen(repo, make_config(mirror.base), client=mirror.client).run()
+            assert gen.run() is None
+        payload = encode_packdep(gen.published)
 
         # 1. the wheel of every version is fetched, unmanaged names are not
         for version in ('0.27.7', '0.27.8', '0.28.1'):
@@ -361,39 +458,61 @@ class TestRun:
         assert decoder.current_version == '0.28.1'
         assert decoder.old_version == ''
         for old in ('0.27.7', '0.27.8'):
-            decoder = PackDecodeBase(file_read_bytes(pack_file(run_dir, '0.28.1', f'from_{old}.pack')))
+            decoder = PackDecodeBase(file_read_bytes(pack_file(run_dir, '0.28.1', f'update_{old}.pack')))
             decoder.validate()
             assert decoder.current_version == '0.28.1'
             assert decoder.old_version == old
 
-        # the channel is exactly the latest info, the full pack of the target
-        # and the update packs: the versions of the window have no full pack
+        # the channel is exactly the full pack of the target and the update
+        # packs: the versions of the window have no full pack, and the per
+        # dependency latest.pack is no longer written
         assert sorted(
             os.path.relpath(path, join_path(run_dir, DEP_FOLDER)).replace(os.sep, '/')
             for path in iter_files(join_path(run_dir, DEP_FOLDER), recursive=True)
         ) == [
-            '0.28.1/from_0.27.7.pack',
-            '0.28.1/from_0.27.8.pack',
             '0.28.1/full.pack',
-            'latest.pack',
+            '0.28.1/update_0.27.7.pack',
+            '0.28.1/update_0.27.8.pack',
         ]
         assert not pack_file(run_dir, '0.27.7').exists()
         assert not pack_file(run_dir, '0.27.8').exists()
+        assert not pack_file(run_dir, 'latest.pack').exists()
 
-        # latest.pack: the target version and the checksum of its full pack
-        data = file_read_bytes(pack_file(run_dir, 'latest.pack'))
-        info = LatestInfo.parse(data)
         full = PackDecodeBase(file_read_bytes(pack_file(run_dir, '0.28.1', 'full.pack')))
-        assert info.version == '0.28.1'
-        assert info.checksum == full.index_checksum
-        assert data == b'0.28.1' + bytes(full.extract_index_pack())[-20:]
+
+        # the packdep payload carries the generated target snapshot
+        assert payload is not None
+        entries = decode_packdep(payload)
+        assert list(entries) == ['httpx']
+        assert entries['httpx'].version == '0.28.1'
+        assert entries['httpx'].index_checksum == bytes(full.extract_index_pack())[-20:]
+        assert gen.published == {'httpx': ('0.28.1', bytes(full.extract_index_pack())[-20:])}
 
         # the progress of the run is logged
-        assert capture.fd.any_contains('[1/3] Fetching wheel of "httpx==0.28.1"')
-        assert capture.fd.any_contains(
-            '[1/1] Building dependency packs of "httpx": 3 versions, target=0.28.1')
-        assert capture.fd.any_contains('Writing update pack: 0.27.7 -> 0.28.1')
-        assert capture.fd.any_contains('Writing latest info: version=0.28.1')
+        assert capture.concat() == f"""\
+INFO | Using pack_update_deps of module/config/const.py at c3: httpx
+INFO | Generating the dependency packs of "Author_Repo_master": 1 dependencies, 3 versions
+INFO | [1/3] Fetching wheel of "httpx==0.28.1", mirror="http://mirror", commit=c3
+INFO | Index data cached: "http://mirror/httpx/" -> "{run_dir}/pack/Author_Repo_master/wheel/httpx/0.28.1/index_data.json"
+INFO | Download wheel: "http://mirror/packages/httpx-0.28.1-py3-none-any.whl" -> "{run_dir}/pack/Author_Repo_master/wheel/httpx/0.28.1/httpx-0.28.1-py3-none-any.whl"
+INFO | [2/3] Fetching wheel of "httpx==0.27.8", mirror="http://mirror", commit=c2
+INFO | Index data cached: "http://mirror/httpx/" -> "{run_dir}/pack/Author_Repo_master/wheel/httpx/0.27.8/index_data.json"
+INFO | Download wheel: "http://mirror/packages/httpx-0.27.8-py3-none-any.whl" -> "{run_dir}/pack/Author_Repo_master/wheel/httpx/0.27.8/httpx-0.27.8-py3-none-any.whl"
+INFO | [3/3] Fetching wheel of "httpx==0.27.7", mirror="http://mirror", commit=c1
+INFO | Index data cached: "http://mirror/httpx/" -> "{run_dir}/pack/Author_Repo_master/wheel/httpx/0.27.7/index_data.json"
+INFO | Download wheel: "http://mirror/packages/httpx-0.27.7-py3-none-any.whl" -> "{run_dir}/pack/Author_Repo_master/wheel/httpx/0.27.7/httpx-0.27.7-py3-none-any.whl"
+INFO | [1/1] Building dependency packs of "httpx": 3 versions, target=0.28.1
+INFO | Writing full pack: "{run_dir}/pack/Author_Repo_master/packdep/httpx/0.28.1/full.pack"
+INFO | Writing update pack: 0.27.8 -> 0.28.1, "{run_dir}/pack/Author_Repo_master/packdep/httpx/0.28.1/update_0.27.8.pack"
+INFO | Writing update pack: 0.27.7 -> 0.28.1, "{run_dir}/pack/Author_Repo_master/packdep/httpx/0.28.1/update_0.27.7.pack"
+INFO | Dependency packs of "Author_Repo_master" generated
+"""
+
+    def test_commit_requires_run(self, fs, run_dir, mirror):
+        """commit() before run() cannot clean a channel that was not generated."""
+        gen = DepGen(make_repo(REQUIREMENTS), make_config(mirror.base), client=mirror.client)
+        with pytest.raises(RuntimeError, match='run\\(\\) must be called'):
+            gen.commit()
 
     @pytest.mark.trio
     async def test_full_pack_is_the_install_tree(self, fs, run_dir, mirror):
@@ -426,7 +545,7 @@ class TestRun:
                 b''.join(PackWheel(wheel_file(run_dir, '0.27.8')).iter_pack_data()),
                 root=site, name='httpx').run()
 
-        update = file_read_bytes(pack_file(run_dir, '0.28.1', 'from_0.27.8.pack'))
+        update = file_read_bytes(pack_file(run_dir, '0.28.1', 'update_0.27.8.pack'))
         job = UpdateJob(update, root=site, name='httpx')
         with logger.mock_capture_writer():
             assert await job.run()
@@ -440,11 +559,49 @@ class TestRun:
         assert not os.path.exists(f'{site}/httpx/version-0.27.8.txt')
         assert file_read_bytes(f'{site}/.pack/httpx/index.pack') == new.index_pack
 
+    def test_no_per_dependency_latest_pack(self, fs, run_dir, mirror):
+        """Neither run() nor commit() writes a per dependency latest.pack."""
+        register_wheels(mirror)
+        repo = make_repo(REQUIREMENTS)
+        gen = DepGen(repo, make_config(mirror.base), client=mirror.client)
+        assert gen.run() is None
+        assert not pack_file(run_dir, 'latest.pack').exists()
+        gen.commit()
+        assert not pack_file(run_dir, 'latest.pack').exists()
+
+    def test_packdep_is_carried_by_the_repo_pack(self, fs, run_dir, mirror):
+        """The payload of DepGen is a generated file of the repo version."""
+        register_wheels(mirror)
+        repo = make_repo(REQUIREMENTS)
+        config = make_config(mirror.base)
+        dep = DepGen(repo, config, client=mirror.client)
+        assert dep.run() is None
+        assert dep.published
+        payload = encode_packdep(dep.published)
+
+        PackRepoGen(repo, config, dep_gen=dep).run()
+
+        full = PackDecodeBase(file_read_bytes(join_path(
+            run_dir, REPO_FOLDER, 'packrepo', 'c3', 'full.pack')))
+        full.validate()
+        info = full.fileinfo[PACKDEP_PATH]
+        assert bytes(full.catfile(info)) == payload
+        entries = decode_packdep(payload)
+        dep_full = PackDecodeBase(file_read_bytes(pack_file(run_dir, '0.28.1', 'full.pack')))
+        assert list(entries) == ['httpx']
+        assert entries['httpx'].version == '0.28.1'
+        assert entries['httpx'].index_checksum == bytes(dep_full.extract_index_pack())[-20:]
+
     def test_no_dependency(self, fs, run_dir, mirror):
-        """A config with no managed dependency writes nothing and removes nothing."""
+        """A repo whose entry declares no dependency writes nothing and removes nothing."""
         with logger.mock_capture_writer() as capture:
-            DepGen(make_repo(REQUIREMENTS), make_config(mirror.base, pack_update=[])).run()
-        assert capture.fd.any_contains('No dependency to build')
+            gen = DepGen(make_repo(REQUIREMENTS, entry=None), make_config(mirror.base))
+            assert gen.run() is None
+        assert capture.concat() == """\
+INFO | No pack_update_deps declared by module/config/const.py at c3, no dependency pack is built
+INFO | No dependency to build of "Author_Repo_master", skipped
+"""
+        assert gen.published == {}
         assert not join_path(run_dir, REPO_FOLDER).exists()
         assert mirror.requests == []
 
@@ -464,32 +621,51 @@ class TestRun:
         with logger.mock_capture_writer() as capture:
             DepGen(make_repo(requirements), make_config(mirror.base), client=mirror.client).run()
 
-        assert capture.fd.any_contains(
-            'Dependency "httpx" is not pinned by the latest commit')
+        assert capture.concat() == """\
+INFO | Using pack_update_deps of module/config/const.py at c2: httpx
+WARNING | Dependency "httpx" is not pinned by the latest commit, no pack is built of it, its historical packs are kept
+INFO | Generating the dependency packs of "Author_Repo_master": 0 dependencies, 0 versions
+INFO | Dependency packs of "Author_Repo_master" generated
+"""
         # nothing is fetched or built, the historical releases are kept
         assert mirror.requests == []
         assert file_read_bytes(pack_file(run_dir, '0.27.7', 'full.pack')) == b'old pack'
         assert file_read_bytes(pack_file(run_dir, 'latest.pack')) == b'old latest'
         assert wheel_file(run_dir, '0.27.7').exists()
 
-    def test_no_pure_wheel(self, fs, run_dir, mirror):
-        """A version the mirror has no pure python wheel of is skipped, the others build."""
+    def test_historical_wheel_missing_fails(self, fs, run_dir, mirror):
+        """A historical version without a usable wheel fails the complete build."""
         register_wheel(mirror, '0.27.8', CORE_V1)
         register_wheel(mirror, '0.28.1', CORE_V2)
         mirror.register('httpx', '0.27.7', tags='cp38-cp38-win_amd64', content=b'compiled')
         repo = make_repo(REQUIREMENTS)
-        with logger.mock_capture_writer() as capture:
+
+        with pytest.raises(
+                WheelNotFoundError, match='historical dependency "httpx==0.27.7"'):
             DepGen(repo, make_config(mirror.base), client=mirror.client).run()
 
-        assert capture.fd.any_contains('No pure python wheel to pack of "httpx==0.27.7"')
-        # the skipped version has no wheel file, no full pack and no update pack
-        assert not wheel_file(run_dir, '0.27.7').exists()
-        assert not pack_file(run_dir, '0.27.7', 'full.pack').exists()
-        assert not pack_file(run_dir, '0.28.1', 'from_0.27.7.pack').exists()
-        # the other versions are complete and latest.pack is published
-        assert pack_file(run_dir, '0.28.1', 'full.pack').isfile()
-        assert pack_file(run_dir, '0.28.1', 'from_0.27.8.pack').isfile()
-        assert LatestInfo.parse(file_read_bytes(pack_file(run_dir, 'latest.pack'))).version == '0.28.1'
+        # every version of the channel is required: nothing of the target is
+        # published when an update side is missing
+        assert not pack_file(run_dir, '0.28.1', 'full.pack').exists()
+        assert not pack_file(run_dir, '0.28.1', 'update_0.27.7.pack').exists()
+        assert not pack_file(run_dir, '0.28.1', 'update_0.27.8.pack').exists()
+        assert not pack_file(run_dir, 'latest.pack').exists()
+
+    def test_target_wheel_missing_fails(self, fs, run_dir, mirror):
+        """A target without a usable wheel fails the run, no pack is published."""
+        register_wheel(mirror, '0.27.8', CORE_V1)
+        mirror.register('httpx', '0.28.1', tags='cp38-cp38-win_amd64', content=b'compiled')
+        repo = make_repo(REQUIREMENTS)
+
+        with pytest.raises(
+                WheelNotFoundError, match='target dependency "httpx==0.28.1"'):
+            DepGen(repo, make_config(mirror.base), client=mirror.client).run()
+
+        # the run stopped before any pack of the target was written
+        assert not wheel_file(run_dir, '0.28.1').exists()
+        assert not pack_file(run_dir, '0.28.1', 'full.pack').exists()
+        assert not pack_file(run_dir, '0.28.1', 'update_0.27.8.pack').exists()
+        assert not pack_file(run_dir, 'latest.pack').exists()
 
     def test_mirror_list(self, fs, run_dir, mirror):
         """A list mirror fetches each dependency from its own url."""
@@ -505,9 +681,12 @@ class TestRun:
                 PythonMirrorInfo(Url='http://mirror-a', Deps=['httpx']),
                 PythonMirrorInfo(Url='http://mirror-b', Deps=['demo']),
             ],
-            pack_update=['httpx', 'demo'],
         )
-        DepGen(make_repo({'c1': 'httpx==0.28.1\ndemo==1.0\n'}), config, client=mirror.client).run()
+        DepGen(
+            make_repo(
+                {'c1': 'httpx==0.28.1\ndemo==1.0\n'},
+                entry=entry_source('httpx', 'demo')),
+            config, client=mirror.client).run()
 
         # every request of a dependency goes to the url of its entry
         assert mirror.requests
@@ -521,9 +700,9 @@ class TestRun:
             run_dir, REPO_FOLDER, 'packdep', 'httpx', '0.28.1', 'full.pack').isfile()
         assert join_path(
             run_dir, REPO_FOLDER, 'packdep', 'demo', '1.0', 'full.pack').isfile()
-        assert pack_file(run_dir, 'latest.pack').isfile()
-        assert join_path(
-            run_dir, REPO_FOLDER, 'packdep', 'demo', 'latest.pack').isfile()
+        assert not pack_file(run_dir, 'latest.pack').exists()
+        assert not join_path(
+            run_dir, REPO_FOLDER, 'packdep', 'demo', 'latest.pack').exists()
 
 
 class TestExistingPacks:
@@ -558,25 +737,12 @@ class TestExistingPacks:
         assert mirror.requests == requests
         assert read_tree(join_path(run_dir, REPO_FOLDER)) == tree
 
-    def test_latest_pack_is_written_again(self, fs, run_dir, mirror):
-        """latest.pack is written on every run, from the checksum of the kept full pack."""
-        register_wheels(mirror)
-        repo = make_repo(REQUIREMENTS)
-        DepGen(repo, make_config(mirror.base), client=mirror.client).run()
-        latest = pack_file(run_dir, 'latest.pack')
-        data = file_read_bytes(latest)
-        os.remove(latest)
-
-        DepGen(repo, make_config(mirror.base), client=mirror.client).run()
-
-        assert file_read_bytes(latest) == data
-
     def test_missing_pack_is_built_again(self, fs, run_dir, mirror, monkeypatch):
         """Only the pack that is missing is built again."""
         register_wheels(mirror)
         repo = make_repo(REQUIREMENTS)
         DepGen(repo, make_config(mirror.base), client=mirror.client).run()
-        target = pack_file(run_dir, '0.28.1', 'from_0.27.7.pack')
+        target = pack_file(run_dir, '0.28.1', 'update_0.27.7.pack')
         data = file_read_bytes(target)
         os.remove(target)
 
@@ -599,7 +765,7 @@ class TestExistingPacks:
         repo = make_repo(REQUIREMENTS)
         DepGen(repo, make_config(mirror.base), client=mirror.client).run()
 
-        names = (('0.28.1', 'full.pack'), ('0.28.1', 'from_0.27.7.pack'), ('0.28.1', 'from_0.27.8.pack'))
+        names = (('0.28.1', 'full.pack'), ('0.28.1', 'update_0.27.7.pack'), ('0.28.1', 'update_0.27.8.pack'))
         original = {parts: file_read_bytes(pack_file(run_dir, *parts)) for parts in names}
         for parts in names:
             file = pack_file(run_dir, *parts)
@@ -613,23 +779,38 @@ class TestExistingPacks:
         # the packs are written again, byte for byte the packs of the version
         for parts in names:
             assert file_read_bytes(pack_file(run_dir, *parts)) == original[parts]
-        # latest.pack is built from the full pack this run wrote
-        info = LatestInfo.parse(file_read_bytes(pack_file(run_dir, 'latest.pack')))
-        full = PackDecodeBase(file_read_bytes(pack_file(run_dir, '0.28.1', 'full.pack')))
-        assert info.checksum == full.index_checksum
+        assert not pack_file(run_dir, 'latest.pack').exists()
 
     def test_pack_that_is_not_a_pack_is_written_again(self, fs, run_dir, mirror):
         """A kept file that cannot be read as a pack is overwritten, the run goes on."""
         register_wheels(mirror)
         repo = make_repo(REQUIREMENTS)
         DepGen(repo, make_config(mirror.base), client=mirror.client).run()
-        file = pack_file(run_dir, '0.28.1', 'from_0.27.7.pack')
+        file = pack_file(run_dir, '0.28.1', 'update_0.27.7.pack')
         atomic_write(file, b'NOPE' + b'\x00' * 60)
 
         with logger.mock_capture_writer() as capture:
             DepGen(repo, make_config(mirror.base), client=mirror.client).run()
 
-        assert capture.fd.any_contains('Failed to read the existing pack')
+        assert capture.concat() == f"""\
+INFO | Using pack_update_deps of module/config/const.py at c3: httpx
+INFO | Generating the dependency packs of "Author_Repo_master": 1 dependencies, 3 versions
+INFO | [1/3] Fetching wheel of "httpx==0.28.1", mirror="http://mirror", commit=c3
+INFO | Index data exists, loaded: "{run_dir}/pack/Author_Repo_master/wheel/httpx/0.28.1/index_data.json"
+INFO | Wheel exists, skipped: "{run_dir}/pack/Author_Repo_master/wheel/httpx/0.28.1/httpx-0.28.1-py3-none-any.whl"
+INFO | [2/3] Fetching wheel of "httpx==0.27.8", mirror="http://mirror", commit=c2
+INFO | Index data exists, loaded: "{run_dir}/pack/Author_Repo_master/wheel/httpx/0.27.8/index_data.json"
+INFO | Wheel exists, skipped: "{run_dir}/pack/Author_Repo_master/wheel/httpx/0.27.8/httpx-0.27.8-py3-none-any.whl"
+INFO | [3/3] Fetching wheel of "httpx==0.27.7", mirror="http://mirror", commit=c1
+INFO | Index data exists, loaded: "{run_dir}/pack/Author_Repo_master/wheel/httpx/0.27.7/index_data.json"
+INFO | Wheel exists, skipped: "{run_dir}/pack/Author_Repo_master/wheel/httpx/0.27.7/httpx-0.27.7-py3-none-any.whl"
+INFO | [1/1] Building dependency packs of "httpx": 3 versions, target=0.28.1
+INFO | Full pack exists, skipped: "{run_dir}/pack/Author_Repo_master/packdep/httpx/0.28.1/full.pack"
+INFO | Update pack exists, skipped: "{run_dir}/pack/Author_Repo_master/packdep/httpx/0.28.1/update_0.27.8.pack"
+WARNING | Failed to read the existing pack, writing it again: Failed to read the pack: not a pack file: b'NOPE', "{run_dir}/pack/Author_Repo_master/packdep/httpx/0.28.1/update_0.27.7.pack"
+INFO | Writing update pack: 0.27.7 -> 0.28.1, "{run_dir}/pack/Author_Repo_master/packdep/httpx/0.28.1/update_0.27.7.pack"
+INFO | Dependency packs of "Author_Repo_master" generated
+"""
         decoder = PackDecodeBase(file_read_bytes(file))
         decoder.validate()
         assert decoder.old_version == '0.27.7'
@@ -640,14 +821,32 @@ class TestExistingPacks:
         repo = make_repo(REQUIREMENTS)
         DepGen(repo, make_config(mirror.base), client=mirror.client).run()
         # the update pack of 0.27.8, put at the path of the update pack of 0.27.7
-        source = pack_file(run_dir, '0.28.1', 'from_0.27.8.pack')
-        file = pack_file(run_dir, '0.28.1', 'from_0.27.7.pack')
+        source = pack_file(run_dir, '0.28.1', 'update_0.27.8.pack')
+        file = pack_file(run_dir, '0.28.1', 'update_0.27.7.pack')
         atomic_write(file, file_read_bytes(source))
 
         with logger.mock_capture_writer() as capture:
             DepGen(repo, make_config(mirror.base), client=mirror.client).run()
 
-        assert capture.fd.any_contains('Existing pack is not the pack of this version')
+        assert capture.concat() == f"""\
+INFO | Using pack_update_deps of module/config/const.py at c3: httpx
+INFO | Generating the dependency packs of "Author_Repo_master": 1 dependencies, 3 versions
+INFO | [1/3] Fetching wheel of "httpx==0.28.1", mirror="http://mirror", commit=c3
+INFO | Index data exists, loaded: "{run_dir}/pack/Author_Repo_master/wheel/httpx/0.28.1/index_data.json"
+INFO | Wheel exists, skipped: "{run_dir}/pack/Author_Repo_master/wheel/httpx/0.28.1/httpx-0.28.1-py3-none-any.whl"
+INFO | [2/3] Fetching wheel of "httpx==0.27.8", mirror="http://mirror", commit=c2
+INFO | Index data exists, loaded: "{run_dir}/pack/Author_Repo_master/wheel/httpx/0.27.8/index_data.json"
+INFO | Wheel exists, skipped: "{run_dir}/pack/Author_Repo_master/wheel/httpx/0.27.8/httpx-0.27.8-py3-none-any.whl"
+INFO | [3/3] Fetching wheel of "httpx==0.27.7", mirror="http://mirror", commit=c1
+INFO | Index data exists, loaded: "{run_dir}/pack/Author_Repo_master/wheel/httpx/0.27.7/index_data.json"
+INFO | Wheel exists, skipped: "{run_dir}/pack/Author_Repo_master/wheel/httpx/0.27.7/httpx-0.27.7-py3-none-any.whl"
+INFO | [1/1] Building dependency packs of "httpx": 3 versions, target=0.28.1
+INFO | Full pack exists, skipped: "{run_dir}/pack/Author_Repo_master/packdep/httpx/0.28.1/full.pack"
+INFO | Update pack exists, skipped: "{run_dir}/pack/Author_Repo_master/packdep/httpx/0.28.1/update_0.27.8.pack"
+WARNING | Existing pack is not the pack of this version, writing it again: "{run_dir}/pack/Author_Repo_master/packdep/httpx/0.28.1/update_0.27.7.pack"
+INFO | Writing update pack: 0.27.7 -> 0.28.1, "{run_dir}/pack/Author_Repo_master/packdep/httpx/0.28.1/update_0.27.7.pack"
+INFO | Dependency packs of "Author_Repo_master" generated
+"""
         decoder = PackDecodeBase(file_read_bytes(file))
         decoder.validate()
         assert decoder.old_version == '0.27.7'
@@ -672,9 +871,30 @@ class TestCleanup:
             contents=b'stale')
 
         with logger.mock_capture_writer() as capture:
-            DepGen(make_repo(REQUIREMENTS), make_config(mirror.base), client=mirror.client).run()
+            run_commit(make_repo(REQUIREMENTS), make_config(mirror.base), mirror.client)
 
-        assert capture.fd.any_contains('Removing stale wheel folder')
+        assert capture.concat() == f"""\
+INFO | Using pack_update_deps of module/config/const.py at c3: httpx
+INFO | Generating the dependency packs of "Author_Repo_master": 1 dependencies, 3 versions
+INFO | [1/3] Fetching wheel of "httpx==0.28.1", mirror="http://mirror", commit=c3
+INFO | Index data cached: "http://mirror/httpx/" -> "{run_dir}/pack/Author_Repo_master/wheel/httpx/0.28.1/index_data.json"
+INFO | Download wheel: "http://mirror/packages/httpx-0.28.1-py3-none-any.whl" -> "{run_dir}/pack/Author_Repo_master/wheel/httpx/0.28.1/httpx-0.28.1-py3-none-any.whl"
+INFO | [2/3] Fetching wheel of "httpx==0.27.8", mirror="http://mirror", commit=c2
+INFO | Index data cached: "http://mirror/httpx/" -> "{run_dir}/pack/Author_Repo_master/wheel/httpx/0.27.8/index_data.json"
+INFO | Download wheel: "http://mirror/packages/httpx-0.27.8-py3-none-any.whl" -> "{run_dir}/pack/Author_Repo_master/wheel/httpx/0.27.8/httpx-0.27.8-py3-none-any.whl"
+INFO | [3/3] Fetching wheel of "httpx==0.27.7", mirror="http://mirror", commit=c1
+INFO | Index data cached: "http://mirror/httpx/" -> "{run_dir}/pack/Author_Repo_master/wheel/httpx/0.27.7/index_data.json"
+INFO | Download wheel: "http://mirror/packages/httpx-0.27.7-py3-none-any.whl" -> "{run_dir}/pack/Author_Repo_master/wheel/httpx/0.27.7/httpx-0.27.7-py3-none-any.whl"
+INFO | [1/1] Building dependency packs of "httpx": 3 versions, target=0.28.1
+INFO | Writing full pack: "{run_dir}/pack/Author_Repo_master/packdep/httpx/0.28.1/full.pack"
+INFO | Writing update pack: 0.27.8 -> 0.28.1, "{run_dir}/pack/Author_Repo_master/packdep/httpx/0.28.1/update_0.27.8.pack"
+INFO | Writing update pack: 0.27.7 -> 0.28.1, "{run_dir}/pack/Author_Repo_master/packdep/httpx/0.28.1/update_0.27.7.pack"
+INFO | Dependency packs of "Author_Repo_master" generated
+INFO | Removing stale wheel folder: "{run_dir}/pack/Author_Repo_master/wheel/httpx/0.26.0"
+INFO | Removing stale wheel folder: "{run_dir}/pack/Author_Repo_master/wheel/demo/1.0"
+INFO | Removing stale wheel folder: "{run_dir}/pack/Author_Repo_master/wheel/other/1.0"
+INFO | Dependency packs of "Author_Repo_master" committed
+"""
         assert not join_path(run_dir, REPO_FOLDER, 'wheel', 'httpx', '0.26.0').exists()
         assert not join_path(run_dir, REPO_FOLDER, 'wheel', 'demo').exists()
         assert not join_path(run_dir, REPO_FOLDER, 'wheel', 'other').exists()
@@ -690,23 +910,53 @@ class TestCleanup:
         # of the target only)
         fs.create_file(pack_file(run_dir, '0.26.0', 'full.pack'), contents=b'stale')
         fs.create_file(pack_file(run_dir, '0.27.8', 'full.pack'), contents=b'stale')
-        # a dependency of another config (or of a removed PackUpdate entry)
+        # a dependency of another config (or of a name removed from pack_update_deps)
         fs.create_file(join_path(run_dir, REPO_FOLDER, 'packdep', 'other', 'latest.pack'), contents=b'stale')
         fs.create_file(join_path(
             run_dir, REPO_FOLDER, 'packdep', 'other', '1.0', 'full.pack'), contents=b'stale')
 
         with logger.mock_capture_writer() as capture:
-            DepGen(make_repo(REQUIREMENTS), make_config(mirror.base), client=mirror.client).run()
+            gen = DepGen(
+                make_repo(REQUIREMENTS), make_config(mirror.base), client=mirror.client)
+            gen.run()
+        # run() only generates: the old packs stay until commit()
+        assert pack_file(run_dir, '0.26.0', 'full.pack').isfile()
+        assert join_path(run_dir, REPO_FOLDER, 'packdep', 'other').isdir()
+        assert capture.concat() == f"""\
+INFO | Using pack_update_deps of module/config/const.py at c3: httpx
+INFO | Generating the dependency packs of "Author_Repo_master": 1 dependencies, 3 versions
+INFO | [1/3] Fetching wheel of "httpx==0.28.1", mirror="http://mirror", commit=c3
+INFO | Index data cached: "http://mirror/httpx/" -> "{run_dir}/pack/Author_Repo_master/wheel/httpx/0.28.1/index_data.json"
+INFO | Download wheel: "http://mirror/packages/httpx-0.28.1-py3-none-any.whl" -> "{run_dir}/pack/Author_Repo_master/wheel/httpx/0.28.1/httpx-0.28.1-py3-none-any.whl"
+INFO | [2/3] Fetching wheel of "httpx==0.27.8", mirror="http://mirror", commit=c2
+INFO | Index data cached: "http://mirror/httpx/" -> "{run_dir}/pack/Author_Repo_master/wheel/httpx/0.27.8/index_data.json"
+INFO | Download wheel: "http://mirror/packages/httpx-0.27.8-py3-none-any.whl" -> "{run_dir}/pack/Author_Repo_master/wheel/httpx/0.27.8/httpx-0.27.8-py3-none-any.whl"
+INFO | [3/3] Fetching wheel of "httpx==0.27.7", mirror="http://mirror", commit=c1
+INFO | Index data cached: "http://mirror/httpx/" -> "{run_dir}/pack/Author_Repo_master/wheel/httpx/0.27.7/index_data.json"
+INFO | Download wheel: "http://mirror/packages/httpx-0.27.7-py3-none-any.whl" -> "{run_dir}/pack/Author_Repo_master/wheel/httpx/0.27.7/httpx-0.27.7-py3-none-any.whl"
+INFO | [1/1] Building dependency packs of "httpx": 3 versions, target=0.28.1
+INFO | Writing full pack: "{run_dir}/pack/Author_Repo_master/packdep/httpx/0.28.1/full.pack"
+INFO | Writing update pack: 0.27.8 -> 0.28.1, "{run_dir}/pack/Author_Repo_master/packdep/httpx/0.28.1/update_0.27.8.pack"
+INFO | Writing update pack: 0.27.7 -> 0.28.1, "{run_dir}/pack/Author_Repo_master/packdep/httpx/0.28.1/update_0.27.7.pack"
+INFO | Dependency packs of "Author_Repo_master" generated
+"""
 
-        assert capture.fd.any_contains('Removing stale pack folder')
-        assert capture.fd.any_contains('Removing stale dependency folder')
+        with logger.mock_capture_writer() as capture:
+            gen.commit()
+
+        assert capture.concat() == f"""\
+INFO | Removing stale pack folder: "{run_dir}/pack/Author_Repo_master/packdep/httpx/0.26.0"
+INFO | Removing stale pack folder: "{run_dir}/pack/Author_Repo_master/packdep/httpx/0.27.8"
+INFO | Removing stale dependency folder: "{run_dir}/pack/Author_Repo_master/packdep/other"
+INFO | Dependency packs of "Author_Repo_master" committed
+"""
         assert not pack_file(run_dir, '0.26.0').exists()
         assert not pack_file(run_dir, '0.27.8').exists()
         assert not join_path(run_dir, REPO_FOLDER, 'packdep', 'other').exists()
-        # the channel of the dependency is kept: latest.pack, the full pack of
-        # the target and its update packs
+        # the channel of the dependency is kept: the full pack of the target
+        # and its update packs
         assert pack_file(run_dir, '0.28.1', 'full.pack').isfile()
-        assert pack_file(run_dir, 'latest.pack').isfile()
+        assert not pack_file(run_dir, 'latest.pack').exists()
 
     def test_stale_update_packs_removed(self, fs, run_dir, mirror):
         """An update pack of another target folder, or of a version out of the window, is removed."""
@@ -715,18 +965,38 @@ class TestCleanup:
         DepGen(repo, make_config(mirror.base), client=mirror.client).run()
         # the leftovers of an earlier run: an update pack in the folder of a
         # version that is not the target, and one of a version out of the window
-        fs.create_file(pack_file(run_dir, '0.27.8', 'from_0.27.7.pack'), contents=b'stale')
-        fs.create_file(pack_file(run_dir, '0.28.1', 'from_0.26.0.pack'), contents=b'stale')
+        fs.create_file(pack_file(run_dir, '0.27.8', 'update_0.27.7.pack'), contents=b'stale')
+        fs.create_file(pack_file(run_dir, '0.28.1', 'update_0.26.0.pack'), contents=b'stale')
 
         with logger.mock_capture_writer() as capture:
-            DepGen(repo, make_config(mirror.base), client=mirror.client).run()
+            run_commit(repo, make_config(mirror.base), mirror.client)
 
-        assert capture.fd.any_contains('Removing stale update pack')
+        assert capture.concat() == f"""\
+INFO | Using pack_update_deps of module/config/const.py at c3: httpx
+INFO | Generating the dependency packs of "Author_Repo_master": 1 dependencies, 3 versions
+INFO | [1/3] Fetching wheel of "httpx==0.28.1", mirror="http://mirror", commit=c3
+INFO | Index data exists, loaded: "{run_dir}/pack/Author_Repo_master/wheel/httpx/0.28.1/index_data.json"
+INFO | Wheel exists, skipped: "{run_dir}/pack/Author_Repo_master/wheel/httpx/0.28.1/httpx-0.28.1-py3-none-any.whl"
+INFO | [2/3] Fetching wheel of "httpx==0.27.8", mirror="http://mirror", commit=c2
+INFO | Index data exists, loaded: "{run_dir}/pack/Author_Repo_master/wheel/httpx/0.27.8/index_data.json"
+INFO | Wheel exists, skipped: "{run_dir}/pack/Author_Repo_master/wheel/httpx/0.27.8/httpx-0.27.8-py3-none-any.whl"
+INFO | [3/3] Fetching wheel of "httpx==0.27.7", mirror="http://mirror", commit=c1
+INFO | Index data exists, loaded: "{run_dir}/pack/Author_Repo_master/wheel/httpx/0.27.7/index_data.json"
+INFO | Wheel exists, skipped: "{run_dir}/pack/Author_Repo_master/wheel/httpx/0.27.7/httpx-0.27.7-py3-none-any.whl"
+INFO | [1/1] Building dependency packs of "httpx": 3 versions, target=0.28.1
+INFO | Full pack exists, skipped: "{run_dir}/pack/Author_Repo_master/packdep/httpx/0.28.1/full.pack"
+INFO | Update pack exists, skipped: "{run_dir}/pack/Author_Repo_master/packdep/httpx/0.28.1/update_0.27.8.pack"
+INFO | Update pack exists, skipped: "{run_dir}/pack/Author_Repo_master/packdep/httpx/0.28.1/update_0.27.7.pack"
+INFO | Dependency packs of "Author_Repo_master" generated
+INFO | Removing stale update pack: "{run_dir}/pack/Author_Repo_master/packdep/httpx/0.28.1/update_0.26.0.pack"
+INFO | Removing stale pack folder: "{run_dir}/pack/Author_Repo_master/packdep/httpx/0.27.8"
+INFO | Dependency packs of "Author_Repo_master" committed
+"""
         assert not pack_file(run_dir, '0.27.8').exists()
-        assert not pack_file(run_dir, '0.28.1', 'from_0.26.0.pack').exists()
+        assert not pack_file(run_dir, '0.28.1', 'update_0.26.0.pack').exists()
         # the update packs of the window and the full pack of the target are kept
-        assert pack_file(run_dir, '0.28.1', 'from_0.27.7.pack').isfile()
-        assert pack_file(run_dir, '0.28.1', 'from_0.27.8.pack').isfile()
+        assert pack_file(run_dir, '0.28.1', 'update_0.27.7.pack').isfile()
+        assert pack_file(run_dir, '0.28.1', 'update_0.27.8.pack').isfile()
         assert pack_file(run_dir, '0.28.1', 'full.pack').isfile()
 
     def test_target_moves(self, fs, run_dir, mirror):
@@ -734,24 +1004,23 @@ class TestCleanup:
         register_wheels(mirror)
         repo = make_repo(REQUIREMENTS)
         DepGen(repo, make_config(mirror.base), client=mirror.client).run()
-        assert pack_file(run_dir, '0.28.1', 'from_0.27.7.pack').isfile()
+        assert pack_file(run_dir, '0.28.1', 'update_0.27.7.pack').isfile()
 
         # the pin of the dependency moves to a new version
         register_wheel(mirror, '0.28.2', CORE_V2 + b'NEWER = True\n')
         repo.register_file('c4', 'requirements.txt', b'httpx==0.28.2\ndemo==1.0\n')
+        repo.register_file('c4', ENTRY_FILE, DEFAULT_ENTRY.encode('utf-8'))
         repo.register_commit(
             'c4', parents=['c3'], author_name='Author', author_time=3, message='commit c4')
         repo.register_branch('master', 'c4')
         repo.register_head('c4')
 
-        DepGen(repo, make_config(mirror.base), client=mirror.client).run()
+        run_commit(repo, make_config(mirror.base), mirror.client)
 
         # the new target holds the only full pack and an update pack of every
-        # other version, and latest.pack points at it
+        # other version
         for old in ('0.27.7', '0.27.8', '0.28.1'):
-            assert pack_file(run_dir, '0.28.2', f'from_{old}.pack').isfile()
-        assert LatestInfo.parse(
-            file_read_bytes(pack_file(run_dir, 'latest.pack'))).version == '0.28.2'
+            assert pack_file(run_dir, '0.28.2', f'update_{old}.pack').isfile()
         # the folder of the old target is gone as a whole: the channel has the
         # folder of the target only
         assert not pack_file(run_dir, '0.28.1').exists()
@@ -767,10 +1036,29 @@ class TestCleanup:
         fs.create_file(pack_file(run_dir, '0.26.0', 'full.pack'), contents=b'stale')
 
         with logger.mock_capture_writer() as capture:
-            DepGen(make_repo(REQUIREMENTS), make_config(mirror.base), client=mirror.client).run()
+            run_commit(make_repo(REQUIREMENTS), make_config(mirror.base), mirror.client)
 
-        assert capture.fd.any_contains('Failed to remove stale pack folder')
+        assert capture.concat() == f"""\
+INFO | Using pack_update_deps of module/config/const.py at c3: httpx
+INFO | Generating the dependency packs of "Author_Repo_master": 1 dependencies, 3 versions
+INFO | [1/3] Fetching wheel of "httpx==0.28.1", mirror="http://mirror", commit=c3
+INFO | Index data cached: "http://mirror/httpx/" -> "{run_dir}/pack/Author_Repo_master/wheel/httpx/0.28.1/index_data.json"
+INFO | Download wheel: "http://mirror/packages/httpx-0.28.1-py3-none-any.whl" -> "{run_dir}/pack/Author_Repo_master/wheel/httpx/0.28.1/httpx-0.28.1-py3-none-any.whl"
+INFO | [2/3] Fetching wheel of "httpx==0.27.8", mirror="http://mirror", commit=c2
+INFO | Index data cached: "http://mirror/httpx/" -> "{run_dir}/pack/Author_Repo_master/wheel/httpx/0.27.8/index_data.json"
+INFO | Download wheel: "http://mirror/packages/httpx-0.27.8-py3-none-any.whl" -> "{run_dir}/pack/Author_Repo_master/wheel/httpx/0.27.8/httpx-0.27.8-py3-none-any.whl"
+INFO | [3/3] Fetching wheel of "httpx==0.27.7", mirror="http://mirror", commit=c1
+INFO | Index data cached: "http://mirror/httpx/" -> "{run_dir}/pack/Author_Repo_master/wheel/httpx/0.27.7/index_data.json"
+INFO | Download wheel: "http://mirror/packages/httpx-0.27.7-py3-none-any.whl" -> "{run_dir}/pack/Author_Repo_master/wheel/httpx/0.27.7/httpx-0.27.7-py3-none-any.whl"
+INFO | [1/1] Building dependency packs of "httpx": 3 versions, target=0.28.1
+INFO | Writing full pack: "{run_dir}/pack/Author_Repo_master/packdep/httpx/0.28.1/full.pack"
+INFO | Writing update pack: 0.27.8 -> 0.28.1, "{run_dir}/pack/Author_Repo_master/packdep/httpx/0.28.1/update_0.27.8.pack"
+INFO | Writing update pack: 0.27.7 -> 0.28.1, "{run_dir}/pack/Author_Repo_master/packdep/httpx/0.28.1/update_0.27.7.pack"
+INFO | Dependency packs of "Author_Repo_master" generated
+INFO | Removing stale pack folder: "{run_dir}/pack/Author_Repo_master/packdep/httpx/0.26.0"
+WARNING | Failed to remove stale pack folder "{run_dir}/pack/Author_Repo_master/packdep/httpx/0.26.0": folder is held: {run_dir}/pack/Author_Repo_master/packdep/httpx/0.26.0
+INFO | Dependency packs of "Author_Repo_master" committed
+"""
         assert pack_file(run_dir, '0.26.0', 'full.pack').isfile()
         # the channel is complete, the stale folder is left to the next run
         assert pack_file(run_dir, '0.28.1', 'full.pack').isfile()
-        assert pack_file(run_dir, 'latest.pack').isfile()

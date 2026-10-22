@@ -9,24 +9,24 @@ of the build, and every dependency gets a channel of its own:
 1. fetch the wheel of every version of every dependency from the PyPI simple
    index (PEP 503) of the config to
    pack/{Author}_{Repo}_{Branch}/wheel/{name}/{version}/{filename}.whl, see
-   WheelFetcher. A version the mirror has no pure python wheel of (a
-   distribution with compiled extensions, a version the mirror does not hold)
-   is skipped with a warning: such a distribution is updated with pip, not
-   with a pack
-2. remove the wheel folders the lookback window does not ask for: the window
-   is the retention boundary of the wheel cache
-3. build the full pack of the target version and the update pack from every
+   WheelFetcher. Every wheel is required, the target and the historical
+   versions alike: a run that cannot fetch one of them fails, no repo pack is
+   published, so a published channel never lacks an update side
+2. build the full pack of the target version and the update pack from every
    other version to it, encoded from the wheels by PackWheel /
    PackWheelUpdate (a pack of a wheel is the install tree of the wheel, see
-   pack_wheel), then latest.pack of every dependency
-4. remove the dependency folders, the pack folders and the update pack files
-   the lookback window does not ask for
+   pack_wheel)
+3. commit(), after the repo tree is published: remove the wheel folders the
+   lookback window does not ask for, and the dependency folders, the pack
+   folders and the update pack files the window does not ask for
+
+The previous channel keeps serving the clients until commit(): a failed run
+or a failed repo publication leaves every old pack in place.
 
 The channel of a dependency is the layout the client reads (ServerFile):
 
-    pack/{Author}_{Repo}_{Branch}/packdep/{name}/latest.pack
     pack/{Author}_{Repo}_{Branch}/packdep/{name}/{new}/full.pack
-    pack/{Author}_{Repo}_{Branch}/packdep/{name}/{new}/from_{old}.pack
+    pack/{Author}_{Repo}_{Branch}/packdep/{name}/{new}/update_{old}.pack
 
 Only the target version has a full pack, the rule the git flow keeps for the
 latest commit: a client downloads the full pack of the version it updates to
@@ -42,22 +42,34 @@ under .../wheel/ with no change of the client.
 The versions of a dependency are the pins of PythonDeps.RequirementFiles over
 the lookback window, sampled by LookbackWheel: the pin of the latest commit is
 the target of the dependency (the version a client updates to, the only
-version latest.pack publishes), the pins of the old commits are the versions a
+version with a full pack), the pins of the old commits are the versions a
 client may still be on, every one of them gets an update path to the target (a
-full pack is only built of the target). Only the names of
-PythonDeps.PackUpdate are built; a name of
-the list that no commit of the window pins yields no wheel and no pack and is
-reported with a warning (a range constraint builds nothing, the version must
-be pinned with '=='). A name the latest commit does not pin has no target:
-nothing is built of it this run and its historical packs are kept.
+full pack is only built of the target). The names to build are the
+pack_update_deps of the mod entry at the latest commit, read from its source
+by PackRepoEntry: a name the entry does not declare is not fetched and gets no
+pack, and a declared name that no commit of the window pins yields no wheel
+and no pack and is reported with a warning (a range constraint builds nothing,
+the version must be pinned with '=='). A name the latest commit does not pin
+has no target: nothing is built of it this run and its historical packs are
+kept.
 
 The bytes of a pack only depend on the wheel of its version, so the pack of an
 earlier run is kept as it is: the identity of the file is read back
 (kept_pack) and a file of another format, of another version pair, or a file
 that cannot be read as a pack is written again. A run over a channel that is
-up to date builds nothing and only rewrites latest.pack, which is written
-after every pack of the target version is on the disk: it is the small file
-the clients read the published version from.
+up to date builds nothing; commit() still removes the entries the window does
+not ask for.
+
+The run leaves the snapshots of the channels it generated on the DepGen
+instance (the published attribute): the version and index checksum of every
+dependency whose latest commit pin has a target. The snapshots are built from
+the target full pack itself, never from a per dependency latest.pack. Every
+wheel is mandatory, the target and the historical versions alike: a
+dependency that cannot be fetched fails the run, so a published repo tree
+never references a dependency whose channel is incomplete.
+
+The pack encoder receives the DepGen object and encodes the snapshots into
+.pack/packdep.pack when the version extras are built.
 
 The repo of a config is an input of the generator, not cloned here: the caller
 opens the git repo of the config and passes it in, the generation only reads
@@ -70,11 +82,15 @@ Usage:
 
     config = PackRepoConfig('LmeSzinc_Alasio_master.yaml')
     repo = GitRepo(repo_path).read_lazy()
-    DepGen(repo, config.data).run()
+    dep = DepGen(repo, config.data)
+    dep.run()
+    # publish the repo tree, then remove the old dependency entries
+    dep.commit()
 """
 
 from msgspec import Struct
 
+from alasio.deploy.pack.packdep import validate_packdep_name
 from alasio.deploy_dev.pack.pack_wheel import PackWheel
 from alasio.deploy_dev.pack.pack_wheel_update import PackWheelUpdate
 from alasio.deploy_dev.pack_server.fetch_wheel import WHEEL_FOLDER, WheelFetcher, WheelNotFoundError
@@ -82,10 +98,11 @@ from alasio.deploy_dev.pack_server.gate import check_run_dir
 from alasio.deploy_dev.pack_server.lookback_wheel import LookbackWheel
 from alasio.deploy_dev.pack_server.pack_check import PackChecksum, kept_pack
 from alasio.deploy_dev.pack_server.parse_dep import normalize_name
+from alasio.deploy_dev.pack_server.parse_entry import ENTRY_FILE, PackRepoEntry
 from alasio.ext import env
 from alasio.ext.cache import cached_property
 from alasio.ext.path.atomic import (
-    atomic_failure_cleanup, atomic_remove, atomic_rmtree, atomic_write, atomic_write_stream, folder_rmtree_empty
+    atomic_failure_cleanup, atomic_remove, atomic_rmtree, atomic_write_stream, folder_rmtree_empty
 )
 from alasio.ext.path.validate import validate_filename
 from alasio.logger import logger
@@ -98,9 +115,6 @@ PACKDEP_FOLDER = 'packdep'
 
 # file of the full pack of a version, in the folder of the version
 FULL_PACK_FILE = 'full.pack'
-
-# file of the latest version of a dependency, in the folder of the dependency
-LATEST_PACK_FILE = 'latest.pack'
 
 # mirror of the dependencies no PythonDeps.PypiMirror entry lists: the base
 # url of the official PyPI, the default of PythonMirrorInfo.Url
@@ -145,8 +159,7 @@ class DepGen:
                 of a dependency file is read from it
             config (PackRepoModel): Config of the repo, read from a
                 PackRepoConfig: the PythonDeps group holds the files to
-                sample, the dependencies to build and the mirror to fetch
-                from
+                sample and the mirror to fetch from
             client (httpx2.Client, optional): Client the wheel fetches are
                 sent with, e.g. the injected client of a test. Its lifetime
                 belongs to the caller. Defaults to None, every fetch creates
@@ -159,9 +172,19 @@ class DepGen:
         self.repo = repo
         self.config = config
         self.client = client
+        # {name: (version, index checksum)} of the channels generated by
+        # run(), filled while the target full packs are written/kept. It is
+        # read from the full packs, never from a per dependency latest.pack.
+        self.published = {}
+        # whether run() completed the generation of this instance, the
+        # precondition of commit(): a failed run must not clean a channel
+        self._generated = False
         # the pins of the dependency files over the lookback window, the
         # latest commit first, see LookbackWheel
         self.wheel = LookbackWheel(repo, config)
+        # the pack_update_deps of the mod entry at the latest commit, read
+        # from its source when the sample needs it
+        self.entry = PackRepoEntry(repo)
         # the folder name is checked before anything is written, see repo_folder
         _ = self.repo_folder
 
@@ -212,36 +235,73 @@ class DepGen:
         return self.repo_folder.joinpath(PACKDEP_FOLDER)
 
     @cached_property
+    def managed(self):
+        """
+        The dependency names the mod entry declares for pack updates.
+
+        The names come from the pack_update_deps of the entry at the latest
+        commit of the repo, the version a client updates to: the client reads
+        the entry of the updated tree before it reconciles its dependencies.
+        The names are PEP 503 normalized and deduplicated, keeping the order
+        of the declaration.
+
+        Returns:
+            dict[str, None]: PEP 503 normalized names
+
+        Raises:
+            ValueError: If the repo has no branch to pack, the entry cannot
+                be read, or its pack_update_deps is written in a form the
+                parser does not support, see PackRepoEntry
+        """
+        commit = self.wheel.lookback.latest_commit
+        names = self.entry.pack_update_deps(commit)
+        if not names:
+            logger.info(
+                f'No pack_update_deps declared by {ENTRY_FILE} at {commit}, '
+                f'no dependency pack is built')
+            return {}
+        logger.info(
+            f'Using pack_update_deps of {ENTRY_FILE} at {commit}: {", ".join(names)}')
+        return dict.fromkeys(normalize_name(name) for name in names)
+
+    @cached_property
     def sample(self):
         """
         The dependencies to build: the pins of the window, managed names only.
 
-        Only the names of PythonDeps.PackUpdate are kept (PEP 503
-        normalized): a dependency the list does not name is not fetched and
-        gets no pack. The pins of the latest commit come first (the target of
-        an update), then the pins of the lookback commits, in the order the
-        sampler answered; a dependency is in the mapping once, with its
-        versions as one list.
+        Only the names of the mod entry pack_update_deps are kept (PEP 503
+        normalized): a dependency the entry does not declare is not fetched
+        and gets no pack. The pins of the latest commit come first (the
+        target of an update), then the pins of the lookback commits, in the
+        order the sampler answered; a dependency is in the mapping once, with
+        its versions as one list.
 
         Returns:
             dict[str, list[DepVersion]]: {PEP 503 name: versions to build},
                 the target of the name first when the name has one
 
         Raises:
-            ValueError: If the repo has no branch to pack, or a dependency
-                file of the window cannot be read, see LookbackWheel
+            ValueError: If the repo has no branch to pack, a dependency file
+                of the window cannot be read (see LookbackWheel), or the mod
+                entry cannot be read (see managed)
         """
-        # the names of PythonDeps.PackUpdate, normalized and deduplicated, in
-        # the order of the config: only these are fetched and packed
-        managed = dict.fromkeys(
-            normalize_name(name) for name in self.config.PythonDeps.PackUpdate)
+        # a config without a dependency file has nothing to sample, the
+        # entry does not need to be read
+        if not self.wheel.files:
+            return {}
+
+        # the window is sampled first: it reads the repo index the entry
+        # lookup needs, see PackRepoLookback
+        latest = self.wheel.latest_deps
+        lookback = self.wheel.lookback_deps
+        managed = self.managed
 
         sample = {}
-        for (name, version), commit in self.wheel.latest_deps.items():
+        for (name, version), commit in latest.items():
             if name in managed:
                 sample.setdefault(name, []).append(
                     DepVersion(name=name, version=version, commit=commit, target=True))
-        for (name, version), commit in self.wheel.lookback_deps.items():
+        for (name, version), commit in lookback.items():
             if name in managed:
                 sample.setdefault(name, []).append(
                     DepVersion(name=name, version=version, commit=commit, target=False))
@@ -249,20 +309,18 @@ class DepGen:
             if name not in sample:
                 logger.warning(
                     f'Dependency "{name}" is not pinned to a version in the lookback window, '
-                    f'nothing is built of it; a dependency of PythonDeps.PackUpdate must be '
-                    f'pinned with "==" in a dependency file of the config')
+                    f'nothing is built of it; a dependency of the mod entry pack_update_deps '
+                    f'must be pinned with "==" in a dependency file of the config')
         return sample
 
     def run(self):
         """
-        Generate and publish the packs of the dependencies of the repo.
+        Generate the packs of the dependencies of the repo.
 
-        The steps are the ones of the module docstring: fetch the wheels,
-        remove the stale wheel folders, build the packs, remove the stale
-        dependency folders, the pack folders and the stale pack files. The
-        packs of an earlier run that are complete are kept, so a run over an
-        up to date channel builds nothing and only rewrites latest.pack of
-        every dependency.
+        The steps are the ones of the module docstring: fetch the wheels and
+        build the full packs and the update packs. Nothing is deleted here:
+        the previous channel keeps serving the clients until commit() is
+        called after the repo tree is published.
 
         A run with no sampled dependency writes nothing and removes nothing.
 
@@ -272,12 +330,18 @@ class DepGen:
             ValueError: If the repo has no branch to pack, a dependency file
                 of the config cannot be read, or a wheel is not a pack target
                 (see PackWheel)
+            WheelNotFoundError: If a wheel of a dependency cannot be fetched,
+                the target and the historical versions alike: every update
+                path of the published channel must be complete
             httpx2.HTTPError: If a wheel cannot be fetched
             OSError: If a wheel or a pack cannot be written
         """
+        # a run is a new publication set, also when the instance is reused
+        self.published = {}
+        self._generated = False
         check_run_dir()
-        sample = self.sample
-        if not sample:
+        if not self.sample:
+            self._generated = True
             logger.info(f'No dependency to build of "{self.repo_folder.name}", skipped')
             return
 
@@ -285,7 +349,7 @@ class DepGen:
         # others have no version to update to, nothing is built of them and
         # their historical packs are kept
         targets = {}
-        for name, deps in sample.items():
+        for name, deps in self.sample.items():
             if self._target_of(deps) is None:
                 logger.warning(
                     f'Dependency "{name}" is not pinned by the latest commit, '
@@ -304,22 +368,42 @@ class DepGen:
 
         # 1. the wheel of every version of every dependency
         wheel_files = self._fetch_wheels(targets)
-        # 2. the wheel folders the sample does not ask for
-        self._remove_stale_wheels(sample)
-        # 3. the full packs, the update packs and latest.pack
+        # 2. the full packs, the update packs and the published snapshots
         self._write_packs(targets, wheel_files)
-        # 4. the dependency folders, pack folders and pack files the sample
-        # does not ask for
-        self._remove_stale_packs(sample)
+        # commit() may clean the channel only after every pack of the run is
+        # on the disk
+        self._generated = True
         logger.info(f'Dependency packs of "{self.repo_folder.name}" generated')
+
+    def commit(self):
+        """
+        Remove the old wheels and packs after the repo tree is published.
+
+        Called only after the repo latest.pack is written: the dependency
+        channel of the previous repo version keeps its packs until the new
+        repo tree is visible to the clients. A failed run or a failed repo
+        publication leaves every old pack in place.
+
+        Raises:
+            RuntimeError: If run() was not called
+        """
+        if not self._generated:
+            raise RuntimeError('DepGen.run() must be called before commit()')
+        if not self.sample:
+            return
+        self._remove_stale_wheels(self.sample)
+        self._remove_stale_packs(self.sample)
+        logger.info(f'Dependency packs of "{self.repo_folder.name}" committed')
 
     def _fetch_wheels(self, targets):
         """
         Fetch the wheel of every version of every dependency.
 
-        A version the mirror has no pure python wheel of is skipped with a
-        warning, see the module docstring: the version has no wheel file
-        then, no pack is built of it, and the client falls back to a rebuild.
+        Every wheel is required, the target and the historical versions alike:
+        a missing wheel fails the run instead of publishing a channel with a
+        missing update pack. The client of the channel would otherwise have to
+        rebuild from the target, and the channel would not be the complete
+        publication the packdep snapshot describes.
 
         Args:
             targets (dict[str, list[DepVersion]]): Dependencies to fetch
@@ -350,9 +434,11 @@ class DepGen:
                     try:
                         out[(name, dep.version)] = fetcher.fetch()
                     except WheelNotFoundError as e:
-                        logger.warning(
-                            f'No pure python wheel to pack of "{name}=={dep.version}", '
-                            f'the distribution must be updated with pip, skipped: {e}')
+                        role = 'target' if dep.target else 'historical'
+                        raise WheelNotFoundError(
+                            f'No usable wheel of the {role} dependency "{name}=={dep.version}", '
+                            f'the dependency packs cannot be generated: {e}'
+                        ) from e
         return out
 
     def _write_packs(self, targets, wheel_files):
@@ -382,8 +468,11 @@ class DepGen:
 
         The full pack of the target version an earlier run wrote is kept as it
         is, see kept_pack: only the packs that are missing are built, so a run
-        over a channel that is up to date builds nothing and only rewrites
-        latest.pack.
+        over a channel that is up to date builds nothing.
+
+        The per dependency latest.pack is not written: the repo packdep is the
+        only publication the clients read; the legacy marker is left on the
+        disk from an earlier run and is not updated.
 
         Args:
             deps (list[DepVersion]): Versions of the dependency, the target
@@ -407,19 +496,29 @@ class DepGen:
         else:
             wheel_file = wheel_files.get((name, target.version))
             if wheel_file is None:
-                # the wheel of the target version could not be fetched: there
-                # is no new side for the update packs and nothing to publish
-                logger.warning(
-                    f'No wheel of "{name}=={target.version}", the packs are not built, '
-                    f'latest.pack is not written, the published version is kept')
-                return
+                raise WheelNotFoundError(
+                    f'No usable wheel of the target dependency "{name}=={target.version}", '
+                    f'the full pack cannot be built')
             target_pack = PackWheel(wheel_file)
             logger.info(f'Writing full pack: "{file}"')
             atomic_write_stream(file, target_pack.iter_pack_data())
             # read the identity back from the file: the same read the kept
-            # path does, so latest.pack is built from the checksum of the
+            # path does, so the published snapshot uses the checksum of the
             # pack that is on the disk
             target_checksum = PackChecksum.from_file(file).index_checksum
+
+        # the snapshot of the channel, read from the target full pack: the
+        # repo packdep is built from this, never from a per dependency
+        # latest.pack
+        try:
+            validate_packdep_name(name)
+            validate_filename(target.version)
+        except ValueError as e:
+            logger.warning(
+                f'The channel of "{name}=={target.version}" has no packdep-safe name or '
+                f'version, the dependency is left out of packdep: {e}')
+            return
+        self.published[name] = (target.version, target_checksum)
 
         # 2. the update pack from every other version to the target. The
         # install tree of the old version is the old side of the update pack
@@ -431,38 +530,29 @@ class DepGen:
         for dep in deps:
             if dep.target:
                 continue
-            file = dep_folder.joinpath(target.version).joinpath(f'from_{dep.version}.pack')
+            file = dep_folder.joinpath(target.version).joinpath(f'update_{dep.version}.pack')
             identity = kept_pack(file, PackWheel.PACK_VERSION, target.version, dep.version)
             if identity is not None:
                 logger.info(f'Update pack exists, skipped: "{file}"')
                 continue
             old_wheel = wheel_files.get((name, dep.version))
             if old_wheel is None:
-                logger.warning(
-                    f'No wheel of "{name}=={dep.version}", the update pack is not '
-                    f'built: "{file}"')
-                continue
+                raise WheelNotFoundError(
+                    f'No usable wheel of the historical dependency "{name}=={dep.version}", '
+                    f'the update pack cannot be built')
             if new_pack is None:
                 new_wheel = wheel_files.get((name, target.version))
                 if new_wheel is None:
-                    # every update pack needs the new side; the target full
-                    # pack of an earlier run is on the disk but the wheel is
-                    # not: the packs cannot be rebuilt
-                    logger.warning(
-                        f'No wheel of "{name}=={target.version}", the update packs are not built')
-                    break
+                    # every update pack needs the new side: the target full
+                    # pack of an earlier run is on the disk but its wheel is
+                    # not, so the update packs cannot be completed
+                    raise WheelNotFoundError(
+                        f'No usable wheel of the target dependency "{name}=={target.version}", '
+                        f'the update packs cannot be built')
                 new_pack = PackWheel(new_wheel)
             old_pack = PackWheel(old_wheel)
             logger.info(f'Writing update pack: {dep.version} -> {target.version}, "{file}"')
             atomic_write_stream(file, PackWheelUpdate(new_pack, old_pack).iter_pack_data())
-
-        # 3. latest.pack, after every pack of the target version is on the
-        # disk: the file the clients read the published version from, the
-        # version in utf-8 followed by the 20 bytes index pack checksum, the
-        # layout PackEncodeBase.latest_pack() writes
-        file = dep_folder.joinpath(LATEST_PACK_FILE)
-        logger.info(f'Writing latest info: version={target.version}, "{file}"')
-        atomic_write(file, target.version.encode('utf-8') + target_checksum)
 
     def _remove_stale_wheels(self, sample):
         """
@@ -506,7 +596,7 @@ class DepGen:
         one update pack per other version of the window, so another version
         folder is the leftover of an earlier run and is removed (its full pack
         was the layout of an earlier run). An update pack of a version out of
-        the window is removed too. Only the folders and the from_ files are
+        the window is removed too. Only the folders and the update_ files are
         recognized: a file of another tool in the folder is left alone. A
         removal that fails is logged and retried by the next run.
 
@@ -554,9 +644,9 @@ class DepGen:
                 if updated is None:
                     continue
                 for filename in version_folder.iter_filenames(ext='.pack'):
-                    if not filename.startswith('from_'):
+                    if not filename.startswith('update_'):
                         continue
-                    old = filename[len('from_'):-len('.pack')]
+                    old = filename[len('update_'):-len('.pack')]
                     if old in updated:
                         continue
                     file = version_folder.joinpath(filename)

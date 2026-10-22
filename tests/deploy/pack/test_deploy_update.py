@@ -4,7 +4,7 @@ Tests for DeployJob.update: the unified entry of the update flow.
 The server is an in-memory MockServerFile serving two versions and the
 update pack between them. The flow follows the draft in PackEncodeBase:
 latest.pack is compared with the local version, a version mismatch
-downloads the update pack /{new}/from_{old}.pack and applies it with
+downloads the update pack /{new}/update_{old}.pack and applies it with
 UpdateJob, the same version continues with ResetJob. The update(version)
 form, covered by TestVersionDrivenUpdate, adds one verification: latest.pack
 must publish the given version, otherwise the server provides no valid
@@ -28,6 +28,7 @@ from alasio.deploy.pack.job import DeployJob
 from alasio.deploy.pack.job_rebuild import RebuildJob
 from alasio.deploy.pack.job_unpack import UnpackJob
 from alasio.deploy.pack.job_update import UpdateJob
+from alasio.deploy.pack.server_file import LatestInfo
 from alasio.deploy_dev.pack.pack_full import PackFull
 from alasio.deploy_dev.pack.pack_update import PackUpdate
 from alasio.ext import env
@@ -117,6 +118,29 @@ OTHER_UPDATE = b''.join(PackUpdate(
         'old': {'other.txt': b'old\n'},
         'new': {'other.txt': b'new\n'},
     }), commit='new'), 'old').iter_pack_data())
+# a self-consistent update pack of the right version pair but another new
+# index: its old tree is the scenario one, so its index record applies to the
+# local old index and the wrong index reaches the commit check
+WRONG_INDEX_NEW = dict(FULL_SCENARIO_NEW)
+WRONG_INDEX_NEW['other.txt'] = b'other\n'
+WRONG_INDEX_REPO = make_repo({
+    'old': FULL_SCENARIO_OLD,
+    'new': WRONG_INDEX_NEW,
+})
+WRONG_INDEX_UPDATE = b''.join(PackUpdate(
+    PackFull(WRONG_INDEX_REPO, commit='new'), 'old').iter_pack_data())
+# the index checksum the update pack produces (the checksum of its new full
+# pack), not the checksum of the update pack's own index section
+WRONG_INDEX_CHECKSUM = PackDecodeBase(
+    b''.join(PackFull(WRONG_INDEX_REPO, commit='new').iter_pack_data())).index_checksum
+# a self-consistent update pack of another version pair, served under the
+# path of the pair the client asks for
+MISMATCHED_UPDATE = b''.join(PackUpdate(
+    PackFull(make_repo({
+        'old': {'other.txt': b'old\n'},
+        'other': {'other.txt': b'other\n'},
+        'new': {'other.txt': b'new\n'},
+    }), commit='new'), 'other').iter_pack_data())
 
 
 def make_server():
@@ -222,6 +246,7 @@ INFO | [LatestVersion] new
 INFO | Update available: no local version, latest is new
 WARNING | Failed to read the local version, rebuilding from the latest index
 INFO | Rebuilding files to "{env.PROJECT_ROOT}"
+INFO | Downloading the full pack of new
 WARNING | Failed to read the old index pack: [Errno 2] No such file or directory: '{env.PROJECT_ROOT}/.pack/index.pack'
 INFO | Rebuild done
 """
@@ -241,9 +266,10 @@ INFO | Rebuild done
 INFO | [CurrentVersion] old
 INFO | [LatestVersion] new
 INFO | Update available: old -> new
-WARNING | Request to "http://mock/new/from_old.pack" failed (attempt 1/3): HTTPStatusError: Client error '404 Not Found' for url 'http://mock/new/from_old.pack'
-WARNING | Failed to get the update pack old -> new: Client error '404 Not Found' for url 'http://mock/new/from_old.pack', rebuilding from the latest index
+WARNING | Request to "http://mock/new/update_old.pack" failed (attempt 1/3): HTTPStatusError: Client error '404 Not Found' for url 'http://mock/new/update_old.pack'
+WARNING | Failed to get the update pack old -> new: Client error '404 Not Found' for url 'http://mock/new/update_old.pack', rebuilding from the latest index
 INFO | Rebuilding files to "{env.PROJECT_ROOT}"
+INFO | Downloading the full pack of new
 INFO | Rebuild done
 """
         assert read_tree() == NEW_TREE
@@ -264,9 +290,62 @@ INFO | [LatestVersion] new
 INFO | Update available: old -> new
 WARNING | Failed to get the update pack old -> new: Failed to decode header: not a pack file: b'garb', rebuilding from the latest index
 INFO | Rebuilding files to "{env.PROJECT_ROOT}"
+INFO | Downloading the full pack of new
 INFO | Rebuild done
 """
         assert read_tree() == NEW_TREE
+        decoder = PackDecodeBase(file_read_bytes(env.PROJECT_ROOT / '.pack/index.pack'))
+        assert decoder.current_version == 'new'
+        assert not os.path.exists(env.PROJECT_ROOT / '.pack/workspace')
+
+    @pytest.mark.trio
+    async def test_update_pack_of_another_pair_falls_back(self, app_folder):
+        """The server serves a self-consistent update pack of another version
+        pair under the requested path: the pair is refused and the tree is
+        rebuilt from the latest index."""
+        server = make_server()
+        server.register_update('old', 'new', MISMATCHED_UPDATE)
+        await UnpackJob(OLD_PACK).run()
+        with logger.mock_capture_writer() as capture:
+            assert await DeployJob(server=server).update()
+        assert capture.concat() == f"""\
+INFO | [CurrentVersion] old
+INFO | [LatestVersion] new
+INFO | Update available: old -> new
+WARNING | Failed to get the update pack old -> new: Failed to download the update pack: it is "other" -> "new", expected "old" -> "new", rebuilding from the latest index
+INFO | Rebuilding files to "{env.PROJECT_ROOT}"
+INFO | Downloading the full pack of new
+INFO | Rebuild done
+"""
+        assert read_tree() == NEW_TREE
+        decoder = PackDecodeBase(file_read_bytes(env.PROJECT_ROOT / '.pack/index.pack'))
+        assert decoder.current_version == 'new'
+        assert not os.path.exists(env.PROJECT_ROOT / '.pack/workspace')
+
+    @pytest.mark.trio
+    async def test_update_pack_of_another_index_falls_back(self, app_folder):
+        """A self-consistent update pack of the right version pair but another
+        index is refused before any target file changes: the prepared index
+        checksum is bound to the latest one, then the tree is rebuilt."""
+        server = make_server()
+        server.register_update('old', 'new', WRONG_INDEX_UPDATE)
+        await UnpackJob(OLD_PACK).run()
+        other_checksum = WRONG_INDEX_CHECKSUM
+        with logger.mock_capture_writer() as capture:
+            assert await DeployJob(server=server).update()
+        assert capture.concat() == f"""\
+INFO | [CurrentVersion] old
+INFO | [LatestVersion] new
+INFO | Update available: old -> new
+INFO | Updating files to "{env.PROJECT_ROOT}"
+WARNING | Failed to update: The update pack produces an index pack with checksum "{other_checksum}", expected "{NEW_DECODER.index_checksum}", discarding the workspace
+WARNING | Failed to apply the update pack, rebuilding from the latest index
+INFO | Rebuilding files to "{env.PROJECT_ROOT}"
+INFO | Downloading the full pack of new
+INFO | Rebuild done
+"""
+        assert read_tree() == NEW_TREE
+        assert 'other.txt' not in read_tree()
         decoder = PackDecodeBase(file_read_bytes(env.PROJECT_ROOT / '.pack/index.pack'))
         assert decoder.current_version == 'new'
         assert not os.path.exists(env.PROJECT_ROOT / '.pack/workspace')
@@ -301,6 +380,7 @@ INFO | [LatestVersion] new
 INFO | Update available: no local version, latest is new
 WARNING | Failed to read the local version, rebuilding from the latest index
 INFO | Rebuilding files to "{env.PROJECT_ROOT}"
+INFO | Downloading the full pack of new
 WARNING | Failed to read the old index pack: [Errno 2] No such file or directory: '{env.PROJECT_ROOT}/.pack/index.pack'
 INFO | Rebuild done
 """
@@ -376,6 +456,7 @@ INFO | [LatestVersion] new
 INFO | Update available: no local version, latest is new
 WARNING | Failed to read the local version, rebuilding from the latest index
 INFO | Rebuilding files to "{env.PROJECT_ROOT}"
+INFO | Downloading the full pack of new
 WARNING | Failed to read the old index pack: [Errno 2] No such file or directory: '{env.PROJECT_ROOT}/.pack/index.pack'
 INFO | Rebuild done
 """
@@ -393,9 +474,10 @@ INFO | Rebuild done
 INFO | [CurrentVersion] old
 INFO | [LatestVersion] new
 INFO | Update available: old -> new
-WARNING | Request to "http://mock/new/from_old.pack" failed (attempt 1/3): HTTPStatusError: Client error '404 Not Found' for url 'http://mock/new/from_old.pack'
-WARNING | Failed to get the update pack old -> new: Client error '404 Not Found' for url 'http://mock/new/from_old.pack', rebuilding from the latest index
+WARNING | Request to "http://mock/new/update_old.pack" failed (attempt 1/3): HTTPStatusError: Client error '404 Not Found' for url 'http://mock/new/update_old.pack'
+WARNING | Failed to get the update pack old -> new: Client error '404 Not Found' for url 'http://mock/new/update_old.pack', rebuilding from the latest index
 INFO | Rebuilding files to "{env.PROJECT_ROOT}"
+INFO | Downloading the full pack of new
 INFO | Rebuild done
 """
         assert len(calls) == 1
@@ -413,6 +495,7 @@ INFO | [LatestVersion] new
 INFO | Update available: old -> new
 WARNING | Failed to get the update pack old -> new: Failed to decode header: not a pack file: b'garb', rebuilding from the latest index
 INFO | Rebuilding files to "{env.PROJECT_ROOT}"
+INFO | Downloading the full pack of new
 INFO | Rebuild done
 """
         assert len(calls) == 1
@@ -531,9 +614,10 @@ INFO | Update done
 INFO | [CurrentVersion] old
 INFO | [LatestVersion] new
 INFO | Update available: old -> new
-WARNING | Request to "http://mock/new/from_old.pack" failed (attempt 1/3): HTTPStatusError: Client error '404 Not Found' for url 'http://mock/new/from_old.pack'
-WARNING | Failed to get the update pack old -> new: Client error '404 Not Found' for url 'http://mock/new/from_old.pack', rebuilding from the latest index
+WARNING | Request to "http://mock/new/update_old.pack" failed (attempt 1/3): HTTPStatusError: Client error '404 Not Found' for url 'http://mock/new/update_old.pack'
+WARNING | Failed to get the update pack old -> new: Client error '404 Not Found' for url 'http://mock/new/update_old.pack', rebuilding from the latest index
 INFO | Rebuilding files to "{env.PROJECT_ROOT}"
+INFO | Downloading the full pack of new
 INFO | Rebuild done
 """
         assert phases.phases == ['checking', 'downloading', 'updating']
@@ -552,6 +636,7 @@ INFO | [LatestVersion] new
 INFO | Update available: no local version, latest is new
 WARNING | Failed to read the local version, rebuilding from the latest index
 INFO | Rebuilding files to "{env.PROJECT_ROOT}"
+INFO | Downloading the full pack of new
 WARNING | Failed to read the old index pack: [Errno 2] No such file or directory: '{env.PROJECT_ROOT}/.pack/index.pack'
 INFO | Rebuild done
 """
@@ -682,6 +767,7 @@ INFO | [LatestVersion] new
 INFO | Update available: no local version, latest is new
 WARNING | Failed to read the local version, rebuilding from the latest index
 INFO | Rebuilding files to "{env.PROJECT_ROOT}"
+INFO | Downloading the full pack of new
 WARNING | Failed to read the old index pack: [Errno 2] No such file or directory: '{env.PROJECT_ROOT}/.pack/index.pack'
 INFO | Rebuild done
 """
@@ -722,9 +808,10 @@ INFO | Reset done
 INFO | [CurrentVersion] old
 INFO | [LatestVersion] new
 INFO | Update available: old -> new
-WARNING | Request to "http://mock/new/from_old.pack" failed (attempt 1/3): HTTPStatusError: Client error '404 Not Found' for url 'http://mock/new/from_old.pack'
-WARNING | Failed to get the update pack old -> new: Client error '404 Not Found' for url 'http://mock/new/from_old.pack', rebuilding from the latest index
+WARNING | Request to "http://mock/new/update_old.pack" failed (attempt 1/3): HTTPStatusError: Client error '404 Not Found' for url 'http://mock/new/update_old.pack'
+WARNING | Failed to get the update pack old -> new: Client error '404 Not Found' for url 'http://mock/new/update_old.pack', rebuilding from the latest index
 INFO | Rebuilding files to "{env.PROJECT_ROOT}"
+INFO | Downloading the full pack of new
 INFO | Rebuild done
 """
         assert len(latest_calls) == 1
@@ -917,6 +1004,51 @@ INFO | Update done
         job.job_file_kept = True
         job.write()
         assert file_read_bytes(workspace_file('job.pack')) == b'kept bytes'
+
+    @pytest.mark.trio
+    async def test_a_matching_snapshot_skips_latest(self, app_folder, monkeypatch):
+        """A local index that is exactly the trusted snapshot is validated
+        without a latest.pack request."""
+        await UnpackJob(NEW_PACK).run()
+        info = LatestInfo(version='new', checksum=NEW_DECODER.index_checksum)
+
+        async def unexpected():
+            raise AssertionError('latest.pack must not be requested')
+
+        monkeypatch.setattr(SERVER, 'get_latest_info', unexpected)
+        with logger.mock_capture_writer() as capture:
+            assert await DeployJob(server=SERVER).update(latest_info=info)
+        assert capture.concat() == f"""\
+INFO | [CurrentVersion] new
+INFO | [LatestVersion] new
+INFO | Already up to date: new
+INFO | Resetting files to "{env.PROJECT_ROOT}"
+INFO | Reset done
+"""
+
+    @pytest.mark.trio
+    async def test_a_snapshot_drives_the_update(self, app_folder):
+        """A snapshot is the target of the flow: a local version different
+        from it is updated, and latest.pack is never requested."""
+        server = make_server()
+        await UnpackJob(OLD_PACK).run()
+        info = LatestInfo(version='new', checksum=NEW_DECODER.index_checksum)
+
+        async def unexpected():
+            raise AssertionError('latest.pack must not be requested')
+
+        server.get_latest_info = unexpected
+        with logger.mock_capture_writer() as capture:
+            assert await DeployJob(server=server).update(latest_info=info)
+        assert capture.concat() == f"""\
+INFO | [CurrentVersion] old
+INFO | [LatestVersion] new
+INFO | Update available: old -> new
+INFO | Updating files to "{env.PROJECT_ROOT}"
+INFO | Replacing files to "{env.PROJECT_ROOT}"
+INFO | Update done
+"""
+        assert read_tree() == NEW_TREE
 
     @pytest.mark.trio
     async def test_without_a_kept_pack_downloads(self, app_folder):

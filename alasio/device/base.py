@@ -1,17 +1,18 @@
 import time
 from collections import deque
 from datetime import datetime
+from threading import Lock
 from typing import TYPE_CHECKING
 
 from alasio.backend.worker.bridge import BackendBridge
 from alasio.backend.worker.event import ConfigEvent
-from alasio.base.image.imfile import image_encode
 from alasio.device.config import DeviceConfig
 from alasio.ext.cache import cached_property_threadsafe
 from alasio.logger import logger
 
 if TYPE_CHECKING:
     import numpy as np
+    from lxml import etree
 
 
 class DeviceBase:
@@ -19,8 +20,25 @@ class DeviceBase:
         logger.hr('Device', level=1)
         self.config = config
         self.image: "np.ndarray" = None
+        self.hierarchy: "etree._Element" = None
         self._image_time = 0.
         self._last_preview_time = 0.
+
+        # Event epochs of the caches, see cached_on_screenshot and cached_on_hierarchy
+        # in alasio/base/cache.py. An epoch is only compared by the store path of
+        # the decorators, to detect a value computed across a new event.
+        self._screenshot_epoch = 0
+        self._hierarchy_epoch = 0
+        # {weakref.ref(instance): {attrname, ...}} of the values cached on the
+        # current event, weak keys and attrnames only: the registry references
+        # neither the instance nor the value. It holds the instances that computed
+        # a value since the last event, so dropping is proportional to the active
+        # instances, not to the history of the process.
+        self._screenshot_caches: "dict" = {}
+        self._hierarchy_caches: "dict" = {}
+        # Protects the registries and the store/drop critical sections.
+        # Never held while computing a cached value.
+        self._cache_lock = Lock()
 
     def on_idle(self):
         """
@@ -29,6 +47,8 @@ class DeviceBase:
         """
         self.image = None
         self._image_time = 0.
+        # no image, every value cached from a screenshot is invalid
+        self._on_new_screenshot()
 
     def on_task_switch(self):
         """
@@ -36,6 +56,76 @@ class DeviceBase:
         Subclasses needs to implement this
         """
         pass
+
+    def set_image(self, image):
+        """
+        Set an external image, for dev tools
+
+        Equivalent to `self.image = image; self._on_new_screenshot()`
+
+        Args:
+            image (np.ndarray):
+        """
+        self.image = image
+        self._image_time = time.time()
+        self._on_new_screenshot()
+
+    def set_hierarchy(self, hierarchy):
+        """
+        Set an external hierarchy, for dev tools
+
+        Equivalent to `self.hierarchy = hierarchy; self._on_new_hierarchy()`
+
+        Args:
+            hierarchy (etree._Element):
+        """
+        self.hierarchy = hierarchy
+        self._on_new_hierarchy()
+
+    def _on_new_screenshot(self):
+        """
+        Advance to the next screenshot: drop every value cached by @cached_on_screenshot
+
+        Must be called after `self.image` is updated, so the values computed from the
+        new image are stamped with the new epoch. Called by `screenshot()` implementations,
+        `set_image()` and `on_idle()`.
+        """
+        with self._cache_lock:
+            self._screenshot_epoch += 1
+            self._drop_caches(self._screenshot_caches)
+
+    def _on_new_hierarchy(self):
+        """
+        Advance to the next hierarchy dump: drop every value cached by @cached_on_hierarchy
+
+        Mirrors `_on_new_screenshot()`, called by `dump_hierarchy()` implementations
+        after `self.hierarchy` is updated, and by `set_hierarchy()`.
+        """
+        with self._cache_lock:
+            self._hierarchy_epoch += 1
+            self._drop_caches(self._hierarchy_caches)
+
+    @staticmethod
+    def _drop_caches(registry):
+        """
+        Drop every value registered on a cache registry
+
+        The caller must hold `self._cache_lock`.
+
+        Args:
+            registry (dict): {weakref.ref(instance): {attrname, ...}}
+        """
+        for ref, attrs in list(registry.items()):
+            instance = ref()
+            if instance is None:
+                # the instance is gone, the values are gone with it
+                continue
+            cache = instance.__dict__
+            for attrname in attrs:
+                cache.pop(attrname, None)
+        # the registrations only live for one event window: the registry tracks
+        # the instances holding entries, not the history of the process
+        registry.clear()
 
     @cached_property_threadsafe
     def screenshot_deque(self):
@@ -72,6 +162,9 @@ class DeviceBase:
         Yields:
             tuple[str, bytes]: (filename, image_bytes)
         """
+        # local import to avoid importing numpy/opencv globally
+        from alasio.base.image.imfile import image_encode
+
         for data in self.screenshot_deque:
             imtime = datetime.strftime(data['time'], '%Y-%m-%d_%H-%M-%S-%f')
             image = image_encode(data['image'], ext='webp')
@@ -83,8 +176,26 @@ class DeviceBase:
         Method that take screenshot, set `self.image` and `self._image_time`
         Subclasses needs to implement this
 
+        Note:
+            `self._on_new_screenshot()` must be called after `self.image` is updated,
+            so the values cached by @cached_on_screenshot are dropped
+
         Returns:
             np.ndarray:
+        """
+        raise NotImplementedError
+
+    def dump_hierarchy(self):
+        """
+        Method that dump UI hierarchy, set `self.hierarchy`
+        Subclasses needs to implement this
+
+        Note:
+            `self._on_new_hierarchy()` must be called after `self.hierarchy` is updated,
+            so the values cached by @cached_on_hierarchy are dropped
+
+        Returns:
+            etree._Element:
         """
         raise NotImplementedError
 

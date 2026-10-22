@@ -17,7 +17,7 @@ The server layout follows the draft in PackEncodeBase:
   checksum of the index pack of that version
 - {mirror}/{version}/full.pack: full pack of a version, the front part of it is
   the index pack of that version
-- {mirror}/{new_version}/from_{old_version}.pack: update pack from the old
+- {mirror}/{new_version}/update_{old_version}.pack: update pack from the old
   version to the new version
 
 The public methods return the business types of the pack format and validate
@@ -306,18 +306,66 @@ class ServerFile(AsyncHttpProbe):
                 f'expected {checksum}, got {decoder.index_checksum}')
         return decoder
 
+    async def get_full_pack(self, version, checksum=''):
+        """
+        Get the whole full pack of a version from {mirror}/{version}/full.pack.
+
+        The whole file is transferred with one request, with no range request:
+        the full pack path of a rebuild needs every byte of the data section,
+        the range requests of the per-file path would fetch the very same bytes
+        record by record. The pack is validated before it is returned
+        (validate(), the checksums of both sections): a mirror that serves a
+        broken pack is dropped and the download is retried once on another one,
+        see the class docstring. When a checksum is given, the index checksum
+        of the pack (the trailing digest of its front part) must match it, the
+        checksum latest.pack advertised for the version: a mirror that serves
+        another pack under the same path cannot be used, it is reselected and
+        the download is retried once.
+
+        Args:
+            version (str): Version to query
+            checksum (str, optional): Expected index pack checksum, hex string,
+                the one get_latest_info() returned. Defaults to '', no extra
+                check
+
+        Returns:
+            PackDecodeBase: Decoder of the full pack, validated
+
+        Raises:
+            PackDecodeError: If the pack does not decode or validate, or the
+                checksum mismatches
+            httpx2.HTTPError: If the request fails
+            AllMirrorsFailedError: If no mirror is usable
+        """
+        path = f'/{version}/full.pack'
+
+        async def work(name, url):
+            data = await self.get_bytes(url, path)
+            decoder = PackDecodeBase(data)
+            decoder.validate()
+            if checksum and decoder.index_checksum != checksum:
+                raise PackDecodeError(
+                    f'Failed to download the full pack: index checksum mismatch, '
+                    f'expected {checksum}, got {decoder.index_checksum}')
+            return decoder
+
+        return await self.fetch(path, work)
+
     async def get_update_pack(self, old_version, new_version):
         """
         Get the update pack from an old version to a new version from
-        {mirror}/{new_version}/from_{old_version}.pack.
+        {mirror}/{new_version}/update_{old_version}.pack.
 
         The pack is validated before it is returned (validate()): the checksums
-        of both sections of the format are checked, a mirror that serves a
-        broken update pack is dropped and the download is retried once on
-        another one - the flow applies the validity of the pack next, it
-        must not decode it a second time. A missing update pack (a 404) is the
-        answer of the server and is raised as-is: another mirror would answer
-        the same, the caller falls back to a rebuild (see DeployJob.update()).
+        of both sections of the format are checked, and the version pair
+        recorded inside the pack must be the requested one - the path names the
+        pair, a pack of another pair can be self-consistent but cannot update
+        these files. A mirror that serves a broken or foreign update pack is
+        dropped and the download is retried once on another one - the flow
+        applies the validity of the pack next, it must not decode it a second
+        time. A missing update pack (a 404) is the answer of the server and is
+        raised as-is: another mirror would answer the same, the caller falls
+        back to a rebuild (see DeployJob.update()).
 
         Args:
             old_version (str): Version of the local files
@@ -327,16 +375,23 @@ class ServerFile(AsyncHttpProbe):
             PackDecodeBase: Decoder of the update pack, validated
 
         Raises:
-            PackDecodeError: If the pack does not decode or validate
+            PackDecodeError: If the pack does not decode or validate, or its
+                internal version pair is not the requested one
             httpx2.HTTPError: If the request fails
             AllMirrorsFailedError: If no mirror is usable
         """
-        path = f'/{new_version}/from_{old_version}.pack'
+        path = f'/{new_version}/update_{old_version}.pack'
 
         async def work(name, url):
             data = await self.get_bytes(url, path)
             decoder = PackDecodeBase(data)
             decoder.validate()
+            if decoder.old_version != old_version or decoder.current_version != new_version:
+                raise PackDecodeError(
+                    f'Failed to download the update pack: it is '
+                    f'"{decoder.old_version}" -> "{decoder.current_version}", '
+                    f'expected "{old_version}" -> "{new_version}"'
+                )
             return decoder
 
         return await self.fetch(path, work)
@@ -344,7 +399,7 @@ class ServerFile(AsyncHttpProbe):
     async def get_update_pack_checksum(self, old_version, new_version, size):
         """
         Get the whole-pack checksum of the update pack from
-        {mirror}/{new_version}/from_{old_version}.pack.
+        {mirror}/{new_version}/update_{old_version}.pack.
 
         The pack format keeps a 20 bytes digest as the trailing bytes of the
         pack file, the sha1 of everything before it (PackDecodeBase validates it
@@ -371,7 +426,7 @@ class ServerFile(AsyncHttpProbe):
                 downloads the pack as usual
             AllMirrorsFailedError: If no mirror is usable
         """
-        path = f'/{new_version}/from_{old_version}.pack'
+        path = f'/{new_version}/update_{old_version}.pack'
 
         async def work(name, url):
             headers = {'Range': f'bytes={size - 20}-{size - 1}'}
@@ -422,3 +477,56 @@ class ServerFile(AsyncHttpProbe):
             return decoder.decode_content(info, data)
 
         return await self.fetch(path, work)
+
+
+class ServerFileWithLatestInfo(ServerFile):
+    """
+    A server view whose latest info is a preset snapshot.
+
+    The class lets a caller drive the ordinary deploy flow from a trusted
+    snapshot, e.g. the dependency snapshot of a packed tree, without a
+    latest.pack request. The local index still decides whether the flow is an
+    update or a validation.
+
+    The attributes of the input server are copied into the new instance, so
+    the inherited methods keep working on the same client and mirror state;
+    only get_latest_info() is overridden. Use create() rather than the
+    constructor.
+    """
+
+    @classmethod
+    def create(cls, server, latest_info):
+        """
+        Wrap a server with a preset latest info.
+
+        Args:
+            server (ServerFile): Server whose state is copied
+            latest_info (LatestInfo): Snapshot get_latest_info() returns
+
+        Returns:
+            ServerFileWithLatestInfo: The wrapped server
+
+        Raises:
+            TypeError: If server is not a ServerFile
+            ValueError: If latest_info is None
+        """
+        if not isinstance(server, ServerFile):
+            raise TypeError(f'Expected a ServerFile, got {type(server).__name__}')
+        if latest_info is None:
+            raise ValueError('Expected a latest_info snapshot')
+        obj = cls.__new__(cls)
+        obj.__dict__.update(server.__dict__)
+        # a test may pin get_latest_info() on the instance; the snapshot
+        # override of this class must win over a copied instance attribute
+        obj.__dict__.pop('get_latest_info', None)
+        obj._latest_info = latest_info
+        return obj
+
+    async def get_latest_info(self):
+        """
+        Return the preset snapshot without a request.
+
+        Returns:
+            LatestInfo: The snapshot of create()
+        """
+        return self._latest_info

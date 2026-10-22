@@ -113,19 +113,17 @@ class TestPythonDepsConfig:
     """The python dependencies to build packs of."""
 
     def test_default(self):
-        """The default group is empty: no dependency file, the official PyPI, no pack."""
+        """The default group is empty: no dependency file, the official PyPI."""
         deps = PythonDepsConfig()
         assert deps.RequirementFiles == []
         assert deps.PypiMirror == 'https://pypi.org/simple'
-        assert deps.PackUpdate == []
+        assert not hasattr(deps, 'PackUpdate')
 
     def test_default_not_shared(self):
-        """The default lists are not shared among instances, a filled one stays empty."""
+        """The default list is not shared among instances, a filled one stays empty."""
         first = PythonDepsConfig()
         first.RequirementFiles.append('requirements.txt')
-        first.PackUpdate.append('httpx')
         assert PythonDepsConfig().RequirementFiles == []
-        assert PythonDepsConfig().PackUpdate == []
 
 
 class TestPackRepoModel:
@@ -147,8 +145,10 @@ class TestPackRepoConfig:
         with logger.mock_capture_writer() as capture:
             with pytest.raises(ValueError, match='Empty Author'):
                 PackRepoConfig(FILE)
-        assert capture.fd.any_contains('Invalid pack config value')
-        assert capture.fd.any_contains(FILE)
+        assert capture.concat() == f"""\
+WARNING | Invalid pack config value: [Errno 2] No such file or directory: '{run_dir}/config/LmeSzinc_AzurLaneAutoScript.yaml', file={run_dir}/config/LmeSzinc_AzurLaneAutoScript.yaml
+INFO | Write config {run_dir}/config/LmeSzinc_AzurLaneAutoScript.yaml
+"""
         # the created file holds the default config, the operator fills it
         assert read_config(config_file(run_dir)) == msgspec.to_builtins(PackRepoModel())
         # and the help comments of every field of the model, the comment text
@@ -199,7 +199,9 @@ Repo:
         file = f'{run_dir}/config/{PackRepoConfig.TEMPLATE_FILE}'
         with logger.mock_capture_writer() as capture:
             assert PackRepoConfig.write_template() is True
-        assert capture.fd.any_contains('Write config')
+        assert capture.concat() == f"""\
+INFO | Write config {run_dir}/config/template.yaml
+"""
         # the template holds the default config and the help comments of the model
         assert read_config(file) == msgspec.to_builtins(PackRepoModel())
         with open(file, encoding='utf-8') as f:
@@ -257,7 +259,7 @@ Lookback:
         assert config.data.Lookback.AdditionalCommit == ['4f3a8b2c1d5e6f708192a3b4c5d6e7f8091a2b3c']
 
     def test_read_python_deps(self, fs, run_dir):
-        """The PythonDeps group is read: the files, the list form of the mirror and the packs to build."""
+        """The PythonDeps group is read: the files and the list form of the mirror."""
         fs.create_file(config_file(run_dir), contents="""\
 Repo:
   Remote: https://github.com/LmeSzinc/AzurLaneAutoScript
@@ -276,9 +278,6 @@ PythonDeps:
       Deps:
         - httpx2
         - starlette
-  PackUpdate:
-    - requests
-    - httpx2
 """)
         config = PackRepoConfig(FILE)
         assert config.errors == []
@@ -288,7 +287,27 @@ PythonDeps:
             PythonMirrorInfo(Url='https://mirrors.aliyun.com/pypi/simple', Deps=['requests']),
             PythonMirrorInfo(Url='https://pack.example.com/pypi', Deps=['httpx2', 'starlette']),
         ]
-        assert deps.PackUpdate == ['requests', 'httpx2']
+        assert not hasattr(deps, 'PackUpdate')
+
+    def test_stale_pack_update_is_ignored(self, fs, run_dir):
+        """The PackUpdate key of a config of an earlier version is ignored."""
+        fs.create_file(config_file(run_dir), contents="""\
+Repo:
+  Remote: https://github.com/LmeSzinc/AzurLaneAutoScript
+  Author: LmeSzinc
+  Repo: AzurLaneAutoScript
+  Branch: master
+PythonDeps:
+  RequirementFiles:
+    - requirements.txt
+  PackUpdate:
+    - requests
+""")
+        config = PackRepoConfig(FILE)
+        assert config.errors == []
+        deps = config.data.PythonDeps
+        assert deps.RequirementFiles == ['requirements.txt']
+        assert not hasattr(deps, 'PackUpdate')
 
     def test_read_python_deps_mirror_url(self, fs, run_dir):
         """PypiMirror accepts one url string, every dependency is downloaded from it."""
@@ -318,7 +337,10 @@ PythonDeps:
 """)
         with logger.mock_capture_writer() as capture:
             config = PackRepoConfig(FILE)
-        assert capture.fd.any_contains('Invalid pack config value')
+        assert capture.concat() == f"""\
+WARNING | Invalid pack config value: ErrorInfo(msg='Expected `str | array`, got `int` - at `$.PythonDeps.PypiMirror`', type=<ErrorType.TYPE_MISMATCH>, loc=('PythonDeps', 'PypiMirror'), ctx=ErrorCtx(expected='str | array', got='int')), file={run_dir}/config/LmeSzinc_AzurLaneAutoScript.yaml
+INFO | Write config {run_dir}/config/LmeSzinc_AzurLaneAutoScript.yaml
+"""
         assert len(config.errors) == 1
         assert config.data.PythonDeps.PypiMirror == 'https://pypi.org/simple'
 
@@ -335,8 +357,10 @@ Lookback:
 """)
         with logger.mock_capture_writer() as capture:
             config = PackRepoConfig(FILE)
-        assert capture.fd.any_contains('Invalid pack config value')
-        assert capture.fd.any_contains('Invalid enum value \'parent-1\'')
+        assert capture.concat() == f"""\
+WARNING | Invalid pack config value: ErrorInfo(msg="Invalid enum value 'parent-1' - at `$.Lookback.Parent`", type=<ErrorType.INVALID_ENUM_VALUE>, loc=('Lookback', 'Parent'), ctx=ErrorCtx()), file={run_dir}/config/LmeSzinc_AzurLaneAutoScript.yaml
+INFO | Write config {run_dir}/config/LmeSzinc_AzurLaneAutoScript.yaml
+"""
         assert len(config.errors) == 1
         assert config.data.Lookback.Parent == 'parent-all'
 
@@ -397,8 +421,10 @@ Lookback:
         with logger.mock_capture_writer() as capture:
             config = PackRepoConfig(FILE)
         # the error is logged with the file name, the file is named by the caller
-        assert capture.fd.any_contains('Invalid pack config value')
-        assert capture.fd.any_contains(FILE)
+        assert capture.concat() == f"""\
+WARNING | Invalid pack config value: ErrorInfo(msg='Expected `int`, got `str` - at `$.Lookback.MaxCommitDay`', type=<ErrorType.TYPE_MISMATCH>, loc=('Lookback', 'MaxCommitDay'), ctx=ErrorCtx(expected='int', got='str')), file={run_dir}/config/LmeSzinc_AzurLaneAutoScript.yaml
+INFO | Write config {run_dir}/config/LmeSzinc_AzurLaneAutoScript.yaml
+"""
         assert len(config.errors) == 1
         assert config.data.Lookback.MaxCommitDay == 90
         # the file is written back with the default value
@@ -413,7 +439,13 @@ Lookback:
         with logger.mock_capture_writer() as capture:
             with pytest.raises(ValueError, match='Empty Author'):
                 PackRepoConfig(FILE)
-        assert capture.fd.any_contains('Invalid pack config value')
+        assert capture.concat() == f"""\
+WARNING | Invalid pack config value: while parsing a flow sequence
+  in "<byte string>", line 1, column 11
+did not find expected ',' or ']'
+  in "<byte string>", line 2, column 1, file={run_dir}/config/LmeSzinc_AzurLaneAutoScript.yaml
+INFO | Write config {run_dir}/config/LmeSzinc_AzurLaneAutoScript.yaml
+"""
         assert read_config(config_file(run_dir)) == msgspec.to_builtins(PackRepoModel())
 
     def test_config_of_each_file(self, fs, run_dir):
