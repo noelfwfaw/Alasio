@@ -4,11 +4,11 @@ import re
 import sys
 import sysconfig
 import zipfile
-from importlib.util import cache_from_source
 
 import pytest
 
 from alasio.deploy.simple_pip.pip_install import DistInfo, SimplePip
+from alasio.deploy.simple_pip.pyc import pyc_path
 from alasio.deploy.simple_pip.python_probe import Scheme, probe_python
 from alasio.ext.concurrent.cmd import CmdlineError, CmdlineResultStr
 from alasio.ext.path import PathStr
@@ -16,21 +16,9 @@ from alasio.ext.path.calc import to_posix
 from alasio.logger import logger
 from alasio.testing.filesystem import fs  # noqa: F401
 from tests.deploy.simple_pip.conftest import (  # noqa: F401
-    abs_path, build_wheel, create_dist, list_files, list_folders, pyc_compile, sha256_record, site_packages
+    SCRIPTS_DIR, SITE_BRANCH_REL, abs_path, build_wheel, create_dist, list_files, list_folders, outside, pyc_compile,
+    sha256_record, site_branch, site_packages
 )
-
-
-def pyc_path(path):
-    """
-    Path of the .pyc file python generates for a source file.
-
-    Args:
-        path (str): Path of the .py file, relative to site-packages
-
-    Returns:
-        str: Relative posix path of the .pyc file
-    """
-    return to_posix(cache_from_source(path))
 
 
 def read_record(site, name='demo-1.0.dist-info'):
@@ -156,10 +144,10 @@ class TestFromPython:
 
     def test_from_python_prefix_missing(self, monkeypatch):
         """An output without a prefix and a scheme falls back to the derived ones."""
-        self.patch_probe(monkeypatch, 'xxxsitepackage {"site_packages": ["/env/Lib/site-packages"]}\n')
+        self.patch_probe(monkeypatch, f'xxxsitepackage {{"site_packages": ["/env/{SITE_BRANCH_REL}"]}}\n')
         pip = SimplePip.from_python('python.exe')
-        assert pip.prefix == ('/env' if os.name == 'nt' else '')
-        assert pip.scheme.scripts == ('/env/Scripts' if os.name == 'nt' else '/bin')
+        assert pip.prefix == '/env'
+        assert pip.scheme.scripts == f'/env/{SCRIPTS_DIR}'
 
     def test_from_python_scheme_without_site_packages(self, monkeypatch):
         """The listing holds no site-packages directory, the purelib of the scheme is used."""
@@ -372,6 +360,25 @@ class TestInstall:
         with open(f'{site}/demo-1.0.dist-info/INSTALLER', 'rb') as f:
             assert f.read() == b'pip\n'
 
+    def test_install_with_a_pycache_prefix(self, fs, pyc_compile, monkeypatch):
+        """The bytecode is compiled in the installation, sys.pycache_prefix moves the pycs of python only."""
+        monkeypatch.setattr(sys, 'pycache_prefix', '/pycache')
+        site = site_packages(fs)
+        wheel = build_wheel('/w/demo-1.0-py3-none-any.whl', {'demo/__init__.py': b'a = 1\n'})
+        SimplePip(site).install(wheel)
+        pyc = pyc_path('demo/__init__.py')
+        assert pyc in list_files(site)
+        # A row of a RECORD is relative to site-packages, no row may escape it
+        assert [path for path, _, _ in read_record(site)] == [
+            'demo/__init__.py',
+            pyc,
+            'demo-1.0.dist-info/INSTALLER',
+            'demo-1.0.dist-info/METADATA',
+            'demo-1.0.dist-info/RECORD',
+            'demo-1.0.dist-info/WHEEL',
+            'demo-1.0.dist-info/top_level.txt',
+        ]
+
     def test_install_record(self, fs, pyc_compile):
         """The RECORD lists the files, the checksum of the content and the size of the file."""
         site = site_packages(fs)
@@ -491,8 +498,8 @@ demo-1.0.dist-info/top_level.txt,sha256=65wmuu5H8Z5Jk6d7ypNtD_CeNVqC09t5vxVOv_Go
             'demo-1.0.data/scripts/demo.conf': b'answer = 42\n',
         }, executable=['demo-1.0.data/scripts/demo-tool'])
         SimplePip(site).install(wheel)
-        assert os.stat(abs_path(fs, '/env/Scripts/demo-tool')).st_mode & 0o111 == 0o111
-        assert os.stat(abs_path(fs, '/env/Scripts/demo.conf')).st_mode & 0o111 == 0
+        assert os.stat(abs_path(fs, f'/env/{SCRIPTS_DIR}/demo-tool')).st_mode & 0o111 == 0o111
+        assert os.stat(abs_path(fs, f'/env/{SCRIPTS_DIR}/demo.conf')).st_mode & 0o111 == 0
 
     @pytest.mark.parametrize("layout, site_rel, category, member, target_rel, record_rel", [
         # Windows layout: <prefix>/Lib/site-packages
@@ -540,7 +547,7 @@ demo-1.0.dist-info/top_level.txt,sha256=65wmuu5H8Z5Jk6d7ypNtD_CeNVqC09t5vxVOv_Go
             purelib=site,
             # A platform directory that the layout of site-packages can not tell
             platlib=abs_path(fs, '/env/lib64/site-packages'),
-            scripts=abs_path(fs, '/env/Scripts'),
+            scripts=abs_path(fs, f'/env/{SCRIPTS_DIR}'),
             data=abs_path(fs, '/env'),
             include=abs_path(fs, '/env/include/python3.8'),
         )
@@ -553,7 +560,7 @@ demo-1.0.dist-info/top_level.txt,sha256=65wmuu5H8Z5Jk6d7ypNtD_CeNVqC09t5vxVOv_Go
         })
         SimplePip(site, scheme=scheme).install(wheel)
         assert os.path.isfile(abs_path(fs, '/env/lib64/site-packages/demo/plat.py'))
-        assert os.path.isfile(abs_path(fs, '/env/Scripts/demo-tool'))
+        assert os.path.isfile(abs_path(fs, f'/env/{SCRIPTS_DIR}/demo-tool'))
         assert os.path.isfile(abs_path(fs, '/env/share/demo/data.txt'))
         assert os.path.isfile(abs_path(fs, '/env/include/python3.8/demo/demo.h'))
         assert sorted(path for path, _, _ in read_record(site)) == sorted([
@@ -564,11 +571,11 @@ demo-1.0.dist-info/top_level.txt,sha256=65wmuu5H8Z5Jk6d7ypNtD_CeNVqC09t5vxVOv_Go
             'demo-1.0.dist-info/top_level.txt',
             'demo/pure.py',
             pyc_path('demo/pure.py'),
-            '../../lib64/site-packages/demo/plat.py',
-            pyc_path('../../lib64/site-packages/demo/plat.py'),
-            '../../Scripts/demo-tool',
-            '../../include/python3.8/demo/demo.h',
-            '../../share/demo/data.txt',
+            outside('lib64/site-packages/demo/plat.py'),
+            pyc_path(outside('lib64/site-packages/demo/plat.py')),
+            outside(f'{SCRIPTS_DIR}/demo-tool'),
+            outside('include/python3.8/demo/demo.h'),
+            outside('share/demo/data.txt'),
         ])
 
     def test_install_data_unknown_category(self, fs, pyc_compile):
@@ -684,7 +691,7 @@ demo-1.0.dist-info/top_level.txt,sha256=65wmuu5H8Z5Jk6d7ypNtD_CeNVqC09t5vxVOv_Go
         assert pip.uninstall('demo') is True
         # The files are removed, the directories emptied under the prefix as well
         assert list_files(abs_path(fs, '/env')) == []
-        assert list_folders(abs_path(fs, '/env')) == ['Lib', 'Lib/site-packages']
+        assert list_folders(abs_path(fs, '/env')) == site_branch()
 
     def test_uninstall_prefix_bounds_folders(self, fs, pyc_compile):
         """A prefix narrower than the environment keeps the directories outside of it."""
@@ -697,8 +704,77 @@ demo-1.0.dist-info/top_level.txt,sha256=65wmuu5H8Z5Jk6d7ypNtD_CeNVqC09t5vxVOv_Go
         pip = SimplePip(site, prefix=site)
         assert pip.uninstall('demo') is True
         assert list_files(abs_path(fs, '/env')) == []
-        # <env>/Scripts is outside of the prefix, it is kept
-        assert list_folders(abs_path(fs, '/env')) == ['Lib', 'Lib/site-packages', 'Scripts']
+        # The scripts directory is outside of the prefix, it is kept
+        assert list_folders(abs_path(fs, '/env')) == sorted(site_branch() + [SCRIPTS_DIR])
+
+
+class TestInstallInvalidWheel:
+    """
+    A refused wheel leaves the installed version untouched.
+
+    The wheel is validated as a whole before the previous installation is
+    removed: an invalid member used to abort the installation after the
+    uninstallation, which removed the distribution from the environment.
+    """
+
+    @staticmethod
+    def install_current(fs):
+        """
+        Install demo 1.0, the version an invalid wheel must not remove.
+
+        Args:
+            fs (FakeFilesystem): Active fake filesystem
+
+        Returns:
+            tuple[str, list[str]]: Path of site-packages, and the files of
+                the environment after the installation
+        """
+        site = site_packages(fs)
+        wheel = build_wheel('/w/demo-1.0-py3-none-any.whl', {
+            'demo/__init__.py': b'a = 1\n',
+            'demo/old.py': b'a = 2\n',
+        })
+        SimplePip(site).install(wheel)
+        return site, list_files(abs_path(fs, '/env'))
+
+    def test_unknown_data_category(self, fs, pyc_compile):
+        """A .data directory that is not an install scheme key."""
+        site, installed = self.install_current(fs)
+        wheel = build_wheel('/w/demo-2.0-py3-none-any.whl', {
+            'demo/__init__.py': b'a = 3\n',
+            'demo-2.0.data/nope/x.py': b'x\n',
+        }, version='2.0')
+        with pytest.raises(ValueError, match='unsupported .data directory "nope"'):
+            SimplePip(site).install(wheel)
+        assert list_files(abs_path(fs, '/env')) == installed
+        assert SimplePip(site).get_dist_info('demo') == f'{site}/demo-1.0.dist-info'
+        with open(f'{site}/demo/__init__.py', 'rb') as f:
+            assert f.read() == b'a = 1\n'
+
+    @pytest.mark.parametrize("member", ['../evil.py', '/evil.py', 'demo/../../evil.py'])
+    def test_traversal_member(self, fs, pyc_compile, member):
+        """A member outside of the install directory."""
+        site, installed = self.install_current(fs)
+        wheel = build_wheel('/w/demo-2.0-py3-none-any.whl', {
+            'demo/__init__.py': b'a = 3\n',
+            member: b'evil\n',
+        }, version='2.0')
+        with pytest.raises(ValueError, match='outside of the install directory'):
+            SimplePip(site).install(wheel)
+        assert list_files(abs_path(fs, '/env')) == installed
+        # The member is not written to any of the directories it could escape to
+        for path in ['/evil.py', '/env/evil.py', '/env/Lib/evil.py', '/env/Lib/site-packages/evil.py']:
+            assert not os.path.exists(abs_path(fs, path)), path
+
+    def test_entry_points_not_utf8(self, fs, pyc_compile):
+        """The entry points are read before the uninstallation, an unreadable wheel changes nothing."""
+        site, installed = self.install_current(fs)
+        wheel = build_wheel('/w/demo-2.0-py3-none-any.whl', {
+            'demo-2.0.dist-info/entry_points.txt': b'[console_scripts]\ndemo = demo:main\n\xff\n',
+        }, version='2.0')
+        with pytest.raises(UnicodeDecodeError):
+            SimplePip(site).install(wheel)
+        assert list_files(abs_path(fs, '/env')) == installed
 
 
 class TestPipConformance:
@@ -732,10 +808,10 @@ class TestPipConformance:
             for path in recorded
         }
         assert resolved == installed
-        assert sorted(recorded - set(list_files(site))) == [
-            '../../Scripts/demo-tool',
-            '../../share/demo/data.txt',
-        ]
+        assert sorted(recorded - set(list_files(site))) == sorted([
+            outside(f'{SCRIPTS_DIR}/demo-tool'),
+            outside('share/demo/data.txt'),
+        ])
 
     def test_record_paths_are_relative(self, fs, pyc_compile):
         """PEP 376 requires the paths of a RECORD to be relative to site-packages."""

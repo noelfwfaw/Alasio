@@ -2,7 +2,7 @@ import typing as t
 
 from alasio.config.base import AlasioConfigBase
 
-from ..const import entry
+from .mod_entry import MOD_ENTRY
 
 if t.TYPE_CHECKING:
     from ..alas import alas_model as alas
@@ -11,6 +11,7 @@ if t.TYPE_CHECKING:
     from ..general import general_model as general
     from ..main import main_model as main
     from ..opsi import opsi_model as opsi
+    from ..shop import shop_model as shop
 
 
 # This file was auto-generated, do not modify it manually. To generate:
@@ -20,7 +21,7 @@ class ConfigGenerated(AlasioConfigBase):
     """
     A generated config struct to fool IDE's type-predict and auto-complete
     """
-    entry = entry
+    entry = MOD_ENTRY
 
     """
     ========== nav: alas ==========
@@ -37,6 +38,7 @@ class ConfigGenerated(AlasioConfigBase):
     Enhance: "general.Enhance"
     OldRetire: "general.OldRetire"
     DropRecord: "general.DropRecord"
+    ShopDemo: "general.ShopDemo"
 
     """
     ========== nav: main ==========
@@ -80,19 +82,43 @@ class ConfigGenerated(AlasioConfigBase):
     """
     # ----- GemsFarming -----
     # Scheduler: "alasio.Scheduler"
-    # Campaign: "main.GemsCampaign"
+    # Campaign: "gems.GemsCampaign"
     GemsFarming: "gems.GemsFarming"
-    # StopCondition: "main.GemsStopCondition"
+    # StopCondition: "gems.GemsStopCondition"
     # Fleet1: "main.Fleet"
-    # Submarine: "main.GemsSubmarine"
-    # Emotion1: "main.GemsEmotionRecord"
+    # Submarine: "gems.GemsSubmarine"
+    # Emotion1: "gems.GemsEmotionRecord"
     EquipmentCode: "gems.EquipmentCode"
+
+    """
+    ========== nav: shop ==========
+    """
+    # ----- GeneralShop -----
+    # Scheduler: "shop.SchedulerGeneralShop"
+    GeneralShop: "shop.GeneralShop"
+
+    # ----- GuildShop -----
+    # Scheduler: "alasio.SchedulerU00"
+    GuildShop: "shop.GuildShop"
+
+    # ----- MedalShop -----
+    # Scheduler: "alasio.SchedulerU00"
+    MedalShop: "shop.MedalShop"
+
+    # ----- MeritShop -----
+    # Scheduler: "alasio.SchedulerU00"
+    MeritShop: "shop.MeritShop"
+
+    # ----- CoreShop -----
+    # Scheduler: "alasio.SchedulerU00"
+    CoreShop: "shop.CoreShop"
 
     """
     ========== nav: dashboard ==========
     """
     # ----- Dashboard -----
     Oil: "dashboard.Oil"
+    Coin: "dashboard.Coin"
     Gems: "dashboard.Gems"
     Progress: "dashboard.Progress"
     Planner: "dashboard.Planner"

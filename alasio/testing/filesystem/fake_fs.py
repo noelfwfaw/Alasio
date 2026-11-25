@@ -1,7 +1,16 @@
 """
 The FakeFilesystem class: an in-memory filesystem and the mock of the
 os / builtins file functions.
+
+The filesystem models Linux, on every host: a test that passes here passes
+against the POSIX semantics of the real disk, and the differences of Windows
+(a path through a file, a rename over an existing name, the errno of a kind
+change) are the subject of the tests that run on a real disk instead, see
+tests/ext/path/atomic/test_atomic_replace_real.py. IS_WINDOWS is still read
+for the shape of a path (a drive root, a backslash of a link target), never
+for the semantics of an operation.
 """
+import _io
 import builtins
 import contextlib
 import errno
@@ -10,9 +19,9 @@ import os
 import time
 from threading import RLock
 
-import _io
+from alasio.ext.path.calc import joinpath
 
-from .base import IS_WINDOWS, FakeDir, FakeFile, FakeSymlink, _normpath, synchronized
+from .base import IS_WINDOWS, FakeDir, FakeFile, FakeSymlink, _normpath, _parent_path, _split_abspath, synchronized
 from .entry import FakeDirEntry, FakeScandirIterator
 from .file_object import FakeFileObject
 
@@ -22,6 +31,21 @@ try:
     O_ACCMODE = os.O_ACCMODE
 except AttributeError:
     O_ACCMODE = 3
+
+# File descriptors of the fake filesystem start above the descriptors of the
+# process: a descriptor the filesystem did not hand out belongs to the
+# process, open(), os.close(), os.write(), os.fsync() and os.fstat() serve it
+# for real (POSIX subprocess.Popen() writes and closes its pipes with the
+# first three, pytest's capture stats its own temp file between two tests),
+# and a fake number is never mistaken for a real one
+FD_BASE = 1000
+# The real open / os.close / os.write / os.fsync / os.fstat, the fake
+# filesystem patches them, so they are bound before any patch can be made
+_platform_open = builtins.open
+_platform_close = os.close
+_platform_fstat = os.fstat
+_platform_fsync = os.fsync
+_platform_write = os.write
 
 
 class FakeFilesystem:
@@ -45,6 +69,13 @@ class FakeFilesystem:
 
     Everything is served from memory, the real disk is never touched.
 
+    A descriptor the filesystem did not hand out belongs to the process:
+    open(fd) and os.write / os.close / os.fsync / os.fstat serve it with the
+    real functions, so the pipes of a subprocess, the capture file of pytest
+    and every other handle of the interpreter keep working while the
+    filesystem is active. A number above FD_BASE that the filesystem no
+    longer holds is a closed file of it and raises EBADF.
+
     open() and os.open() follow the real os: a file is only created when
     its parent directory exists, a missing parent raises FileNotFoundError
     instead of creating the directory tree. The create_file() /
@@ -66,16 +97,24 @@ class FakeFilesystem:
     def __init__(self, cwd=None):
         """
         Args:
-            cwd (str, optional): Initial working directory.
-                Defaults to None, use the real current directory.
+            cwd (str, optional): Initial working directory. Defaults to
+                None, use the root of the drive of the real working
+                directory: a fresh filesystem holds the root only, the
+                directories of the working directory are not created
         """
         # the state lock, taken by every public operation
         self._lock = RLock()
         if cwd is None:
+            # A blank filesystem keeps the drive of the real working directory
+            # so absolute paths land on the drive the platform expects, but not
+            # the directories of it: the workspace of a CI runner is
+            # "D:/a/Alasio/Alasio", its "a" collides with the "/a" of a test
             cwd = os.getcwd()
+            cwd = cwd[:2] if IS_WINDOWS and cwd[1:2] == ':' else '/'
         self._cwd = _normpath(cwd, cwd)
-        # the drive root on Windows, "/" on POSIX
-        root = self._cwd[:2] if IS_WINDOWS else '/'
+        # the drive root on Windows, "/" on POSIX and for a cwd that has no
+        # drive (a POSIX style cwd of the fake filesystem)
+        root = self._cwd[:2] if IS_WINDOWS and self._cwd[1:2] == ':' else '/'
         self._ino = 0
         now = time.time()
         self.root_dir = FakeDir(
@@ -90,7 +129,7 @@ class FakeFilesystem:
         self._symlinks: "dict[str, FakeSymlink]" = {}
         # fd -> FakeFileObject
         self._fds: "dict[int, FakeFileObject]" = {}
-        self._next_fd = 3
+        self._next_fd = FD_BASE
         # saved originals of activate() without monkeypatch
         self._saved = []
         # create the cwd chain, so os.getcwd() exists in the fake fs
@@ -151,7 +190,9 @@ class FakeFilesystem:
             dirpath (str): Normalized directory path
 
         Returns:
-            str: Key prefix, "/" for the POSIX root
+            str: Key prefix, "/" for the POSIX root. The root is its own
+                prefix match, so callers must skip the directory itself:
+                a directory is not its own child.
         """
         return '/' if dirpath == '/' else f'{dirpath}/'
 
@@ -166,23 +207,10 @@ class FakeFilesystem:
         prefix = self._child_prefix(dirpath)
         return (
             any(key.startswith(prefix) for key in self._files)
-            or any(key.startswith(prefix) for key in self._dirs)
+            # the root is its own prefix match, a directory is not its own child
+            or any(key.startswith(prefix) and key != dirpath for key in self._dirs)
             or any(key.startswith(prefix) for key in self._symlinks)
         )
-
-    @staticmethod
-    def _parent_dir(path):
-        """
-        Get the parent of a normalized absolute path.
-
-        Args:
-            path (str): Normalized absolute path
-
-        Returns:
-            str: Parent path, "/" for a direct child of the POSIX root
-        """
-        parent = path.rpartition('/')[0]
-        return parent or '/'
 
     def _missing_parents(self, path):
         """
@@ -196,7 +224,7 @@ class FakeFilesystem:
                 deepest to the shallowest, and the first parent path that
                 is a file or a symlink (None when the chain has no such path)
         """
-        parent = self._parent_dir(path)
+        parent = _parent_path(path)
         missing = []
         conflict = None
         while parent not in self._dirs:
@@ -228,9 +256,9 @@ class FakeFilesystem:
             NotADirectoryError: (POSIX) If a parent path is a file or a symlink
         """
         missing, conflict = self._missing_parents(path)
-        if conflict is not None and not IS_WINDOWS:
+        if conflict is not None:
             raise NotADirectoryError(errno.ENOTDIR, 'Not a directory', path)
-        if missing or conflict is not None:
+        if missing:
             raise FileNotFoundError(errno.ENOENT, 'No such file or directory', path)
 
     def _create_parents(self, path):
@@ -483,6 +511,8 @@ class FakeFilesystem:
             del self._symlinks[path]
             return
         if path in self._dirs:
+            if path == self.root_dir.path:
+                raise OSError(errno.EBUSY, 'Cannot remove the root directory', path)
             if self._has_children(path):
                 raise OSError(errno.ENOTEMPTY, 'Directory not empty', path)
             del self._dirs[path]
@@ -529,8 +559,11 @@ class FakeFilesystem:
         """
         Mock of the builtin open().
 
+        A descriptor the fake filesystem did not hand out belongs to the
+        process, e.g. a pipe of subprocess.Popen(), it is wrapped for real.
+
         Args:
-            file (str): Path of the file
+            file (str | int): Path of the file, or a descriptor of the process
             mode (str): Open mode, any of r / w / a / x with optional
                 b / t / +. Defaults to 'r'.
             buffering (int): Accepted for compatibility, ignored.
@@ -552,7 +585,14 @@ class FakeFilesystem:
             IsADirectoryError: If the path is a directory
             NotADirectoryError: (POSIX) If a parent path is a file
             ValueError: If the mode is invalid
+            OSError: If the descriptor of the process is not open
         """
+        if isinstance(file, int):
+            # A descriptor of the fake filesystem can not be wrapped, only the
+            # descriptors of the process are served
+            if file >= FD_BASE:
+                raise OSError(errno.EBADF, 'Bad file descriptor')
+            return _platform_open(file, mode, buffering, encoding, errors, newline, closefd, opener)
         file = self._normpath(file)
         file = self._follow_links(file)
         mode = str(mode)
@@ -823,26 +863,8 @@ class FakeFilesystem:
             OSError: If a symlink loop is detected (errno.ELOOP)
         """
         path = str(path)
-        if IS_WINDOWS:
-            path = path.replace('\\', '/')
-        drive = ''
-        if IS_WINDOWS and len(path) > 1 and path[1] == ':':
-            # explicit drive letter, e.g. "C:/a" or "C:a"
-            drive, path = path[:2], path[2:]
-        if drive:
-            if path.startswith('/'):
-                bits = [f'{drive}/'] + path.split('/')[1:]
-            else:
-                # drive-relative path "C:foo", resolve on the drive root
-                bits = [f'{drive}/'] + path.split('/')
-        elif path.startswith('/'):
-            bits = ['/'] + path.split('/')[1:]
-        else:
-            # relative path, resolve against the fake cwd
-            bits = self._cwd.split('/') + path.split('/')
-        if not bits[0]:
-            bits = ['/'] + bits
-        return self._join_realpath(bits[0], bits[1:])
+        root, bits = _split_abspath(path, self._cwd)
+        return self._join_realpath(root, bits)
 
     def _join_realpath(self, resolved, bits):
         """
@@ -866,12 +888,12 @@ class FakeFilesystem:
                 i += 1
                 continue
             if bit == '..':
-                # collapse on the resolved prefix, like the real os
-                parent = resolved.rpartition('/')[0]
-                resolved = parent if parent else resolved
+                # collapse on the resolved prefix, like the real os, the root
+                # is the parent of its own children
+                resolved = _parent_path(resolved)
                 i += 1
                 continue
-            candidate = self._normpath(f'{resolved}/{bit}')
+            candidate = joinpath(resolved, bit)
             link = self._symlinks.get(candidate)
             if link is None:
                 resolved = candidate
@@ -881,15 +903,14 @@ class FakeFilesystem:
                 raise OSError(errno.ELOOP, 'Too many levels of symbolic links', candidate)
             seen.add(candidate)
             target = link.target
+            if IS_WINDOWS:
+                target = target.replace('\\', '/')
             if os.path.isabs(target):
-                if IS_WINDOWS and len(target) > 1 and target[1] == ':':
-                    resolved = f'{target[:2]}/'
-                    tbits = target[2:].split('/')
-                else:
-                    resolved = '/'
-                    tbits = target.split('/')[1:]
+                # an absolute target replaces the resolved prefix, its own
+                # root decides where it lands, no cwd is involved
+                resolved, tbits = _split_abspath(target, '')
             else:
-                # relative target, components are joined to the resolved prefix
+                # a relative target continues below the resolved prefix
                 tbits = target.split('/')
             bits = tbits + bits[i + 1:]
             i = 0
@@ -927,11 +948,7 @@ class FakeFilesystem:
         try:
             self._create_parents(path)
         except NotADirectoryError:
-            if not IS_WINDOWS:
-                raise
-            # The mkdir of Windows reports a path through a file as a
-            # missing path (ERROR_PATH_NOT_FOUND), like os.makedirs does
-            raise FileNotFoundError(errno.ENOENT, 'No such file or directory', path) from None
+            raise
         now = time.time()
         self._dirs[path] = FakeDir(
             path=path, mode=mode & 0o7777, ino=self._next_ino(), nlink=2,
@@ -980,6 +997,8 @@ class FakeFilesystem:
             raise NotADirectoryError(errno.ENOTDIR, 'Not a directory', path)
         if path not in self._dirs:
             raise FileNotFoundError(errno.ENOENT, 'No such file or directory', path)
+        if path == self.root_dir.path:
+            raise OSError(errno.EBUSY, 'Cannot remove the root directory', path)
         if self._has_children(path):
             raise OSError(errno.ENOTEMPTY, 'Directory not empty', path)
         del self._dirs[path]
@@ -1011,10 +1030,7 @@ class FakeFilesystem:
     @synchronized
     def rename(self, src, dst):
         """
-        Mock of os.rename().
-
-        On Windows renaming over an existing file raises, on POSIX the
-        file is replaced, like the real os.
+        Mock of os.rename(), the POSIX one: an existing target is replaced.
 
         Args:
             src (str): Source path
@@ -1022,14 +1038,24 @@ class FakeFilesystem:
 
         Raises:
             FileNotFoundError: If the source does not exist
-            FileExistsError: On Windows, if the target exists
+            IsADirectoryError: If the source is not a folder and the target is
+            NotADirectoryError: If the source is a folder and the target is not
+            OSError: If the source is a folder and the target is a folder that
+                holds an entry (ENOTEMPTY)
         """
-        self._move(src, dst, overwrite=not IS_WINDOWS)
+        self._move(src, dst, overwrite=True)
 
     @synchronized
     def replace(self, src, dst):
         """
-        Mock of os.replace(), the target is always replaced.
+        Mock of os.replace(), the target is replaced when the kinds allow it.
+
+        The kind of the two paths decides, with the POSIX answer on every host:
+        a file never replaces a folder (EISDIR), a folder never replaces a file
+        (ENOTDIR), and a folder only replaces an empty folder (ENOTEMPTY). The
+        real Windows API answers those cases with PermissionError (and replaces
+        a file with a folder, which POSIX refuses), see
+        alasio.ext.path.atomic.file_replace for the difference it hides.
 
         Args:
             src (str): Source path
@@ -1037,6 +1063,10 @@ class FakeFilesystem:
 
         Raises:
             FileNotFoundError: If the source does not exist
+            IsADirectoryError: If the source is not a folder and the target is
+            NotADirectoryError: If the source is a folder and the target is not
+            OSError: If the source is a folder and the target is a folder that
+                holds an entry (ENOTEMPTY)
         """
         self._move(src, dst, overwrite=True)
 
@@ -1126,17 +1156,17 @@ class FakeFilesystem:
         prefix = self._child_prefix(path)
         entries = []
         for key in self._files:
-            if key.startswith(prefix):
+            if key.startswith(prefix) and key != path:
                 name = key[len(prefix):]
                 if '/' not in name:
                     entries.append(FakeDirEntry(name, key, False, self._files[key].stat()))
         for key in self._dirs:
-            if key.startswith(prefix):
+            if key.startswith(prefix) and key != path:
                 name = key[len(prefix):]
                 if '/' not in name:
                     entries.append(FakeDirEntry(name, key, True, self._dirs[key].stat()))
         for key, link in self._symlinks.items():
-            if key.startswith(prefix):
+            if key.startswith(prefix) and key != path:
                 name = key[len(prefix):]
                 if '/' not in name:
                     follow_stat = None
@@ -1175,17 +1205,17 @@ class FakeFilesystem:
         prefix = self._child_prefix(path)
         names = []
         for key in self._files:
-            if key.startswith(prefix):
+            if key.startswith(prefix) and key != path:
                 name = key[len(prefix):]
                 if '/' not in name:
                     names.append(name)
         for key in self._dirs:
-            if key.startswith(prefix):
+            if key.startswith(prefix) and key != path:
                 name = key[len(prefix):]
                 if '/' not in name:
                     names.append(name)
         for key in self._symlinks:
-            if key.startswith(prefix):
+            if key.startswith(prefix) and key != path:
                 name = key[len(prefix):]
                 if '/' not in name:
                     names.append(name)
@@ -1247,8 +1277,12 @@ class FakeFilesystem:
         """
         Mock of os.write().
 
+        A descriptor the fake filesystem did not hand out belongs to the
+        process, e.g. the stdin pipe of subprocess.Popen() on POSIX, it is
+        written for real.
+
         Args:
-            fd (int): Fake file descriptor
+            fd (int): Fake file descriptor, or a descriptor of the process
             data (bytes): Data to write
 
         Returns:
@@ -1258,47 +1292,70 @@ class FakeFilesystem:
             OSError: If the fd is not open
         """
         fobj = self._fds.get(fd)
-        if fobj is None:
+        if fobj is not None:
+            return fobj.write(data)
+        if isinstance(fd, int) and fd >= FD_BASE:
+            # A descriptor of the fake filesystem that is already closed
             raise OSError(errno.EBADF, 'Bad file descriptor')
-        return fobj.write(data)
+        return _platform_write(fd, data)
 
     @synchronized
     def os_close(self, fd):
         """
         Mock of os.close().
 
+        A descriptor the fake filesystem did not hand out belongs to the
+        process, e.g. a pipe of subprocess.Popen() on POSIX, it is closed for
+        real.
+
         Args:
-            fd (int): Fake file descriptor
+            fd (int): Fake file descriptor, or a descriptor of the process
 
         Raises:
             OSError: If the fd is not open
         """
         fobj = self._fds.get(fd)
-        if fobj is None:
+        if fobj is not None:
+            fobj.close()
+            return
+        if isinstance(fd, int) and fd >= FD_BASE:
+            # A descriptor of the fake filesystem that is already closed
             raise OSError(errno.EBADF, 'Bad file descriptor')
-        fobj.close()
+        _platform_close(fd)
 
     @synchronized
     def os_fsync(self, fd):
         """
-        Mock of os.fsync(), a no-op because content is already in memory.
+        Mock of os.fsync().
+
+        The content of a file of the fake filesystem is already in memory, so
+        syncing it is a no-op. A descriptor the fake filesystem did not hand
+        out belongs to the process, it is synced for real.
 
         Args:
-            fd (int): Fake file descriptor
+            fd (int): Fake file descriptor, or a descriptor of the process
 
         Raises:
             OSError: If the fd is not open
         """
-        if fd not in self._fds:
+        if fd in self._fds:
+            return
+        if isinstance(fd, int) and fd >= FD_BASE:
+            # A descriptor of the fake filesystem that is already closed
             raise OSError(errno.EBADF, 'Bad file descriptor')
+        _platform_fsync(fd)
 
     @synchronized
     def os_fstat(self, fd):
         """
         Mock of os.fstat().
 
+        A descriptor the fake filesystem did not hand out belongs to the
+        process, e.g. the capture file pytest stats between two tests, it is
+        stated for real.
+
         Args:
-            fd (int): Fake file descriptor
+            fd (int): Fake file descriptor, or a descriptor of the process
 
         Returns:
             os.stat_result: Stat result of the open file
@@ -1307,9 +1364,12 @@ class FakeFilesystem:
             OSError: If the fd is not open
         """
         fobj = self._fds.get(fd)
-        if fobj is None:
+        if fobj is not None:
+            return fobj._entry.stat()
+        if isinstance(fd, int) and fd >= FD_BASE:
+            # A descriptor of the fake filesystem that is already closed
             raise OSError(errno.EBADF, 'Bad file descriptor')
-        return fobj._entry.stat()
+        return _platform_fstat(fd)
 
     """
     Other os functions

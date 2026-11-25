@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { goto } from "$app/navigation";
 import { FakeWebSocket } from "$lib/test-utils/fake-websocket";
 import { flushEffects } from "$lib/test-utils/flush-effects";
-import { websocketClient } from "./client.svelte";
+import { WebsocketManager, websocketClient } from "./client.svelte";
 import type { RequestEvent } from "./event";
 import { routeState } from "./route-state.svelte";
 import { type Rpc, type RpcCallbacks, type RpcContext, createResilientRpc, createRpc } from "./rpc.svelte";
@@ -20,10 +20,19 @@ vi.stubGlobal("WebSocket", FakeWebSocket);
 /** A minimal in-memory RpcContext (no real websocket involved). */
 class FakeContext implements RpcContext {
   sent: RequestEvent[] = [];
+  /** Whether the fake connection is live (see RpcContext.isConnected). */
+  connected = true;
+  /** Connection counter (see RpcContext.connectionGeneration). */
+  connectionGeneration = 1;
+  /** How many times the context was asked to connect. */
+  connectCalls = 0;
   #callbacks = new Map<string, RpcCallbacks>();
 
   sendRaw(payload: RequestEvent): void {
     this.sent.push(payload);
+  }
+  connect(): void {
+    this.connectCalls++;
   }
   registerRpcCall(id: string, callbacks: RpcCallbacks): void {
     this.#callbacks.set(id, callbacks);
@@ -33,6 +42,12 @@ class FakeContext implements RpcContext {
   }
   hasRpcCall(id: string): boolean {
     return this.#callbacks.has(id);
+  }
+  isConnected(): boolean {
+    return this.connected;
+  }
+  isTopicReady(): boolean {
+    return true;
   }
   callbacks(id: string): RpcCallbacks | undefined {
     return this.#callbacks.get(id);
@@ -208,6 +223,90 @@ describe("TestCreateRpc", () => {
     expect(rpc.isPending).toBe(false);
     expect(rpc.errorMsg).toBeNull();
     expect(rpc.isOpen).toBe(true);
+  });
+});
+
+describe("TestCreateRpcWhenOffline", () => {
+  let context: FakeContext;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.clearAllMocks();
+    context = new FakeContext();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("sends nothing and reports nothing while there is no connection", () => {
+    // No connection can answer the request, and a request that never left the
+    // client has no deadline: it is not sent at all, and its state stays
+    // untouched. A resilient rpc asserts the call again once the connection is
+    // back, so the client is only asked for a connection.
+    context.connected = false;
+    const rpc = createRpc("ConnState", context, { pendingDelay: 0 });
+    const onError = vi.fn();
+    rpc.call("set_lang", {}, { onError });
+
+    vi.advanceTimersByTime(60_000);
+    expect(context.sent).toHaveLength(0);
+    expect(context.connectCalls).toBe(1);
+    expect(rpc.errorMsg).toBeNull();
+    expect(rpc.isPending).toBe(false);
+    expect(onError).not.toHaveBeenCalled();
+    expect(toast.error).not.toHaveBeenCalled();
+  });
+
+  it("reports nothing when the call times out on a connection that is gone", () => {
+    // The socket dropped before the answer: the call can never be answered,
+    // which is a connection failure, not an rpc failure. The page already
+    // reports the disconnection, and a resilient rpc replays the call.
+    const rpc = createRpc("ConnState", context, { pendingDelay: 0, timeout: 100 });
+    const onError = vi.fn();
+    rpc.call("set_lang", {}, { onError });
+    const id = context.sent[0].i!;
+
+    context.connected = false;
+    vi.advanceTimersByTime(100);
+
+    expect(rpc.errorMsg).toBeNull();
+    expect(rpc.isPending).toBe(false);
+    expect(onError).not.toHaveBeenCalled();
+    expect(toast.error).not.toHaveBeenCalled();
+    // The call is still cleaned up: a late answer cannot revive it.
+    expect(context.hasRpcCall(id)).toBe(false);
+  });
+
+  it("ignores the response of a call that was replaced", () => {
+    // call #1 is answered after call #2 replaced it: its result is not this
+    // operation's state any more.
+    const rpc = createRpc("ConnState", context, { pendingDelay: 0 });
+    rpc.call("set_lang", { lang: "en-US" });
+    const firstId = context.sent[0].i!;
+    const firstHandlers = context.callbacks(firstId)!;
+
+    rpc.call("set_lang", { lang: "zh-CN" });
+    firstHandlers.onSuccess(firstId);
+
+    expect(rpc.successMsg).toBeNull();
+    expect(rpc.errorMsg).toBeNull();
+  });
+
+  it("restarts the clock of a call that was replaced", () => {
+    const rpc = createRpc("ConnState", context, { pendingDelay: 0, timeout: 100 });
+    rpc.call("set_lang", { lang: "en-US" });
+    vi.advanceTimersByTime(60);
+
+    rpc.call("set_lang", { lang: "zh-CN" });
+    // 160ms after the first call, 100ms after the second: only the second one
+    // is late.
+    vi.advanceTimersByTime(60);
+    expect(toast.error).not.toHaveBeenCalled();
+
+    vi.advanceTimersByTime(40);
+    expect(toast.error).toHaveBeenCalledTimes(1);
+    expect(rpc.errorMsg).toBe("RPC call timeout");
   });
 });
 
@@ -406,7 +505,11 @@ describe("TestCreateResilientRpc", () => {
     expect(ws1.sent).toHaveLength(1);
   });
 
-  it("does not replay while the previous call is still pending", async () => {
+  it("sends the last call again when the connection carrying it is gone", async () => {
+    // The call was sent on the old connection and never answered: its outcome
+    // is unknown, and the new connection knows nothing about it. The commands
+    // this layer carries are state assertions (a language, a preview, a
+    // config), so the call is simply sent again.
     const ws0 = connectClient();
     await makeResilientRpc("ConnState");
 
@@ -416,14 +519,29 @@ describe("TestCreateResilientRpc", () => {
 
     ws0.serverClose(1006);
     vi.advanceTimersByTime(1000);
-    FakeWebSocket.last!.serverOpen();
+    const ws1 = FakeWebSocket.last!;
+    ws1.serverOpen();
     await flushEffects();
 
-    expect(FakeWebSocket.last!.sent).toHaveLength(0);
-    expect(rpc.isPending).toBe(true);
+    expect(ws1.sent).toHaveLength(1);
+    expect(lastPayload(ws1)).toEqual({
+      t: "ConnState",
+      o: "rpc",
+      f: "set_lang",
+      v: { lang: "en-US" },
+      i: expect.any(String),
+    });
+
+    // The lost call is not reported (its connection is gone): the replayed one
+    // is the call that counts, and it is answered normally.
+    vi.advanceTimersByTime(4999);
+    expect(toast.error).not.toHaveBeenCalled();
+    ws1.serverMessage(JSON.stringify({ t: "ConnState", i: lastPayload(ws1).i }));
+    vi.advanceTimersByTime(5000);
+    expect(toast.error).not.toHaveBeenCalled();
   });
 
-  it("does not replay before the topic is ready again", async () => {
+  it("waits for the topic before replaying", async () => {
     const ws0 = connectClient();
     await makeResilientRpc("ConnState");
 
@@ -435,17 +553,52 @@ describe("TestCreateResilientRpc", () => {
     vi.advanceTimersByTime(1000);
     const ws1 = FakeWebSocket.last!;
     ws1.serverOpen();
-    // Simulate a topic that has not received its full snapshot yet.
+    // Simulate a topic whose re-subscription is not on the wire yet: the
+    // server would answer an rpc with "Cannot do RPC before subscribing topic".
     delete websocketClient.topicReady["ConnState"];
     await flushEffects();
-
     expect(ws1.sent).toHaveLength(0);
 
-    // Even when the topic becomes ready later, the generation snapshot
-    // was already advanced, so the call is not replayed twice.
+    // As soon as the subscription is established on this connection, the call
+    // goes out — once.
     websocketClient.topicReady["ConnState"] = true;
     await flushEffects();
-    expect(ws1.sent).toHaveLength(0);
+    expect(ws1.sent).toHaveLength(1);
+    await flushEffects();
+    expect(ws1.sent).toHaveLength(1);
+  });
+
+  it("replays on the connection of the client it was created with", async () => {
+    // Preview has its own client, and its own socket: the replay must follow
+    // that connection (the topic never becomes ready on the default client,
+    // which does not even subscribe to it).
+    const client = new WebsocketManager();
+    stopEffect = effect_root(() => {
+      rpc = createResilientRpc("Preview", client, { pendingDelay: 0, timeout: 5000 });
+    });
+    await flushEffects();
+
+    client.sub("Preview");
+    const ws0 = FakeWebSocket.last!;
+    ws0.serverOpen();
+    await flushEffects();
+
+    rpc.call("preview_start", { name: "alasio", speed: "normal" });
+    const first = lastPayload(ws0);
+    ws0.serverMessage(JSON.stringify({ t: "Preview", i: first.i }));
+
+    ws0.serverClose(1006);
+    vi.advanceTimersByTime(1000);
+    const ws1 = FakeWebSocket.last!;
+    ws1.serverOpen();
+    await flushEffects();
+
+    expect(ws1.sent.map((raw) => JSON.parse(typeof raw === "string" ? raw : new TextDecoder().decode(raw)))).toEqual([
+      { t: "Preview" },
+      { t: "Preview", o: "rpc", f: "preview_start", v: { name: "alasio", speed: "normal" }, i: expect.any(String) },
+    ]);
+
+    client.disconnect();
   });
 
   it("does not revive the connection after an auth failure", async () => {

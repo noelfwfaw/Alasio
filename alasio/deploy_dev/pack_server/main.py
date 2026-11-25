@@ -1,76 +1,76 @@
 """
-Generate the packs of every config in the run directory.
+The command line entry of the pack server: one channel after another, each one
 
-The modules below do one step of the work each, this module chains them:
+    config -> clone -> generate -> publish -> retire
 
-0. PackRepoConfig.write_template() writes config/template.yaml from the
-   model: the operator copies it to a config file, e.g.
-   config/LmeSzinc_AzurLaneAutoScript_master.yaml, and fills the values
-1. PackRepoConfig reads config/{Author}_{Repo}_{Branch}.yaml from the run
-   directory, the file is created from the model when it does not exist
+A channel is one config file in the config folder of the run directory. The
+steps are the ones of the modules below:
+
+0. PackRepoConfig.write_template() writes config/template.yaml from the model:
+   the operator copies it to a config file and fills it
+1. PackRepoConfig reads config/{Author}_{Repo}_{Branch}.yaml; the file is
+   created from the model when it does not exist
 2. PackRepo clones or fetches the git repo of the config into
    repo/{Author}_{Repo}
-3. DepGen generates the packs of the python dependencies of the repo into
-   pack/{Author}_{Repo}_{Branch}/packdep, the wheel channel of the
-   PythonDeps group of the config; a config without PythonDeps builds
-   nothing there. The run leaves the published dependency snapshots on
-   the DepGen instance. Its cleanup is deferred to commit()
-4. PackRepoGen generates the packs of the repo into
-   pack/{Author}_{Repo}_{Branch}/packrepo, with the DepGen instance: the
-   published snapshots are encoded into .pack/packdep.pack when the version
-   pack is built. commit() writes latest.pack, the publication barrier, and
-   only then does DepGen.commit() remove the old dependency packs
+3. Repo generates the workspace: the wheels of the dependency versions, the pip
+   index of the provided pins, the dependency packs (packdep) and the packs of
+   the repo tree (packrepo), then latest.pack, the publication barrier, and the
+   removal of the packs and wheels the window does not ask for
+4. UploadRun mirrors the workspace to every remote of the config, writes the
+   barrier and the contract last, and retires the keys the previous generation
+   no longer serves (see publish/channel.py)
 
-The configs are run one by one, sorted by name. A config that fails is
-logged with its traceback and left out, the other configs still run: a
-broken config, a remote that cannot be reached or a repo that does not
-build must not stop the whole run. The run is logged at the end, and a
-PackRunError is raised when at least one config failed, so the scheduler
-that starts the pack server sees the failed run and can retry it.
+The three steps of one channel run under one lock, held by ``PackRun``; a run
+that writes the workspace while another publishes it would mirror the record of
+one generation with the files of another.
+
+The configs are run one by one, sorted by name. A config that fails is logged
+with its traceback and left out, the other configs still run: a broken config, a
+remote that cannot be reached or a repo that does not build must not stop the
+whole run. The run is logged at the end, and a PackRunError is raised when at
+least one config failed, so the scheduler sees the failed run and retries it.
+
+Every config writes a log file of its own, see config_log_name(); the lines
+outside the configs (the start of the run, the tally at the end) go to the log
+file of the process.
 
 Usage:
     python -m alasio.deploy_dev.pack_server.main --root D:/AlasPack
+    python -m alasio.deploy_dev.pack_server.main --root D:/AlasPack --dry-run
 
-    from alasio.deploy_dev.pack_server.main import PackServer
-    PackServer().run()
+    from alasio.deploy_dev.pack_server.run import PackRun
+    await PackRun().run()
+
+A run that only builds the packs, with no remote and no credential, is
+``PackServer().run()``: it is the generation step alone, for a machine that
+prepares a workspace and publishes it later from elsewhere.
 """
 
 import argparse
+import functools
+import sys
 
-from alasio.deploy_dev.pack_server.dep_gen import DepGen
-from alasio.deploy_dev.pack_server.gate import check_run_dir
-from alasio.deploy_dev.pack_server.model import PackRepoConfig
-from alasio.deploy_dev.pack_server.pack_gen import PackRepoGen
+import trio
+
+from alasio.deploy_dev.pack_server.gate import RunDirError, check_run_dir
+from alasio.deploy_dev.pack_server.model import ConfigError, PackRepoConfig
 from alasio.deploy_dev.pack_server.pack_repo import PackRepo
+from alasio.deploy_dev.pack_server.publish.lock import ChannelLock
+from alasio.deploy_dev.pack_server.repo import Repo
+from alasio.deploy_dev.pack_server.run import PackRun, PackRunError, config_log_name
 from alasio.ext import env
 from alasio.logger import logger
-
-
-class PackRunError(ValueError):
-    """
-    Raised when the run of at least one config failed
-
-    Attributes:
-        errors (list[tuple[str, Exception]]): (config file, error) of every
-            failed config, in the order of the run
-    """
-
-    def __init__(self, errors):
-        """
-        Args:
-            errors (list[tuple[str, Exception]]): (config file, error) of
-                every failed config
-        """
-        self.errors = errors
-        count = len(errors)
-        names = ', '.join(name for name, _ in errors)
-        plural = 's' if count > 1 else ''
-        super().__init__(f'Failed to run {count} config{plural}: {names}')
+from alasio.logger.utils import stringify_event
 
 
 class PackServer:
     """
-    Generate the packs of every config of the run directory, see the module docstring.
+    Generate the packs of every config of the run directory, and nothing else.
+
+    This is the generation step alone: it needs no remote and no credential, so
+    a machine can prepare a workspace and another one publish it. The command
+    line runs the whole channel instead (see PackRun), which publishes what it
+    generated.
 
     Usage:
         PackServer().run()
@@ -78,43 +78,34 @@ class PackServer:
 
     def iter_config(self):
         """
-        Iter the config files of the run directory.
-
-        The config files are the *.yaml files of the config folder of the run
-        directory, sorted by name so a run follows the same order every time.
-        The template of a config file is skipped, it is the file the operator
-        copies and fills, see PackRepoConfig.write_template. A folder that
-        does not exist has no config, see run(). A file that is not a *.yaml
-        file is not a config either, e.g. the tmp file of an interrupted
-        write (file.yaml.xxxxxxxx.tmp), an incomplete config is never run.
+        Iter the config files of the run directory, see PackRepoConfig.iter_files
 
         Yields:
             str: File name of a config in the config folder, e.g.
                 'LmeSzinc_AzurLaneAutoScript_master.yaml'
         """
-        folder = env.PROJECT_ROOT.joinpath(PackRepoConfig.CONFIG_FOLDER)
-        for name in sorted(folder.iter_filenames(ext='.yaml')):
-            if name == PackRepoConfig.TEMPLATE_FILE:
-                # the template is not a config: the operator copies it to a
-                # config file and fills the values
-                continue
-            yield name
+        yield from PackRepoConfig.iter_files()
 
     def run_config(self, file):
         """
-        Run the flow of one config: read, clone or fetch, generate the packs.
+        Run the flow of one config: read the config, clone or fetch the repo,
+        generate the workspace, publish the version.
 
-        The dependency channels are generated first: their target versions and
-        index checksums are the packdep payload the project tree pack carries.
-        PackRepoGen then generates the tree packs and writes repo
-        latest.pack; only after that publication does DepGen remove the old
-        dependency packs. A failure of either generation step fails the
-        config and keeps the previous latest.pack serving the clients.
+        The workspace of the repo is generated by Repo, the flow of
+        PackRepoModel: the wheels of the dependencies, the pip index, the
+        dependency packs, the repo tree packs, and finally latest.pack, the
+        barrier a client switches the version at. A failure of any step fails
+        the config and keeps the previous latest.pack serving the clients.
+
+        The lock of the channel is held for the whole generation: a publication
+        of the same workspace, e.g. the one of PackRun, must never read it
+        halfway through a run, see publish/lock.py.
 
         Args:
             file (str): Name of the config file in the config folder
 
         Raises:
+            ChannelBusy: If another run holds the lock of the channel
             RunDirError: If env.PROJECT_ROOT is not a run directory of the
                 pack server, see check_run_dir
             ValueError: If Author, Repo, Remote or Branch of the config is
@@ -123,18 +114,20 @@ class PackServer:
             httpx2.HTTPError: If a wheel of a dependency cannot be fetched
             OSError: If a pack of the repo cannot be written
         """
-        config = PackRepoConfig(file)
-        repo = PackRepo(config.data).run()
-        dep = DepGen(repo, config.data)
-        dep.run()
-        # the dependency channels are published before the repo pack: the
-        # DepGen carries the snapshots the tree version encodes into packdep
-        gen = PackRepoGen(repo, config.data, dep_gen=dep)
-        gen.run()
-        # repo latest.pack is the publication barrier: the old dependency
-        # packs stay on the disk until it is written
-        gen.commit()
-        dep.commit()
+        try:
+            config = PackRepoConfig(file)
+        except ValueError as e:
+            # the reader raises ValueError for a file it cannot decode, e.g. a
+            # value of another type; a check of the file raises ConfigError
+            raise ConfigError(str(e)) from None
+        with ChannelLock(config.data.workspace_name).locked():
+            logger.hr('Generate', level=1)
+            repo = PackRepo(config.data).run()
+            gen = Repo(repo, config.data)
+            gen.run()
+            # latest.pack is the publication barrier: the leftover packs and
+            # wheels of the previous version stay on the disk until it is written
+            gen.commit()
 
     def run(self):
         """
@@ -165,17 +158,24 @@ class PackServer:
         logger.info(f'Running {len(file_list)} config{plural} of "{env.PROJECT_ROOT}"')
         errors = []
         for file in file_list:
-            logger.hr(f'Running config "{file}"', level=1)
-            try:
-                self.run_config(file)
-            except Exception as e:
-                # one config must not stop the others: a broken config or a
-                # remote that cannot be reached is retried by the next run,
-                # the error is collected and raised at the end of the run
-                errors.append((file, e))
-                logger.exception(f'Config "{file}" failed')
-            else:
-                logger.info(f'Config "{file}" done')
+            # one log file per config, the same rule as the chained run, see
+            # config_log_name()
+            with logger.log_file(config_log_name(file)):
+                logger.hr(f'Running config "{file}"', level=0)
+                try:
+                    self.run_config(file)
+                except ConfigError:
+                    # a value the operator has to edit: the other configs are not
+                    # run, a retry would fail on the same line
+                    raise
+                except Exception as e:
+                    # one config must not stop the others: a repo that does not
+                    # build or a remote that cannot be reached is retried by the
+                    # next run, the error is collected and raised at the end
+                    errors.append((file, e))
+                    logger.exception(f'Config "{file}" failed')
+                else:
+                    logger.info(f'Config "{file}" done')
 
         done = len(file_list) - len(errors)
         logger.info(f'Ran {len(file_list)} config{plural}: {done} done, {len(errors)} failed')
@@ -185,25 +185,52 @@ class PackServer:
 
 def main():
     """
-    Command line entry, generate the packs of every config of the run directory.
+    Command line entry: generate, publish and retire every config of the run
+    directory, one channel after another.
 
     Raises:
-        SystemExit: If the arguments are invalid
+        SystemExit: 0 when every config succeeded, 1 when at least one failed at
+            something a later run may succeed at, 2 when the arguments, the run
+            directory or the configuration of a config are not usable
     """
     parser = argparse.ArgumentParser(
-        description='Generate the packs of every config of the pack server',
+        description='Generate, publish and retire every config of the pack server',
     )
     parser.add_argument(
         '-r', '--root', default='',
         help='run directory of the pack server, default to env.PROJECT_ROOT',
     )
+    parser.add_argument(
+        '--dry-run', action='store_true',
+        help='generate nothing and upload nothing, print the plan of every config',
+    )
     args = parser.parse_args()
     if args.root:
         env.set_project_root(args.root)
+    # the check runs before the first log line: opening the log file creates
+    # {root}/log, so a mistyped root would exist by the time the check ran and
+    # read as a run directory that has no config yet
+    try:
+        check_run_dir()
+    except RunDirError as e:
+        # the log of the process would live under the root that was refused
+        print(f'error: {e}', file=sys.stderr)
+        raise SystemExit(2) from None
     # the project root must be set before the first log: the log file of the
     # process is decided by the first write, see LogWriter.file
     logger.hr('Start', level=0)
-    PackServer().run()
+    try:
+        trio.run(functools.partial(PackRun().run, dry_run=args.dry_run))
+    except ConfigError as e:
+        # a value the operator has to edit: no retry can fix it
+        logger.error(stringify_event(e))
+        raise SystemExit(2) from None
+    except RunDirError as e:
+        logger.error(stringify_event(e))
+        raise SystemExit(2) from None
+    except PackRunError as e:
+        logger.error(stringify_event(e))
+        raise SystemExit(1) from None
 
 
 if __name__ == '__main__':

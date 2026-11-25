@@ -1,581 +1,436 @@
 """
-Fetch the wheel of a distribution version from a PyPI simple mirror.
+Fetch the wheels of a distribution version from a PyPI simple index.
 
-A pack config with PythonDeps builds the packs of the dependencies of a repo,
-the wheels are the input of the build: this module downloads the wheel of one
-(name, version) from the PyPI simple index (PEP 503) of a mirror to the wheel
-folder of a repo of the pack server:
+A repo of the pack server builds the packs of its python dependencies and
+publishes the wheels of the provided ones, the wheels of a name are fetched for
+one of the two jobs only: this module downloads them from the PyPI simple
+index (PEP 503) of the pin into the cache folder of its version:
 
-    {run directory}/pack/{Author}_{Repo}_{Branch}/wheel/{distribution}/{version}/{filename}.whl
+    {workspace}/.wheel_cache/{distribution}/{version}/index.html   the index page
+    {workspace}/.wheel_cache/{distribution}/{version}/{filename}.whl   the wheels
 
-One WheelFetcher instance fetches one (name, version) of one mirror,
-target_folder is the folder the wheel and its index data are put in. The
-fetch runs in two steps:
+The fetch is the shared wheel fetcher of the deploy domain,
+`alasio.deploy.pip_download.pypi_file.PypiFile` (the ported pip helpers parse the page,
+select the wheel of a version for a mode, check the bytes against the hash of
+their index link and write the file atomically), and this class is the release
+side of it. A run of the pack server is repeated on the same workspace, so the
+network is spent once and the local files answer the next runs:
 
-1. index_data: the index page of the distribution is requested at
-   {mirror}/{name}/ and parsed into one WheelInfo per wheel file of the page,
-   the parse is written to {target_folder}/index_data.json with an indent, so
-   an operator can read it (jsonfile.write_json). A fetch of the same
-   (name, version) loads the file instead of requesting the page again: the
-   cache is trusted as it is, delete the file to read the page again, e.g.
-   after the mirror of the config was changed. A cache file that holds no
-   index data is reported with a warning and the page is read again, the file
-   is written again;
-2. wheel: the pure python wheel of the version is selected from index_data
-   and downloaded to {target_folder}/{filename}. The file is downloaded when
-   it is not in the folder yet, and when the sha256 of the local file does
-   not match the sha256 of its index link: a file that matches is kept as it
-   is, no request is made. A link without sha256 has nothing to check
-   against, the local file is trusted, the first download is the authority
-   (TOFU).
+- links reads the index page from `index.html` when the snapshot is there, and
+  requests the page once when it is not: the page of a distribution is the
+  slowest request of the flow and the one that changes least. The snapshot
+  lives in the folder of the version, so every version of the window keeps its
+  own, see the cache layout. It is a cached property: the page of a run is
+  parsed once and shared by its fetches;
+- get_wheel() keeps the local file that matches the hash of its index link and
+  downloads the one that does not;
+- fetch_async(mode) is the two steps: the page, the wheels of the version the
+  mode asks for, a few transfers at a time (FETCH_CONCURRENT).
 
-Only the pure python wheels of python3 are fetched: the abi and the platform
-tag of the file must be none-any, the python tag must cover py3. A version
-that has no such wheel is not a target of the pack build (a distribution with
-compiled extensions is updated with pip, not with a pack), the fetch raises
-WheelNotFoundError. The distribution name is normalized with PEP 503 for the
-index url and the folder, the same dist-key the ledger and the pack folders
-use, see parse_dep.normalize_name.
+A local file that does not match the page is a mismatch of two caches of an
+earlier run, and a mismatch does not say which side is stale: the page may
+describe a file the index replaced under the same name, or the file may be the
+half written leftover of a killed run. The page is downloaded again (once per
+instance, at most) and every wheel of the fetch is checked against it again,
+the ones checked before the download included: a file that matched the old page
+says nothing about the new one. The parsed page and its snapshot are dropped in
+fetch_async(), so the second round reads the page from the index again. A wheel
+that still does not match after the new page is a source error and is raised.
 
-A download is written atomically, and the bytes are checked against the
-sha256 of the index link while streaming when the link carries one: a
-mismatch raises WheelHashError and no file is put at the final path.
+The modes are the ones of the shared fetcher, see select_wheels():
 
-Both requests go through the retrying http client of the instance
-(HttpClient): a transport error (dns failure, connect refusal, timeout,
-read error) is retried, so a one-off network blip does not fail the
-fetch; the transfer of a wheel is retried as a whole, a read error in
-the middle of a download starts it over. An http status error is the
-answer of the mirror and is never retried.
+- DOWNLOAD_MODE_PY3_ANY is the pure python wheel of python3, the only wheel a
+  pack build can encode (the abi and the platform tag of the file are
+  `none-any`): the input of the dependency packs, one file per version;
+- DOWNLOAD_MODE_ALL is every wheel of the version: the files of a provided
+  pin, one per platform, the client installs the one of its platform.
+
+The distribution name is normalized with PEP 503 for the index url, the same
+dist-key the pack folders use, see parse_dep.normalize_name.
+
+The fetch runs on the event loop of the shared fetcher (trio):
+fetch_async() is the entry of a caller that runs on a loop, like RepoWheel. A
+fetcher is closed by its caller, see aclose(): the instance keeps the client
+and the page of its version for as many fetches as the caller makes.
 
 Usage:
+    from alasio.deploy.pip_download.pypi_file import DOWNLOAD_MODE_ALL, DOWNLOAD_MODE_PY3_ANY
     from alasio.deploy_dev.pack_server.fetch_wheel import WheelFetcher
 
-    # root = {run directory}/pack/{Author}_{Repo}_{Branch}
-    root = env.PROJECT_ROOT.joinpath('pack').joinpath('LmeSzinc_AzurLaneAutoScript_master')
-    fetcher = WheelFetcher(root, mirror, 'httpx', '0.28.1')
-    file = fetcher.fetch()
-    fetcher.close()
+    folder = env.PROJECT_ROOT.joinpath('pack').joinpath('Author_Repo_master') \
+        .joinpath('.wheel_cache').joinpath('httpx').joinpath('0.28.1')
+    fetcher = WheelFetcher(folder, 'https://pypi.org/simple', 'httpx', '0.28.1')
+    try:
+        file = (await fetcher.fetch_async(DOWNLOAD_MODE_PY3_ANY))[0]
+        files = await fetcher.fetch_async(DOWNLOAD_MODE_ALL)
+    finally:
+        await fetcher.aclose()
 """
 
-import hashlib
-import re
-from typing import List
-from urllib.parse import unquote, urljoin, urlparse
+import trio
 
-import httpx2
-import msgspec
-from msgspec.structs import asdict
-
-from alasio.deploy.httpclient.client_sync import HttpClient
-from alasio.deploy_dev.pack_server.parse_dep import normalize_name
-from alasio.ext.cache import cached_property
-from alasio.ext.file.jsonfile import write_json
+from alasio.deploy.httpclient.client_async import AsyncHttpClient
+from alasio.deploy.httpclient.probe_mirrors import Mirrors
+from alasio.deploy.pip_download._link import parse_links
+from alasio.deploy.pip_download._utils import canonicalize_name
+from alasio.deploy.pip_download.pypi_file import (
+    DownloadMode, PypiFile, WheelHashError, WheelInfo, WheelNotFoundError, select_wheels
+)
+from alasio.ext.cache import cached_property, cached_property_async
 from alasio.ext.path import PathStr
-from alasio.ext.path.atomic import atomic_read_bytes, atomic_read_bytes_stream
 from alasio.logger import logger
 
-# folder of the fetched wheels in the repo folder
-WHEEL_FOLDER = 'wheel'
+__all__ = [
+    'WheelFetcher',
+    'WheelHashError',
+    'WheelInfo',
+    'WheelNotFoundError',
+    'create_client',
+]
 
-# cache of the parsed index page, in the folder of the version
-INDEX_DATA_FILE = 'index_data.json'
+# the snapshot of the index page of a version, in the folder of the version. The
+# body is kept as the index served it, byte for byte, see WheelFetcher.links
+INDEX_FILE = 'index.html'
 
-# the href of a link of a PEP 503 index page: href="..." or href='...'
-REGEX_LINK = re.compile(r'href=["\']([^"\']+)["\']')
+# the content type of a PEP 691 JSON page: the snapshot keeps the body only, so
+# a page is told from an HTML one by its first character, see WheelFetcher.links
+JSON_PAGE = 'application/vnd.pypi.simple.v1+json'
+
+# Transfers in flight of one version. A page of a compiled dependency lists tens
+# of wheels (one per platform and interpreter, 46 for av, 126 for multidict),
+# and the files of a release are served by one host: one transfer at a time
+# spends the run on the round trips rather than on the bytes. Measured on a
+# consumer link, the same version of multidict takes 76s at 1, 16s at 4, 3~13s
+# at 8 and 10~12s at 16/12, so 8 is where the round trips stop being the cost
+# and the mirror starts being throttled.
+#
+# The memory of a burst is bounded by the wheels in flight, and a wheel is
+# buffered in memory before it is written (see PypiFile.get_wheel): the worst
+# version of the real repo is av, 46 wheels of up to 42 MiB, so 8 transfers can
+# hold a few hundred MB for the seconds a group of large files takes. A wheel
+# of a pure python dependency is one small file, where the mode is
+# DOWNLOAD_MODE_PY3_ANY.
+FETCH_CONCURRENT = 8
 
 
-class WheelInfo(msgspec.Struct):
+def create_client(proxy=''):
     """
-    One wheel file parsed from a link of a PEP 503 index page.
+    Create the http client the wheel fetches of one step are sent with.
 
-    Attributes:
-        name (str): PEP 503 normalized distribution name of the filename
-        version (str): Version of the filename
-        filename (str): Filename of the wheel, e.g. 'httpx-0.28.1-py3-none-any.whl'
-        url (str): Absolute url of the file, resolved against the index url,
-            without the fragment: the fragment of a link carries the sha256
-        sha256 (str): Lowercase sha256 hex of the link fragment, '' if the
-            link carries none
-        tags (List[str]): Trailing python, abi and platform tags of the filename
-    """
+    A fetcher takes any client (see WheelFetcher.__init__), so the route and the
+    lifetime of the requests are decided by the caller: a step of the pack
+    server builds one client and hands it to every fetcher of the step, so the
+    versions of the window reuse the connections of that client instead of
+    opening a connection pool each.
 
-    name: str
-    version: str
-    filename: str
-    url: str
-    sha256: str
-    tags: List[str]
-
-
-class WheelNotFoundError(ValueError):
-    """
-    Raised when the mirror holds no wheel to fetch for the name and version.
-
-    The cases: the mirror has no index of the distribution (a 404), the index
-    has no wheel of the version, or the version has no pure python wheel of
-    python3 (a distribution with compiled extensions is not a target of the
-    pack build, it is updated with pip).
-    """
-
-
-class WheelHashError(ValueError):
-    """
-    Raised when the downloaded wheel does not match the sha256 of the index
-    link: the bytes are not the file the index describes and are not kept.
-    """
-
-
-def _parse_wheel_file(filename):
-    """
-    Parse a wheel filename into the name, the version and the tags.
-
-    The wheel filename format (PEP 427):
-    {name}-{version}(-{build tag})?-{python tag}-{abi tag}-{platform tag}.whl
-    The name and the version of the file carry no '-', the name part is
-    normalized with PEP 503 for the compare with a dependency name.
+    The environment of the user is ignored, the rule of the clients of the
+    deploy domain (see AsyncHttpClient.create_client): the proxy is the one the
+    operator configured (PackRepoModel.Env), never the one a proxy tool left in
+    the environment of the process.
 
     Args:
-        filename (str): Filename of a wheel, e.g. 'httpx-0.28.1-py3-none-any.whl'
+        proxy (str): Proxy url the requests are routed through, e.g.
+            'http://127.0.0.1:7890' or 'socks5://127.0.0.1:7890'. Defaults to
+            '', a direct connection
 
     Returns:
-        tuple[str, str, list[str]] | None: (normalized name, version, tags) of
-            the file, the tags are the trailing python, abi and platform tags,
-            None if the filename is not a wheel filename
+        httpx2.AsyncClient: The client, its requests go out directly or through
+            the proxy. Nothing is connected by the creation, the first request
+            of the client opens the connection
     """
-    if not filename.endswith('.whl'):
-        return None
-    parts = filename[:-len('.whl')].split('-')
-    # {name}-{version}-{python}-{abi}-{platform}(-{build})...: the name and
-    # the version carry no '-', the last three parts are always the tags
-    if len(parts) < 5:
-        return None
-    return normalize_name(parts[0]), parts[1], parts[-3:]
-
-
-def _is_pure_python3(tags):
-    """
-    Whether the tags are a pure python wheel of python3.
-
-    A pure python wheel has no environment constraint: the abi and the
-    platform tag are none-any, only the python tag narrows the interpreter.
-    The python tag must cover py3 ('py3', 'py2.py3', 'py38', ...): the pack
-    build runs on python3, a py2 only wheel is not installable.
-
-    Args:
-        tags (list[str]): Trailing tags of a wheel filename: python, abi, platform
-
-    Returns:
-        bool: True if the wheel is a pure python wheel of python3
-    """
-    python, abi, platform = tags
-    return abi == 'none' and platform == 'any' and 'py3' in python
-
-
-def _fragment_sha256(fragment):
-    """
-    The sha256 of a link fragment of a PEP 503 index page.
-
-    Args:
-        fragment (str): Fragment of the url, e.g. 'sha256=ab12...'
-
-    Returns:
-        str: Lowercase hex digest, '' if the fragment carries no sha256
-    """
-    key, sep, value = fragment.partition('=')
-    if sep and key.lower() == 'sha256':
-        return value.lower()
-    return ''
-
-
-def _parse_index_page(text, index_url):
-    """
-    Parse a PEP 503 index page into the wheel files it links.
-
-    The links of the page are read as they are: the relative urls are
-    resolved against the index url, the sha256 fragment of a link is read and
-    the filename is parsed. A link that is not a wheel file is skipped, the
-    wheel files of every version are parsed.
-
-    Args:
-        text (str): Content of the index page
-        index_url (str): Url of the page, the relative urls of the links are
-            resolved against it
-
-    Returns:
-        list[WheelInfo]: One WheelInfo per wheel file the page links, in the
-            order of the page
-    """
-    data = []
-    for href in REGEX_LINK.findall(text):
-        link_url = urljoin(index_url, href)
-        split = urlparse(link_url)
-        filename = unquote(split.path.rpartition('/')[2])
-        parsed = _parse_wheel_file(filename)
-        if parsed is None:
-            continue
-        name, version, tags = parsed
-        # the request url carries no fragment, the sha256 fragment of the
-        # link is read separately
-        url = split._replace(fragment='').geturl()
-        data.append(WheelInfo(
-            name=name, version=version, filename=filename, url=url,
-            sha256=_fragment_sha256(split.fragment), tags=tags))
-    return data
-
-
-def _sha256_file(file):
-    """
-    The sha256 hex digest of a file, streamed in chunks.
-
-    Args:
-        file (str): Source file path
-
-    Returns:
-        str: Lowercase sha256 hex digest
-
-    Raises:
-        FileNotFoundError: If the file does not exist
-    """
-    digest = hashlib.sha256()
-    for chunk in atomic_read_bytes_stream(file):
-        digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _read_index_data(file):
-    """
-    Read the cached index data of a version.
-
-    A cache file that holds no index data of the version (an interrupted
-    write, a file of another tool) is reported with a warning and None is
-    answered: the caller reads the index page and writes the file again,
-    like a missing file.
-
-    Args:
-        file (PathStr): Path of the cache file, see WheelFetcher.index_data_file
-
-    Returns:
-        list[WheelInfo] | None: The cached wheel information, None if the
-            file does not exist or holds no index data
-    """
-    try:
-        content = atomic_read_bytes(file)
-    except FileNotFoundError:
-        return None
-    try:
-        return msgspec.json.decode(content, type=List[WheelInfo])
-    except msgspec.DecodeError as e:
-        logger.warning(f'Invalid index data, read the index page again: "{file}", {e}')
-        return None
-
-
-def _iter_checked(chunks, sha256, url):
-    """
-    Iter the chunks of a download, check the sha256 when the stream ends.
-
-    The check lives in the generator on purpose: the generator is consumed by
-    atomic_write_stream, a raise here (after every chunk is yielded) fails the
-    write before the tmp file is put at the final path.
-
-    Args:
-        chunks (Iterable[bytes]): Chunks of the download
-        sha256 (str): Expected sha256 hex, '' to skip the check
-        url (str): Url of the download, for the error message
-
-    Yields:
-        bytes: The chunks, unchanged
-
-    Raises:
-        WheelHashError: If the digest of the chunks does not match sha256
-    """
-    digest = hashlib.sha256()
-    for chunk in chunks:
-        digest.update(chunk)
-        yield chunk
-    if sha256 and digest.hexdigest() != sha256:
-        raise WheelHashError(
-            f'Sha256 of "{url}" does not match the index: {digest.hexdigest()} != {sha256}')
+    if not proxy:
+        # the factory of the domain: the same trust_env=False without a proxy
+        return AsyncHttpClient.create_client()
+    import httpx2
+    return httpx2.AsyncClient(trust_env=False, proxy=proxy)
 
 
 class WheelFetcher:
     """
-    Fetch the wheel of one distribution version from a PyPI simple mirror.
+    Fetch the wheels of one distribution version from its PyPI simple index.
 
-    The layout, the selection of the wheel and the checks are in the module
-    docstring. The fetch is lazy: nothing is requested until fetch() or
-    index_data is read.
-
-    Usage:
-        # the folder of the repo, {run directory}/pack/{Author}_{Repo}_{Branch}
-        fetcher = WheelFetcher(repo_folder, mirror, 'httpx', '0.28.1')
-        file = fetcher.fetch()
+    The layout, the cache of the index page and the modes are in the module
+    docstring. The fetch is lazy: nothing is requested until fetch_async().
     """
 
-    def __init__(self, root, mirror, name, version, client=None):
+    def __init__(self, folder, mirrors, name, version, client=None):
         """
         Args:
-            root (str): Folder of the repo in the pack folder of the run
-                directory, e.g. {run directory}/pack/{Author}_{Repo}_{Branch};
-                the index data and the wheel are put in
-                {root}/wheel/{name}/{version}/
-            mirror (str): Base url of the PyPI simple index (PEP 503), e.g.
-                'https://mirrors.aliyun.com/pypi/simple', with or without the
-                trailing '/'
+            folder (str): Folder of the version in the cache,
+                {workspace}/.wheel_cache/{name}/{version}: the index page and
+                the wheels are written into it. The atomic writes create the
+                folder when it does not exist
+            mirrors (Mirrors | str | dict): The PyPI simple index (PEP 503)
+                mirrors to fetch from, see Mirrors.from_input() for the
+                accepted forms: a single url, name to url, group to mirrors,
+                and the flat/nested mix. The release side passes the one index
+                of the pin, so no probe selects between candidates
             name (str): Distribution name, e.g. 'httpx', the name a dependency
-                file writes. Normalized with PEP 503 for the index url and the
-                folder.
+                file writes. Normalized with PEP 503 for the index url
             version (str): Exact version of the distribution, e.g. '0.28.1',
                 the version string a dependency file pins
-            client (httpx2.Client | HttpClient, optional): Client to
-                use, or an HttpClient whose client is taken (independent
-                fetchers can share one client, see HttpClient). Its
-                lifetime belongs to the caller (this class never closes
-                an injected client). Defaults to None, a client of this
-                instance is created on the first request and reused by
-                the later ones, close() closes it
+            client (httpx2.AsyncClient | AsyncHttpClient, optional): Client to
+                send the requests with, or an AsyncHttpClient whose client is
+                taken (independent fetchers can share one client, see
+                AsyncHttpClient). The lifetime of an injected client belongs to
+                the caller (this class never closes it). Defaults to None, a
+                client of the fetcher is created on the first request and
+                closed by aclose()
         """
-        self.root = PathStr.new(root)
-        self.mirror = mirror.rstrip('/')
+        self.folder = PathStr.new(folder)
+        self.mirrors = Mirrors.from_input(mirrors)
         self.name = name
         self.version = version
-        # the retrying http client of this instance: every request goes
-        # through it, a transport error is retried, see HttpClient
-        self._http = HttpClient(client)
+        self.client = client
+        # the shared fetcher of the version folder: the index page, the wheels
+        # and their checks are its work, see PypiFile
+        self.pypi = PypiFile(self.mirrors, self.folder, client=client)
+        # whether the index page was downloaded again in this instance, the page
+        # of a version is downloaded at most once, see fetch_async()
+        self._page_reloaded = False
 
     @cached_property
-    def target_folder(self):
+    def index_file(self):
         """
-        Folder the wheel is fetched into: {root}/wheel/{name}/{version}
-
-        The name is normalized with PEP 503, like the dist-key of the pack
-        files.
+        The snapshot of the index page of the version.
 
         Returns:
-            PathStr: Absolute path of the folder
+            PathStr: {folder}/index.html, the body the index served
         """
-        return self.root.joinpath(WHEEL_FOLDER).joinpath(normalize_name(self.name)).joinpath(self.version)
+        return self.folder.joinpath(INDEX_FILE)
 
     @cached_property
-    def index_data_file(self):
+    def page_url(self):
         """
-        Cache file of the index data: {target_folder}/index_data.json
+        The url of the index page of the distribution.
 
-        The file holds the parse of the index page of an earlier fetch, see
-        index_data.
+        The base is the first index of the mirrors: the release side gives one
+        index per pin, so the snapshot of an earlier run is parsed against the
+        same base the page was served at. It is the base of the relative links
+        of the page, see parse_links().
 
         Returns:
-            PathStr: Absolute path of the file
+            str: {index}/{dist-key}/, e.g. 'https://pypi.org/simple/httpx/'
         """
-        return self.target_folder.joinpath(INDEX_DATA_FILE)
+        return f'{next(iter(self.mirrors.urls.values()))}/{canonicalize_name(self.name)}/'
 
     @cached_property
-    def index_data(self):
+    def mirrors_text(self):
         """
-        The wheel information of the distribution, from the cache or the page.
-
-        An existing index_data_file is loaded as it is and the page is not
-        requested again: the cache is trusted like the wheel folder, delete
-        the file to read the page again, e.g. after the mirror of the config
-        was changed. A cache file that holds no index data is reported with a
-        warning and the page is read again, the file is written again (an
-        interrupted write, a file of another tool). Otherwise the index of
-        the distribution is requested at {mirror}/{name}/, the links of the
-        page are read as they are: the relative urls are resolved against the
-        index url, the sha256 fragment of a link is read and the filename is
-        parsed. A link that is not a wheel file is skipped, the wheel files
-        of every version are parsed. The parse is written to the cache file
-        for the later fetches with jsonfile.write_json, with an indent, so an
-        operator can read it. The result is cached on the instance: the cache
-        file or the page is read once per instance.
+        The mirror set as the logs print it: the urls it fetches from, in the
+        declared order, a set of one url prints that url alone
 
         Returns:
-            list[WheelInfo]: One WheelInfo per wheel file the page links, in
-                the order of the page
+            str: The urls of the candidate mirrors
+        """
+        return ', '.join(dict.fromkeys(self.mirrors.urls.values()))
+
+    async def aclose(self):
+        """
+        Close the http client of the fetcher, the injected one is left open.
+
+        A fetcher serves as many fetches as the caller makes (the modes of a
+        version share one page), so its lifetime belongs to the caller.
+        """
+        await self.pypi.aclose()
+
+    # ------------------------------------------------------------------
+    # The index page of the version
+    # ------------------------------------------------------------------
+
+    @cached_property_async
+    async def links(self):
+        """
+        The links of the index page of the distribution, parsed once.
+
+        The snapshot of an earlier run answers when it is there: the page is a
+        file of the cache like the wheels, and a run over an up to date
+        workspace makes no request for it. A snapshot that does not parse is
+        downloaded again, and the page is written to the snapshot when it comes
+        from the index. The body is kept only, the content type of the response
+        is not stored: a PEP 691 JSON page is told from an HTML one by its
+        first character, the object a JSON page starts with.
+
+        The value is a cached property: the page of a run is parsed once and
+        shared by its fetches, and a mismatch of the wheels drops it, see
+        fetch_async().
+
+        Returns:
+            list[Link]: The links of the page, in the order of the page
 
         Raises:
-            WheelNotFoundError: If the mirror has no index of the
-                distribution (a 404)
-            httpx2.HTTPStatusError: If the index request fails with another
-                status
+            WheelNotFoundError: If the index has no page of the distribution (a
+                404), or the served page does not parse
+            httpx2.HTTPError: If the request fails
+            AllMirrorsFailedError: If no mirror is usable
         """
-        file = self.index_data_file
-        data = _read_index_data(file)
-        if data is not None:
-            logger.info(f'Index data exists, loaded: "{file}"')
-            return data
-
-        index_url = f'{self.mirror}/{normalize_name(self.name)}/'
-        response = self._get_index(index_url)
-        data = _parse_index_page(response.text, index_url)
-        write_json(file, [asdict(wheel) for wheel in data])
-        logger.info(f'Index data cached: "{index_url}" -> "{file}"')
-        return data
-
-    def fetch(self):
-        """
-        Fetch the wheel of the distribution version to the target folder.
-
-        The fetch runs in two steps, see the module docstring: index_data is
-        read from the cache file or the index page, then the wheel of the
-        version is selected from it. The selected file is downloaded when it
-        is not in the folder yet, and when the sha256 of the local file does
-        not match the sha256 of its index link: a file that matches is kept
-        as it is and no request is made. The bytes of a download are checked
-        against the sha256 of the index link when the link carries one.
-
-        Returns:
-            PathStr: Path of the wheel file, target_folder/{filename}
-
-        Raises:
-            WheelNotFoundError: If the mirror has no index of the
-                distribution, the index has no wheel of the version, or the
-                version has no pure python wheel of python3
-            WheelHashError: If the downloaded wheel does not match the sha256
-                of the index link, no file is put at the final path
-            httpx2.HTTPError: If a request fails
-        """
-        wheel = self._select_wheel()
-        file = self.target_folder.joinpath(wheel.filename)
-        if self._wheel_is_valid(file, wheel):
-            logger.info(f'Wheel exists, skipped: "{file}"')
-            return file
-        logger.info(f'Download wheel: "{wheel.url}" -> "{file}"')
-        self._download(wheel.url, file, wheel.sha256)
-        return file
-
-    def close(self):
-        """
-        Close the http client of this instance when it created one.
-
-        An injected client is never closed: its lifetime belongs to the
-        caller, see __init__. Closing is idempotent, `with WheelFetcher(...)
-        as fetcher:` closes it on exit.
-        """
-        self._http.close()
-
-    def __enter__(self):
-        """
-        Returns:
-            WheelFetcher: The instance itself, for the with statement
-        """
-        return self
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        """
-        Close the client of this instance on exit, see close().
-        """
-        self.close()
-
-    def _wheel_is_valid(self, file, wheel):
-        """
-        Whether the local file is the wheel the index data describes.
-
-        The file is the one the index data names to fetch, the filename of
-        the selected wheel: a file of another name is not this fetch, see
-        fetch. A file that does not exist is not valid, it is downloaded.
-        The sha256 of the file is checked against the sha256 of the index
-        link when the link carries one: other bytes mean the local file is
-        not the file the index describes, the file is downloaded again. A
-        link without sha256 has nothing to check against, the local file is
-        trusted: the mirror carries no hash, the first download is the
-        authority (TOFU).
-
-        Args:
-            file (PathStr): Path of the wheel in the target folder
-            wheel (WheelInfo): Wheel selected from the index data
-
-        Returns:
-            bool: True if the file is usable as it is, no download needed
-        """
-        if not wheel.sha256:
-            return file.exists()
         try:
-            return _sha256_file(file) == wheel.sha256
+            body = self.index_file.atomic_read_bytes()
         except FileNotFoundError:
-            return False
-
-    def _select_wheel(self):
-        """
-        Select the pure python wheel of the version from the index data.
-
-        A wheel of another version and a wheel with an environment constraint
-        are skipped; when the version has several pure wheels (e.g. different
-        python tags), the first by filename is selected.
-
-        Returns:
-            WheelInfo: The selected wheel
-
-        Raises:
-            WheelNotFoundError: If the index has no wheel of the version, or
-                the version has no pure python wheel of python3
-        """
-        dist = normalize_name(self.name)
-        index_url = f'{self.mirror}/{dist}/'
-        wheels = [
-            wheel for wheel in self.index_data
-            if wheel.name == dist and wheel.version == self.version
-        ]
-        pure = [wheel for wheel in wheels if _is_pure_python3(wheel.tags)]
-        if not pure:
-            if wheels:
-                files = ', '.join(sorted(wheel.filename for wheel in wheels))
-                raise WheelNotFoundError(
-                    f'No pure python wheel of "{self.name}=={self.version}" in "{index_url}", '
-                    f'the version has: {files}')
-            raise WheelNotFoundError(
-                f'No wheel of "{self.name}=={self.version}" in "{index_url}"')
-        return sorted(pure, key=lambda wheel: wheel.filename)[0]
-
-    def _get_index(self, index_url):
-        """
-        Get the index page of the distribution from the mirror.
-
-        Args:
-            index_url (str): Url of the index page
-
-        Returns:
-            httpx2.Response: The index page
-
-        Raises:
-            WheelNotFoundError: If the mirror has no index of the
-                distribution (a 404)
-            httpx2.HTTPStatusError: If the request fails with another status
-        """
-        # the http client raises the status errors of the response, a
-        # 404 means the mirror has no index of the distribution
+            return await self._download_index()
+        content_type = JSON_PAGE if body.lstrip()[:1] == b'{' else ''
         try:
-            return self._http.get(index_url, follow_redirects=True)
+            return parse_links(body, self.page_url, content_type)
+        except ValueError as e:
+            # the snapshot is a cache: a body that does not parse is dropped
+            # and the page is requested, no run is failed by a broken cache
+            logger.warning(f'The index snapshot does not parse, downloaded again: "{self.index_file}", {e}')
+        return await self._download_index()
+
+    async def _download_index(self):
+        """
+        Request the index page, write it to the snapshot and read its links.
+
+        The page is the one of the shared fetcher: the request, the probe of
+        the mirror and the parse are its work, see PypiFile.get_package_index().
+
+        Returns:
+            list[Link]: The links of the page
+
+        Raises:
+            WheelNotFoundError: If the index has no page of the distribution (a
+                404), or the served page does not parse
+            httpx2.HTTPError: If the request fails
+        """
+        # httpx2 is imported lazily in the places that catch its errors: the
+        # package resolves its own version with importlib.metadata at import
+        # time, which the in-memory filesystem of the tests cannot answer
+        import httpx2
+        try:
+            index = await self.pypi.get_package_index(self.name)
         except httpx2.HTTPStatusError as e:
             if e.response.status_code == 404:
-                raise WheelNotFoundError(
-                    f'No index of "{self.name}" in "{self.mirror}"') from None
+                raise WheelNotFoundError(f'No index of "{self.name}" in "{self.mirrors_text}"') from None
             raise
+        logger.debug(f'Index page of "{self.name}": "{index.url}" -> "{self.index_file}"')
+        self.index_file.atomic_write(index.body)
+        return index.links
 
-    def _download(self, url, file, sha256):
+    # ------------------------------------------------------------------
+    # The wheels of the version
+    # ------------------------------------------------------------------
+
+    async def fetch_async(self, mode: DownloadMode):
         """
-        Download a file, check the sha256 while streaming, write it atomically.
+        Fetch the wheels of the version that match a mode.
 
-        The transfer is retried as a whole on a transport error, see
-        HttpClient.stream: a read error in the middle of the download
-        discards the attempt and starts the transfer over, and a failed
-        attempt leaves no file behind (the atomic write removes its tmp
-        file).
+        The mode is the caller's decision, there is no default: a pack build
+        asks DOWNLOAD_MODE_PY3_ANY, the pip index of the repo asks
+        DOWNLOAD_MODE_ALL (see RepoWheel).
+
+        The page is read (or downloaded) once, the wheels of the mode are
+        selected from its links and fetched a few at a time, see
+        _fetch_wheels().
+
+        A wheel that does not match the page is a mismatch of two caches, see
+        the module docstring: the cached links are dropped with the snapshot
+        and the round starts again, so the page is downloaded again and every
+        wheel of the mode is checked against the new page, the wheels fetched
+        before it included. The page is downloaded at most once per instance:
+        a wheel that does not match the new page is a failure.
 
         Args:
-            url (str): Url of the file
-            file (PathStr): Path of the file to write
-            sha256 (str): Expected sha256 hex, '' to skip the check
+            mode: DOWNLOAD_MODE_PY3_ANY (the pure python wheel, the pack build)
+            or DOWNLOAD_MODE_ALL (every wheel of the version, the
+                pip index)
+
+        Returns:
+            list[WheelInfo]: The wheels, in the order of the page
 
         Raises:
-            WheelHashError: If the bytes do not match sha256, no file is put
-                at the final path
-            httpx2.HTTPError: If the transfer fails on every attempt
+            ValueError: If the mode is not one of DOWNLOAD_MODES
+            WheelNotFoundError: If the index has no page of the distribution,
+                the page has no wheel of the version that matches the mode, or
+                the page downloaded again has no wheel of the mode
+            WheelHashError: If a downloaded wheel does not match the hash of its
+                link, the page was downloaded again already
+            httpx2.HTTPError: If a request fails
+            AllMirrorsFailedError: If no mirror is usable
         """
-        def consume(response):
-            # the check of the digest lives in the chunk generator: a
-            # mismatch fails the atomic write before the tmp file is
-            # put at the final path
-            file.atomic_write_stream(_iter_checked(response.iter_bytes(), sha256, url))
+        for _ in range(2):
+            candidates = select_wheels(await self.links, self.name, self.version, mode)
+            try:
+                files = await self._fetch_wheels(candidates)
+            except WheelHashError:
+                if self._page_reloaded:
+                    raise
+                # the page and the files are the caches of an earlier run: the
+                # parsed page and the snapshot are dropped, so the next round
+                # downloads the page and checks every wheel against it
+                self._page_reloaded = True
+                logger.warning(f'The wheels do not match the index snapshot, downloaded again: "{self.index_file}"')
+                cached_property_async.pop(self, 'links')
+                self.index_file.atomic_remove()
+                continue
+            return files
 
-        self._http.stream(url, consume, follow_redirects=True)
+    async def _fetch_wheels(self, candidates):
+        """
+        Download the wheels of one version, a few transfers in flight.
+
+        The wheels of a compiled dependency are one file per platform and
+        interpreter, all served by the same host: the transfers overlap up to
+        FETCH_CONCURRENT, so the run spends the bytes of the release instead of
+        one round trip per file. A file that is already in the cache folder is
+        answered by get_wheel() without a request, so a burst over a warm cache
+        costs the hash of its files only.
+
+        The whole burst runs: a failure does not cancel the transfers in flight.
+        A wheel that does not match the page makes fetch_async reload the page
+        and check every wheel of the version again, and the files the burst did
+        fetch are then the ones the new page keeps, so the transfers of the
+        failed round are not wasted. The failure raised is the one of the first
+        wheel of the page, not the one that happened to fail first, so a run
+        fails with the same error whatever order the transfers complete in. It
+        is raised as it is, never wrapped in the exception group of the nursery.
+
+        The answer is in the order of the candidates, whatever the order the
+        transfers complete in: the caller publishes the wheels in that order.
+
+        Args:
+            candidates (list[WheelCandidate]): Wheels of the version, most
+                preferred first, see select_wheels()
+
+        Returns:
+            list[WheelInfo]: The wheels, in the order of the candidates
+
+        Raises:
+            WheelHashError: If a downloaded wheel does not match the hash of
+                its link
+            httpx2.HTTPError: If a request fails
+            OSError: If a wheel cannot be written
+        """
+        # (index of the candidate, wheel) of the transfers that answered. The
+        # result is sorted by the index below, so the order of the list is the
+        # order of the candidates whatever order the transfers complete in
+        fetched = []
+        failures = []
+        limiter = trio.CapacityLimiter(FETCH_CONCURRENT)
+        async with trio.open_nursery() as nursery:
+            async def fetch(index, candidate):
+                try:
+                    async with limiter:
+                        wheel = await self.pypi.get_wheel(candidate.link.url)
+                        fetched.append((index, wheel))
+                except Exception as e:
+                    # trio.Cancelled is a BaseException: the cancellation of the
+                    # step is not a failure of the file it interrupted
+                    failures.append((index, e))
+
+            for index, candidate in enumerate(candidates):
+                nursery.start_soon(fetch, index, candidate)
+        if failures:
+            _, failure = min(failures, key=lambda item: item[0])
+            raise failure
+        # every candidate must answer with a wheel: a hole here would be
+        # published as a version that misses a file, and nothing downstream can
+        # tell a missing wheel from a platform the release does not ship
+        files = [wheel for _, wheel in sorted(fetched)]
+        if len(files) != len(candidates):
+            raise RuntimeError(
+                f'Fetched {len(files)} of {len(candidates)} wheels of '
+                f'"{self.name}=={self.version}", the version is incomplete')
+        if any(wheel is None for wheel in files):
+            raise RuntimeError(
+                f'Empty answer of a wheel transfer of "{self.name}=={self.version}"')
+        return files

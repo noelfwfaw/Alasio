@@ -1,92 +1,97 @@
-import importlib.util
+import pytest
 
 from alasio.codegen.python.libscan import EnvLibraryScanner, ModuleType
-from alasio.ext import env
-
-# Alasio repo root, used as the scanner's classification root.
-PROJECT_ROOT = env.ALASIO_ROOT
+from alasio.codegen.ruff.stdlist import STD_SET
+from alasio.testing.filesystem import fs  # noqa: F401
 
 
-class TestEnvLibraryScanner:
-    def test_scanned_metadata(self):
+class TestStdList:
+    """The static table of standard library names shared with isort."""
+
+    def test_covers_python_38_to_315(self):
+        """Every version in the range contributes its names."""
+        # 3.8
+        assert 'typing' in STD_SET
+        assert 'asynchat' in STD_SET
+        assert 'distutils' in STD_SET
+        # 3.9
+        assert 'graphlib' in STD_SET
+        assert 'zoneinfo' in STD_SET
+        # 3.10
+        assert 'xxlimited_35' in STD_SET
+        # 3.11
+        assert 'tomllib' in STD_SET
+        # 3.12
+        assert '_pydatetime' in STD_SET
+        # 3.13
+        assert '_pyrepl' in STD_SET
+        # 3.14
+        assert 'annotationlib' in STD_SET
+        assert '_zstd' in STD_SET
+        # 3.15
+        assert 'profiling' in STD_SET
+
+    def test_private_extension_modules(self):
+        """The private C modules are standard library, isort's own table lacks them."""
+        for name in ('_io', '_json', '_ssl', '_socket', '_sqlite3', '_ctypes', '_lzma'):
+            assert name in STD_SET
+
+    def test_third_party_are_absent(self):
+        """Installed distributions and project modules are not in the table."""
+        for name in ('pytest', 'msgspec', 'starlette', 'isort', 'ruff', 'alasio'):
+            assert name not in STD_SET
+
+    def test_is_a_set(self):
+        """The table is a set, a module name is looked up without a scan."""
+        assert isinstance(STD_SET, set)
+
+
+class TestClassifySingleModule:
+    """Classification of one module name."""
+
+    def test_stdlib_by_name(self, fs):
+        """A stdlib module is classified by name, without touching the disk.
+
+        The fake filesystem serves nothing of the real interpreter, so a
+        classification that consulted find_spec or the stdlib paths would not
+        find `typing` here.
         """
-        Test that scanned_metadata is not empty and contains core modules
-        """
-        scanner = EnvLibraryScanner(PROJECT_ROOT)
-        meta = scanner._scanned_metadata
+        scanner = EnvLibraryScanner('/classify-stdlib-by-name')
+        assert scanner.classify_single_module('typing') is ModuleType.STANDARD_LIBRARY
 
-        # Verify it's not empty
-        assert len(meta) > 0
+    def test_private_stdlib_by_name(self, fs):
+        """A private C module of the table is standard library too."""
+        scanner = EnvLibraryScanner('/classify-private-stdlib')
+        assert scanner.classify_single_module('_io') is ModuleType.STANDARD_LIBRARY
 
-        # Verify core modules are identified as standard library
-        assert meta.get('os') == ModuleType.STANDARD_LIBRARY
-        assert meta.get('sys') == ModuleType.STANDARD_LIBRARY
-        assert meta.get('json') == ModuleType.STANDARD_LIBRARY
+    def test_third_party_by_path(self, fs):
+        """A module of site-packages is classified third-party."""
+        scanner = EnvLibraryScanner('/classify-third-party')
+        assert scanner.classify_single_module('msgspec') is ModuleType.THIRD_PARTY
 
-    def test_all_importable(self):
-        """
-        Test that all_importable contains common top-level modules
-        """
-        scanner = EnvLibraryScanner(PROJECT_ROOT)
-        all_modules = scanner.all_importable
+    def test_unknown(self, fs):
+        """A name that is no standard library module and is not installed is unknown."""
+        scanner = EnvLibraryScanner('/classify-unknown')
+        assert scanner.classify_single_module('no_such_module_zzz') is ModuleType.UNKNOWN
 
-        # Verify presence of core modules
-        assert 'os' in all_modules
-        assert 'sys' in all_modules
-        assert 'math' in all_modules
+    def test_cached_by_name(self, monkeypatch):
+        """A name is classified once, however many times it is asked for."""
+        scanner = EnvLibraryScanner('/classify-cached-by-name')
+        calls = []
 
-    def test_scan_low_level_c_lib(self):
-        """
-        Test that low-level C libraries are correctly scanned as standard library
-        """
-        scanner = EnvLibraryScanner(PROJECT_ROOT)
-        stdlib = scanner.standard_library
+        def fake_classify(name):
+            calls.append(name)
+            return ModuleType.THIRD_PARTY
 
-        # Specifically check _lzma as requested by user
-        # Note: _lzma is a C extension usually located in DLLs/ on Windows or built-in
-        assert '_lzma' in stdlib
+        monkeypatch.setattr(scanner, '_classify_single_module', fake_classify)
+        assert scanner.classify_single_module('mod_a') is ModuleType.THIRD_PARTY
+        assert scanner.classify_single_module('mod_a') is ModuleType.THIRD_PARTY
+        assert scanner.classify_single_module('mod_b') is ModuleType.THIRD_PARTY
+        assert scanner.classify_single_module('mod_b') is ModuleType.THIRD_PARTY
+        assert calls == ['mod_a', 'mod_b']
 
-        # Check other common low-level C modules
-        assert '_ssl' in stdlib
-        assert '_socket' in stdlib
-        assert '_json' in stdlib
-
-    def test_third_party(self):
-        """
-        Test that known third-party libraries are correctly classified
-        """
-        scanner = EnvLibraryScanner(PROJECT_ROOT)
-        third_party = scanner.third_party
-
-        # Verify project dependencies are classified as third-party
-        assert 'pytest' in third_party
-        assert 'rich' in third_party
-
-        # Only check optional dependencies if they are installed
-        for mod_name in ('msgspec', 'starlette'):
-            if importlib.util.find_spec(mod_name) is not None:
-                assert mod_name in third_party, \
-                    f"Installed dependency '{mod_name}' should be classified as third_party"
-
-    def test_no_overlap(self):
-        """
-        Test that standard_library and third_party sets have no intersection
-        """
-        scanner = EnvLibraryScanner(PROJECT_ROOT)
-        stdlib = scanner.standard_library
-        third_party = scanner.third_party
-
-        overlap = stdlib.intersection(third_party)
-        assert len(overlap) == 0, f"Overlap found between stdlib and third_party: {overlap}"
-
-    def test_local_project(self):
-        """
-        Test that the local project itself is correctly classified
-        """
-        scanner = EnvLibraryScanner(PROJECT_ROOT)
-        meta = scanner._scanned_metadata
-
-        # 'alasio' should be classified as LOCAL_PROJECT
-        # if it is found during scanning and is within the project root
-        if 'alasio' in meta:
-            assert meta['alasio'] == ModuleType.LOCAL_PROJECT
+    @pytest.mark.parametrize('name', sorted(STD_SET))
+    def test_every_listed_name_is_standard_library(self, name):
+        """No name of the table falls through to the path comparison."""
+        scanner = EnvLibraryScanner('/classify-every-listed-name')
+        assert scanner.classify_single_module(name) is ModuleType.STANDARD_LIBRARY

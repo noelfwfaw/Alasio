@@ -29,6 +29,7 @@
   "Dashboard": {
     "group": {
       "Oil": {"file": "dashboard/dashboard_model.py", "cls": "Oil", "task": "Dashboard"},
+      "Coin": {"file": "dashboard/dashboard_model.py", "cls": "Coin", "task": "Dashboard"},
       "Gems": {"file": "dashboard/dashboard_model.py", "cls": "Gems", "task": "Dashboard"},
       "Progress": {"file": "dashboard/dashboard_model.py", "cls": "Progress", "task": "Dashboard"},
       "Planner": {"file": "dashboard/dashboard_model.py", "cls": "Planner", "task": "Dashboard"}
@@ -38,12 +39,12 @@
   "GemsFarming": {
     "group": {
       "Scheduler": {"file": "alasio/alasio_model.py", "cls": "Scheduler", "task": "GemsFarming"},
-      "Campaign": {"file": "main/main_model.py", "cls": "GemsCampaign", "task": "GemsFarming"},
+      "Campaign": {"file": "gems/gems_model.py", "cls": "GemsCampaign", "task": "GemsFarming"},
       "GemsFarming": {"file": "gems/gems_model.py", "cls": "GemsFarming", "task": "GemsFarming"},
-      "StopCondition": {"file": "main/main_model.py", "cls": "GemsStopCondition", "task": "GemsFarming"},
+      "StopCondition": {"file": "gems/gems_model.py", "cls": "GemsStopCondition", "task": "GemsFarming"},
       "Fleet1": {"file": "main/main_model.py", "cls": "Fleet", "task": "GemsFarming"},
-      "Submarine": {"file": "main/main_model.py", "cls": "GemsSubmarine", "task": "GemsFarming"},
-      "Emotion1": {"file": "main/main_model.py", "cls": "GemsEmotionRecord", "task": "GemsFarming"},
+      "Submarine": {"file": "gems/gems_model.py", "cls": "GemsSubmarine", "task": "GemsFarming"},
+      "Emotion1": {"file": "gems/gems_model.py", "cls": "GemsEmotionRecord", "task": "GemsFarming"},
       "EquipmentCode": {"file": "gems/gems_model.py", "cls": "EquipmentCode", "task": "GemsFarming"}
     },
     "config": {"task": ["GemsFarming"], "group": []}
@@ -54,7 +55,8 @@
       "OneClickRetire": {"file": "general/general_model.py", "cls": "OneClickRetire", "task": "General"},
       "Enhance": {"file": "general/general_model.py", "cls": "Enhance", "task": "General"},
       "OldRetire": {"file": "general/general_model.py", "cls": "OldRetire", "task": "General"},
-      "DropRecord": {"file": "general/general_model.py", "cls": "DropRecord", "task": "General"}
+      "DropRecord": {"file": "general/general_model.py", "cls": "DropRecord", "task": "General"},
+      "ShopDemo": {"file": "general/general_model.py", "cls": "ShopDemo", "task": "General"}
     },
     "config": {"task": ["General"], "group": []}
   },
@@ -104,6 +106,41 @@
     },
     "config": {"task": ["OpsiAshAssist"], "group": []}
   },
+  "GeneralShop": {
+    "group": {
+      "Scheduler": {"file": "shop/shop_model.py", "cls": "SchedulerGeneralShop", "task": "GeneralShop"},
+      "GeneralShop": {"file": "shop/shop_model.py", "cls": "GeneralShop", "task": "GeneralShop"}
+    },
+    "config": {"task": ["GeneralShop"], "group": []}
+  },
+  "GuildShop": {
+    "group": {
+      "Scheduler": {"file": "alasio/alasio_model.py", "cls": "SchedulerU00", "task": "GuildShop"},
+      "GuildShop": {"file": "shop/shop_model.py", "cls": "GuildShop", "task": "GuildShop"}
+    },
+    "config": {"task": ["GuildShop"], "group": []}
+  },
+  "MedalShop": {
+    "group": {
+      "Scheduler": {"file": "alasio/alasio_model.py", "cls": "SchedulerU00", "task": "MedalShop"},
+      "MedalShop": {"file": "shop/shop_model.py", "cls": "MedalShop", "task": "MedalShop"}
+    },
+    "config": {"task": ["MedalShop"], "group": []}
+  },
+  "MeritShop": {
+    "group": {
+      "Scheduler": {"file": "alasio/alasio_model.py", "cls": "SchedulerU00", "task": "MeritShop"},
+      "MeritShop": {"file": "shop/shop_model.py", "cls": "MeritShop", "task": "MeritShop"}
+    },
+    "config": {"task": ["MeritShop"], "group": []}
+  },
+  "CoreShop": {
+    "group": {
+      "Scheduler": {"file": "alasio/alasio_model.py", "cls": "SchedulerU00", "task": "CoreShop"},
+      "CoreShop": {"file": "shop/shop_model.py", "cls": "CoreShop", "task": "CoreShop"}
+    },
+    "config": {"task": ["CoreShop"], "group": []}
+  },
   "_global_bind": {
     "group": {
       "Emulator": {"file": "alasio/device_model.py", "cls": "Emulator", "task": "Device"},
@@ -116,7 +153,9 @@
       "Enhance": {"file": "general/general_model.py", "cls": "Enhance", "task": "General"},
       "OldRetire": {"file": "general/general_model.py", "cls": "OldRetire", "task": "General"},
       "DropRecord": {"file": "general/general_model.py", "cls": "DropRecord", "task": "General"},
+      "ShopDemo": {"file": "general/general_model.py", "cls": "ShopDemo", "task": "General"},
       "Oil": {"file": "dashboard/dashboard_model.py", "cls": "Oil", "task": "Dashboard"},
+      "Coin": {"file": "dashboard/dashboard_model.py", "cls": "Coin", "task": "Dashboard"},
       "Gems": {"file": "dashboard/dashboard_model.py", "cls": "Gems", "task": "Dashboard"},
       "Progress": {"file": "dashboard/dashboard_model.py", "cls": "Progress", "task": "Dashboard"},
       "Planner": {"file": "dashboard/dashboard_model.py", "cls": "Planner", "task": "Dashboard"}

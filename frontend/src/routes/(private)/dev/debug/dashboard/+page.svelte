@@ -270,9 +270,10 @@
     [1, 2, 3].flatMap((copy) => Object.entries(baseItems).map(([name, data]) => [`${name}-${copy}`, data])),
   );
 
-  // The three value forms, one item each: a plain amount, an amount over its
-  // limit (`Total`), and an amount over a dynamic total. Names and times are
-  // long enough to squeeze the info line as well.
+  // The four value forms, one item each: a plain amount, an amount over its
+  // limit (`Total`), an amount over a dynamic total, and an amount over a soft
+  // total that it may pass. Names and times are long enough to squeeze the
+  // info line as well.
   const valueFormItems: Record<string, Record<string, ArgData>> = {
     Amount: {
       _info: {
@@ -362,6 +363,43 @@
         value: new Date(Date.now() - 30 * 60 * 1000).toISOString(),
       },
     },
+    SoftTotal: {
+      _info: {
+        group: "SoftTotal",
+        arg: "_info",
+        task: "Dashboard",
+        dt: "dashboard-total",
+        dashboard: "SoftTotal",
+        dashboard_color: "#4caf50",
+        name: "Weekly Points",
+        value: "",
+      },
+      Value: {
+        task: "Dashboard",
+        group: "SoftTotal",
+        arg: "Value",
+        dt: "input-int",
+        value: 12345,
+        ge: 0,
+        le: 25000,
+      },
+      Total: {
+        task: "Dashboard",
+        group: "SoftTotal",
+        arg: "Total",
+        dt: "static",
+        value: 23145,
+        ge: 0,
+        le: 25000,
+      },
+      Time: {
+        task: "Dashboard",
+        group: "SoftTotal",
+        arg: "Time",
+        dt: "datetime",
+        value: new Date(Date.now() - 30 * 60 * 1000).toISOString(),
+      },
+    },
   };
 
   // Card widths from the full container down to w-40, one card per step
@@ -433,6 +471,9 @@
       if (args.Value) args.Value.value = Math.round(Math.random() * (args.Value.le ?? 25000));
     } else if (dashboard === "DynamicTotal") {
       if (args.Value) args.Value.value = Math.round(Math.random() * (args.Total?.value ?? 40000));
+    } else if (dashboard === "SoftTotal") {
+      // The value may pass the soft total, the hard total of the value is the limit
+      if (args.Value) args.Value.value = Math.round(Math.random() * (args.Value.le ?? 25000));
     } else if (args.Value) {
       args.Value.value = Math.round(Math.random() * 999999);
     }
@@ -463,97 +504,97 @@
   <section class="space-y-4">
     <div class="space-y-1">
       <h2 class="text-xl font-semibold">Dashboard Overview</h2>
-      <p class="text-muted-foreground text-sm">
+      <p class="text-sm text-muted-foreground">
         Testing the Dashboard component with mock data. All items are displayed, wrapped into rows of at least two
         columns.
       </p>
     </div>
 
-    <DashboardCard items={baseItems} class="bg-card h-64 rounded-lg" />
+    <DashboardCard items={baseItems} class="h-64 rounded-lg bg-card" />
   </section>
 
   <section class="space-y-4">
     <div class="space-y-1">
       <h2 class="text-xl font-semibold">Flash on Value Change</h2>
-      <p class="text-muted-foreground text-sm">
+      <p class="text-sm text-muted-foreground">
         An item highlights for one second when one of its values changes: the background turns
-        <code class="bg-muted rounded px-1">primary</code>, the text
-        <code class="bg-muted rounded px-1">primary-foreground</code>, the dot
-        <code class="bg-muted rounded px-1">background</code>, and the colors transition. An update that arrives while
+        <code class="rounded bg-muted px-1">primary</code>, the text
+        <code class="rounded bg-muted px-1">primary-foreground</code>, the dot
+        <code class="rounded bg-muted px-1">background</code>, and the colors transition. An update that arrives while
         the item still flashes restarts that second, so the highlight follows the last update.
       </p>
     </div>
 
     <div class="space-y-2">
       <h3 class="text-lg font-semibold">Pinned Flash State (overrideFlash)</h3>
-      <p class="text-muted-foreground text-sm">
-        <code class="bg-muted rounded px-1">overrideFlash</code> pins the flash state instead of reacting to the values: every
+      <p class="text-sm text-muted-foreground">
+        <code class="rounded bg-muted px-1">overrideFlash</code> pins the flash state instead of reacting to the values: every
         item of this group is pinned lit, so the whole card can be inspected in the flash colors (the background, the text,
         the dot, the inset of the highlight) without waiting for an update. The values of this group never change.
       </p>
-      <DashboardCard items={baseItems} overrideFlash={true} class="bg-card h-64 rounded-lg" />
+      <DashboardCard items={baseItems} overrideFlash={true} class="h-64 rounded-lg bg-card" />
     </div>
 
     <div class="space-y-2">
       <h3 class="text-lg font-semibold">Random Values</h3>
-      <p class="text-muted-foreground text-sm">
+      <p class="text-sm text-muted-foreground">
         Values are rewritten every 800 ms: the fast item on every tick, each other item on a random fifth of them
         (roughly every 4 s), so only a few items flash at a time. An item written again while it still flashes stays lit
         (its second is restarted) instead of blinking off in between, which is what the fast item shows: it never ends.
       </p>
-      <DashboardCard items={liveItems} class="bg-card h-64 rounded-lg" />
+      <DashboardCard items={liveItems} class="h-64 rounded-lg bg-card" />
     </div>
   </section>
 
   <section class="space-y-4">
     <div class="space-y-1">
       <h2 class="text-xl font-semibold">Many Items</h2>
-      <p class="text-muted-foreground text-sm">
+      <p class="text-sm text-muted-foreground">
         More items than fit into the height of the card: the flow scrolls, as many items per row as their preferred
         width allows.
       </p>
     </div>
 
-    <DashboardCard items={mockItemsMany} class="bg-card h-64 rounded-lg" />
+    <DashboardCard items={mockItemsMany} class="h-64 rounded-lg bg-card" />
   </section>
 
   <section class="space-y-4">
     <div class="space-y-1">
       <h2 class="text-xl font-semibold">Narrow Container</h2>
-      <p class="text-muted-foreground text-sm">
+      <p class="text-sm text-muted-foreground">
         A container too narrow for the preferred item width: items are compressed to keep two columns per row, and the
-        info line degrades in one direction only: <code class="bg-muted rounded px-1">Oil - 3h ago</code> &rarr;
-        <code class="bg-muted rounded px-1">Oil - 3...</code> &rarr; <code class="bg-muted rounded px-1">Oil</code>
-        &rarr; <code class="bg-muted rounded px-1">O..</code> (the name yields last; the whole tail, separator included, is
+        info line degrades in one direction only: <code class="rounded bg-muted px-1">Oil - 3h ago</code> &rarr;
+        <code class="rounded bg-muted px-1">Oil - 3...</code> &rarr; <code class="rounded bg-muted px-1">Oil</code>
+        &rarr; <code class="rounded bg-muted px-1">O..</code> (the name yields last; the whole tail, separator included, is
         dropped once it cannot show a character of the time).
       </p>
     </div>
 
-    <DashboardCard items={baseItems} class="bg-card h-64 w-56 rounded-lg" />
+    <DashboardCard items={baseItems} class="h-64 w-56 rounded-lg bg-card" />
 
-    <DashboardCard items={baseItems} class="bg-card h-64 w-40 rounded-lg" />
+    <DashboardCard items={baseItems} class="h-64 w-40 rounded-lg bg-card" />
   </section>
 
   <section class="space-y-4">
     <div class="space-y-1">
       <h2 class="text-xl font-semibold">Value Forms by Width</h2>
-      <p class="text-muted-foreground text-sm">
-        The three value forms only (Amount, Total, DynamicTotal), from the full container width down to
-        <code class="bg-muted rounded px-1">w-40</code>. Both lines degrade in one direction only as the card gets
-        narrower. The value line reads <code class="bg-muted rounded px-1">1234 / 25000</code> &rarr;
-        <code class="bg-muted rounded px-1">1234 / 2...</code> &rarr; <code class="bg-muted rounded px-1">1234</code>
-        &rarr; <code class="bg-muted rounded px-1">12...</code>, the info line
-        <code class="bg-muted rounded px-1">Oil - 3h ago</code> &rarr;
-        <code class="bg-muted rounded px-1">Oil - 3...</code> &rarr; <code class="bg-muted rounded px-1">Oil</code>
-        &rarr; <code class="bg-muted rounded px-1">O..</code>. Neither line ever shows a cut primary text next to a cut
+      <p class="text-sm text-muted-foreground">
+        The four value forms only (Amount, Total, DynamicTotal, SoftTotal), from the full container width down to
+        <code class="rounded bg-muted px-1">w-40</code>. Both lines degrade in one direction only as the card gets
+        narrower. The value line reads <code class="rounded bg-muted px-1">1234 / 25000</code> &rarr;
+        <code class="rounded bg-muted px-1">1234 / 2...</code> &rarr; <code class="rounded bg-muted px-1">1234</code>
+        &rarr; <code class="rounded bg-muted px-1">12...</code>, the info line
+        <code class="rounded bg-muted px-1">Oil - 3h ago</code> &rarr;
+        <code class="rounded bg-muted px-1">Oil - 3...</code> &rarr; <code class="rounded bg-muted px-1">Oil</code>
+        &rarr; <code class="rounded bg-muted px-1">O..</code>. Neither line ever shows a cut primary text next to a cut
         tail, and a tail never outlives its content as a bare separator.
       </p>
     </div>
 
     {#each widthLadder as widthClass (widthClass)}
       <div class="space-y-1">
-        <p class="text-muted-foreground font-mono text-xs">{widthClass}</p>
-        <DashboardCard items={valueFormItems} class="bg-card h-40 rounded-lg {widthClass}" />
+        <p class="font-mono text-xs text-muted-foreground">{widthClass}</p>
+        <DashboardCard items={valueFormItems} class="h-40 rounded-lg bg-card {widthClass}" />
       </div>
     {/each}
   </section>

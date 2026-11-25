@@ -3,19 +3,22 @@ Tests for alasio/testing/filesystem/fake_fs.py.
 
 The FakeFilesystem class and the mocked os / builtins functions.
 """
+import _io
 import builtins
 import errno
 import io
 import os
 import stat as statmod
+import subprocess
+import sys
 
-import _io
 import pytest
 
 from alasio.ext.path import PathStr
 from alasio.ext.path.atomic import file_read_bytes
 from alasio.testing.filesystem import FakeDir, FakeFile, FakeFilesystem, fs  # noqa: F401
 from alasio.testing.filesystem.base import IS_WINDOWS as FS_IS_WINDOWS
+from alasio.testing.filesystem.fake_fs import FD_BASE
 from tests.testing.filesystem.conftest import join
 
 FILE = os.path.abspath(__file__)
@@ -176,17 +179,15 @@ class TestOpenModes:
         """A parent path that is a file should raise like the real os."""
         fs.create_file(join(fs, 'a.txt'))
         # Windows reports a path through a file as a missing path
-        expected = FileNotFoundError if FS_IS_WINDOWS else NotADirectoryError
-        with pytest.raises(expected):
+        with pytest.raises(NotADirectoryError):
             open(join(fs, 'a.txt', 'b.txt'), 'w')
-        with pytest.raises(expected):
+        with pytest.raises(NotADirectoryError):
             open(join(fs, 'a.txt', 'b.txt'), 'x')
 
     def test_write_file_in_middle(self, fs):
         """A file in the middle of the path should raise like the real os."""
         fs.create_file(join(fs, 'a.txt'))
-        expected = FileNotFoundError if FS_IS_WINDOWS else NotADirectoryError
-        with pytest.raises(expected):
+        with pytest.raises(NotADirectoryError):
             open(join(fs, 'a.txt', 'missing', 'b.txt'), 'w')
 
     def test_write_truncates(self, fs):
@@ -384,8 +385,7 @@ class TestSymlink:
     def test_symlink_parent_is_file(self, fs):
         """os.symlink() through a file should raise like the real os."""
         fs.create_file(join(fs, 'a.txt'))
-        expected = FileNotFoundError if FS_IS_WINDOWS else NotADirectoryError
-        with pytest.raises(expected):
+        with pytest.raises(NotADirectoryError):
             os.symlink(join(fs, 'a.txt'), join(fs, 'a.txt', 'link'))
 
     def test_readlink_not_link(self, fs):
@@ -471,6 +471,20 @@ class TestSymlink:
         fs.create_file(join(fs, 'a.txt'), contents='data')
         os.symlink('a.txt', join(fs, 'link'))
         assert os.path.realpath(join(fs, 'link')) == join(fs, 'a.txt')
+
+    def test_realpath_relative_dotdot_target(self, fs):
+        """A relative target may climb out of the directory of the link."""
+        fs.create_dir(join(fs, 'dir'))
+        fs.create_file(join(fs, 'a.txt'), contents='data')
+        os.symlink('../a.txt', join(fs, 'dir', 'link'))
+        assert os.path.realpath(join(fs, 'dir', 'link')) == join(fs, 'a.txt')
+
+    @pytest.mark.skipif(not FS_IS_WINDOWS, reason='backslash is a separator on Windows only')
+    def test_realpath_windows_target(self, fs):
+        """The backslashes of a target written on Windows are separators."""
+        fs.create_file(join(fs, 'sub', 'a.txt'), contents='data')
+        os.symlink('sub\\a.txt', join(fs, 'link'))
+        assert os.path.realpath(join(fs, 'link')) == join(fs, 'sub', 'a.txt')
 
     def test_realpath_dotdot(self, fs):
         """'..' should collapse on the resolved prefix, after the link."""
@@ -594,8 +608,7 @@ class TestOsDir:
     def test_makedirs_parent_is_file(self, fs):
         """os.makedirs() through a file should raise like the real os."""
         fs.create_file(join(fs, 'a.txt'))
-        expected = FileNotFoundError if FS_IS_WINDOWS else NotADirectoryError
-        with pytest.raises(expected):
+        with pytest.raises(NotADirectoryError):
             os.makedirs(join(fs, 'a.txt', 'b', 'c'))
 
     def test_mkdir(self, fs):
@@ -612,8 +625,7 @@ class TestOsDir:
     def test_mkdir_parent_is_file(self, fs):
         """os.mkdir() through a file should raise like the real os."""
         fs.create_file(join(fs, 'a.txt'))
-        expected = FileNotFoundError if FS_IS_WINDOWS else NotADirectoryError
-        with pytest.raises(expected):
+        with pytest.raises(NotADirectoryError):
             os.mkdir(join(fs, 'a.txt', 'b'))
 
     def test_mkdir_exists(self, fs):
@@ -755,6 +767,77 @@ class TestOsDir:
             os.scandir(join(fs, 'a.txt'))
 
 
+class TestRootScan:
+    """Scanning the root, the root is its own prefix match but not its own child.
+
+    A POSIX root is created explicitly with FakeFilesystem(cwd='/'), so the
+    cases below run on every platform. On Windows a default root is a drive
+    ("D:"), the root self reference only exists for "/".
+    """
+
+    def test_listdir_root(self):
+        """os.listdir() of the root should not yield an empty name."""
+        fs = FakeFilesystem(cwd='/')
+        fs.create_file('/a.txt')
+        fs.create_dir('/dir')
+        assert fs.listdir('/') == ['a.txt', 'dir']
+
+    def test_scandir_root(self):
+        """os.scandir() of the root should not yield the root itself."""
+        fs = FakeFilesystem(cwd='/')
+        fs.create_file('/a.txt')
+        fs.create_dir('/dir')
+        entries = list(fs.scandir('/'))
+        assert sorted(entry.name for entry in entries) == ['a.txt', 'dir']
+        assert sorted(entry.path for entry in entries) == ['/a.txt', '/dir']
+
+    def test_walk_root(self):
+        """os.walk() of the root should walk the tree once and terminate."""
+        with FakeFilesystem(cwd='/') as fs:
+            fs.create_file('/proj/a.txt')
+            fs.create_file('/proj/sub/b.txt')
+            walked = [
+                (root.replace('\\', '/'), dirs, files)
+                for root, dirs, files in os.walk('/')
+            ]
+        assert walked == [
+            ('/', ['proj'], []),
+            ('/proj', ['sub'], ['a.txt']),
+            ('/proj/sub', [], ['b.txt']),
+        ]
+
+    def test_default_cwd_is_the_root(self):
+        """A fresh filesystem holds the root only, not the working directory."""
+        fs = FakeFilesystem()
+        assert fs.getcwd() == fs.root_dir.path
+        assert fs.listdir(fs.root_dir.path) == []
+
+    def test_chdir_under_root(self):
+        """A cwd below the root works, an absolute path keeps the root."""
+        with FakeFilesystem(cwd='/') as fs:
+            fs.makedirs('/cwd')
+            os.chdir('/cwd')
+            fs.create_file('a.txt', contents='x')
+            assert os.path.exists('/cwd/a.txt')
+            assert os.path.exists('..')
+
+    def test_remove_root(self):
+        """remove() of the root should raise EBUSY, the root is never removed."""
+        fs = FakeFilesystem(cwd='/')
+        with pytest.raises(OSError) as exc_info:
+            fs.remove('/')
+        assert exc_info.value.errno == errno.EBUSY
+        assert fs.isdir('/')
+
+    def test_rmdir_root(self):
+        """os.rmdir() of an empty root should raise EBUSY, not ENOTEMPTY."""
+        with FakeFilesystem(cwd='/') as fs:
+            with pytest.raises(OSError) as exc_info:
+                os.rmdir('/')
+        assert exc_info.value.errno == errno.EBUSY
+        assert fs.isdir('/')
+
+
 class TestOsFd:
     """The mocked low level fd functions os.open / write / close."""
 
@@ -779,8 +862,7 @@ class TestOsFd:
     def test_os_open_create_parent_is_file(self, fs):
         """os.open() with O_CREAT through a file should raise like the real os."""
         fs.create_file(join(fs, 'a.bin'))
-        expected = FileNotFoundError if FS_IS_WINDOWS else NotADirectoryError
-        with pytest.raises(expected):
+        with pytest.raises(NotADirectoryError):
             os.open(join(fs, 'a.bin', 'b.bin'), os.O_CREAT | os.O_WRONLY)
 
     def test_os_open_excl(self, fs):
@@ -821,6 +903,50 @@ class TestOsFd:
         with pytest.raises(OSError):
             os.write(fd, b'x')
 
+    def test_os_close_of_a_process_fd(self, fs):
+        """A descriptor the fake filesystem did not hand out is closed for real."""
+        read_fd, write_fd = os.pipe()
+        os.close(read_fd)
+        os.close(write_fd)
+        # os.get_inheritable is not mocked, it asks the real descriptor table
+        with pytest.raises(OSError):
+            os.get_inheritable(write_fd)
+
+    def test_os_write_of_a_process_fd(self, fs):
+        """A descriptor the fake filesystem did not hand out is written for real."""
+        read_fd, write_fd = os.pipe()
+        try:
+            assert os.write(write_fd, b'data') == 4
+            # os.read is not mocked, it reads the real pipe
+            assert os.read(read_fd, 4) == b'data'
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)
+
+    def test_os_write_of_an_unhandled_fake_fd(self, fs):
+        """A number the filesystem never handed out is treated as a closed fake fd."""
+        with pytest.raises(OSError) as exc_info:
+            os.write(FD_BASE, b'x')
+        assert exc_info.value.errno == errno.EBADF
+
+    def test_open_of_a_process_fd(self, fs):
+        """A descriptor of the process is wrapped by the real open()."""
+        read_fd, write_fd = os.pipe()
+        try:
+            with open(write_fd, 'wb', closefd=False) as f:
+                f.write(b'data')
+            with open(read_fd, 'rb', closefd=False) as f:
+                assert f.read(4) == b'data'
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)
+
+    def test_open_of_an_unhandled_fake_fd(self, fs):
+        """A number the filesystem never handed out can not be wrapped."""
+        with pytest.raises(OSError) as exc_info:
+            open(FD_BASE, 'rb')
+        assert exc_info.value.errno == errno.EBADF
+
     def test_os_fsync(self, fs):
         """os.fsync() should be a no-op for a valid fd."""
         fd = os.open(join(fs, 'a.bin'), os.O_CREAT | os.O_WRONLY)
@@ -828,6 +954,32 @@ class TestOsFd:
         os.close(fd)
         with pytest.raises(OSError):
             os.fsync(fd)
+
+    def test_os_fsync_of_a_process_fd(self, fs):
+        """A descriptor of the process is synced for real, not as a fake fd."""
+        read_fd, write_fd = os.pipe()
+        try:
+            if FS_IS_WINDOWS:
+                # fsync of a pipe is a successful no-op on windows
+                os.fsync(write_fd)
+            else:
+                # the descriptor belongs to the process, so the fake filesystem
+                # passes it to the real os.fsync() and the error is the one the
+                # platform reports for a pipe: EINVAL on linux, ENOTSUP on macos.
+                # EBADF here would mean the fake filesystem claimed a descriptor
+                # it never handed out.
+                with pytest.raises(OSError) as exc_info:
+                    os.fsync(write_fd)
+                assert exc_info.value.errno in (errno.EINVAL, errno.ENOTSUP)
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)
+
+    def test_os_fsync_of_an_unhandled_fake_fd(self, fs):
+        """A number the filesystem never handed out is treated as a closed fake fd."""
+        with pytest.raises(OSError) as exc_info:
+            os.fsync(FD_BASE)
+        assert exc_info.value.errno == errno.EBADF
 
     def test_os_fstat(self, fs):
         """os.fstat() should return the stat of the open file."""
@@ -839,6 +991,50 @@ class TestOsFd:
         os.close(fd)
         with pytest.raises(OSError):
             os.fstat(fd)
+
+    def test_os_fstat_of_a_process_fd(self, fs):
+        """
+        A descriptor of the process is stated for real.
+
+        pytest's capture stats its own temp file with os.fstat() between two
+        tests, a fake EBADF there breaks every test that follows.
+        """
+        read_fd, write_fd = os.pipe()
+        try:
+            write_stat = os.fstat(write_fd)
+            read_stat = os.fstat(read_fd)
+            # windows reports every pipe with the same padding record, the
+            # type bit of a POSIX pipe is the one the real os reports
+            if FS_IS_WINDOWS:
+                assert write_stat == read_stat
+            else:
+                assert statmod.S_ISFIFO(write_stat.st_mode)
+                assert statmod.S_ISFIFO(read_stat.st_mode)
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)
+
+    def test_os_fstat_of_an_unhandled_fake_fd(self, fs):
+        """A number the filesystem never handed out is treated as a closed fake fd."""
+        with pytest.raises(OSError) as exc_info:
+            os.fstat(FD_BASE)
+        assert exc_info.value.errno == errno.EBADF
+
+
+class TestSubprocess:
+    """A real subprocess keeps working while the fake filesystem is active."""
+
+    def test_subprocess_with_input(self, fs):
+        """The pipes of subprocess.Popen() go through the real open() and os.write()."""
+        result = subprocess.run(
+            [sys.executable, '-c', 'import sys; sys.stdout.write(sys.stdin.read())'],
+            input=b'hello',
+            capture_output=True,
+            timeout=30,
+        )
+        assert result.returncode == 0
+        assert result.stdout == b'hello'
+        assert result.stderr == b''
 
 
 class TestOsMisc:

@@ -1,12 +1,98 @@
+import io
 import multiprocessing
 import os
+import signal
+import subprocess
 import sys
 import threading
 import time
 
 import pytest
 
+from alasio.backend import supervisor as supervisor_module
 from alasio.backend.supervisor import ParentProcessExited, Supervisor, mprint
+from alasio.ext import env
+
+pytestmark = [
+    pytest.mark.parallel,
+]
+
+# A supervisor thread that takes a signal while the print lock is held by the
+# same thread: the shape of a CTRL+C that arrives while the line the caller
+# reacted to is being printed. It prints HANDLED when the handler got through,
+# and hangs silently if the handler needed the lock (a plain Lock cannot be
+# re-entered, so a handler that prints would block on it forever).
+HOLDING_THE_PRINT_LOCK = """
+import signal
+from alasio.backend.mpipe.token_supervisor import PRINT_LOCK
+from alasio.backend.supervisor import Supervisor
+
+supervisor = Supervisor()
+
+with PRINT_LOCK:
+    try:
+        supervisor.handle_sigint(signal.SIGINT, None)
+    except KeyboardInterrupt:
+        # inside the lock on purpose: the handler must not need it released
+        print('HANDLED', flush=True)
+"""
+
+
+@pytest.fixture(autouse=True)
+def no_electron_host(monkeypatch):
+    """
+    Keep the electron switch out of the test process.
+
+    A supervisor reads ALASIO_APP_ELECTRON_PID at construction: a value
+    inherited from the environment of the test runner would put every
+    supervisor of this worker into electron mode (token announcements on
+    stdout), which the tests do not expect. TestElectronMode sets its own
+    value after this fixture ran.
+    """
+    monkeypatch.delenv('ALASIO_APP_ELECTRON_PID', raising=False)
+
+
+def child_env():
+    """
+    Environment of a child interpreter that imports the checkout
+
+    Returns:
+        dict: Environment with the project root on PYTHONPATH
+    """
+    process_env = os.environ.copy()
+    root = str(env.ALASIO_ROOT)
+    existing = process_env.get('PYTHONPATH')
+    process_env['PYTHONPATH'] = root + (os.pathsep + existing if existing else '')
+    return process_env
+
+
+class _StopRun(BaseException):
+    """Ends Supervisor.run() from a stubbed mprint, past the broad except."""
+
+
+class RunSupervisor(Supervisor):
+    """A supervisor run() is allowed to start, with a real backend entry."""
+
+    @staticmethod
+    def backend_entry(args):
+        pass
+
+
+@pytest.fixture
+def restore_signal_handlers():
+    """
+    Put the signal handlers of the test process back after the test
+
+    Supervisor.run() installs its own handlers on the process, which would
+    otherwise outlive the test and change how the runner answers CTRL+C.
+    """
+    signals = [signal.SIGINT, signal.SIGTERM]
+    if sys.platform == 'win32':
+        signals.append(signal.SIGBREAK)
+    original = {sig: signal.getsignal(sig) for sig in signals}
+    yield
+    for sig, handler in original.items():
+        signal.signal(sig, handler)
 
 
 def wait_stdin_listener(supervisor, timeout=2.0):
@@ -996,6 +1082,260 @@ class TestHandleStdinLine:
         assert supervisor.stop_requested is False
 
 
+class TestHandleSigint:
+    """
+    Tests for Supervisor.handle_sigint.
+
+    The handler is installed by run() before the first backend is spawned, so a
+    CTRL+C that arrives once the supervisor prints anything about that backend
+    reaches it. What it must never do is write: it runs in the thread that took
+    the signal, usually inside the stdout write() that signal interrupted, so a
+    log line here re-enters the same thread's buffer and replaces the
+    KeyboardInterrupt with a RuntimeError. run() prints the shutdown lines
+    instead.
+    """
+
+    def test_first_signal_asks_for_a_graceful_shutdown(self):
+        """The first CTRL+C raises into the main loop."""
+        supervisor = Supervisor()
+
+        with pytest.raises(KeyboardInterrupt):
+            supervisor.handle_sigint(signal.SIGINT, None)
+
+        assert supervisor.sigint_count == 1
+        assert supervisor._signal_name() == 'SIGINT'
+
+    def test_the_handler_writes_nothing(self, monkeypatch):
+        """
+        No CTRL+C press may be logged from the handler.
+
+        On POSIX the handler is called from PyErr_CheckSignals() while the
+        interrupted thread still holds the buffered stdout lock, so a print
+        here raises "reentrant call inside <_io.BufferedWriter>" and replaces
+        the KeyboardInterrupt: the supervisor then reports an unexpected error
+        and skips graceful_shutdown. That is the failure that made
+        py3.8 / ubuntu-22.04 time out in test_supervisor.
+        """
+        from alasio.logger.writer import CaptureStream
+
+        capture = CaptureStream()
+        monkeypatch.setattr(sys, 'stdout', capture)
+        supervisor = Supervisor()
+
+        for _ in range(3):
+            try:
+                supervisor.handle_sigint(signal.SIGTERM, None)
+            except KeyboardInterrupt:
+                pass
+
+        assert supervisor.sigint_count == 3
+        assert capture.logs == []
+        assert supervisor._signal_name() == 'SIGTERM'
+
+    def test_the_signal_is_handled_while_the_thread_holds_the_print_lock(self):
+        """
+        A signal that lands while the thread is inside mprint() is handled.
+
+        The handler runs in the thread that took the signal. If that thread is
+        already inside mprint() -- printing the very line the test reacted to
+        -- a handler that logs would need the print lock that same thread
+        holds: with a plain Lock it blocks on itself, KeyboardInterrupt is
+        never raised and the supervisor hangs with no further output instead of
+        shutting down. The handler therefore takes no lock at all.
+
+        A fresh interpreter runs the case: the hazard is a deadlock that holds
+        the shared print lock forever, and a hung thread in the test process
+        would block the report of every later test instead of failing one.
+        """
+        proc = subprocess.run(
+            [sys.executable, '-c', HOLDING_THE_PRINT_LOCK],
+            cwd=str(env.ALASIO_ROOT),
+            env=child_env(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=20,
+        )
+
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.strip().splitlines()[-1] == 'HANDLED'
+
+    def test_the_second_signal_asks_for_a_force_kill(self):
+        """The second CTRL+C raises again, so the shutdown path force kills."""
+        supervisor = Supervisor()
+
+        with pytest.raises(KeyboardInterrupt):
+            supervisor.handle_sigint(signal.SIGINT, None)
+        with pytest.raises(KeyboardInterrupt):
+            supervisor.handle_sigint(signal.SIGINT, None)
+
+        assert supervisor.sigint_count == 2
+
+    def test_a_further_signal_is_ignored(self):
+        """A third CTRL+C must not raise: the shutdown is already running."""
+        supervisor = Supervisor()
+        supervisor.sigint_count = 2
+
+        supervisor.handle_sigint(signal.SIGINT, None)
+
+        assert supervisor.sigint_count == 3
+
+
+class TestRunSignalHandlers:
+    """
+    The order run() prints its first line and installs its signal handlers.
+
+    "Running on PID:" is the line the host (and a user watching the console)
+    reacts to. Whoever reacts to it may send CTRL+C immediately, so the handler
+    has to be installed before it is printed, and the line has to be printed
+    where the handler's exception is caught.
+    """
+
+    def test_the_pid_line_is_printed_with_the_handlers_installed(self, monkeypatch, restore_signal_handlers):
+        """A signal right after the line finds the supervisor's own handler."""
+        supervisor = RunSupervisor()
+        observed = {}
+
+        def fake_mprint(*args, start=''):
+            text = ' '.join(str(arg) for arg in args)
+            if text.startswith('Running on PID:'):
+                observed['sigint'] = signal.getsignal(signal.SIGINT)
+                observed['sigterm'] = signal.getsignal(signal.SIGTERM)
+                raise _StopRun
+
+        monkeypatch.setattr(supervisor_module, 'mprint', fake_mprint)
+
+        with pytest.raises(_StopRun):
+            supervisor.run([])
+
+        assert observed['sigint'].__func__ is Supervisor.handle_sigint
+        assert observed['sigint'].__self__ is supervisor
+        assert observed['sigterm'].__func__ is Supervisor.handle_sigint
+
+    def test_a_signal_right_after_the_pid_line_shuts_down_gracefully(
+        self, monkeypatch, restore_signal_handlers
+    ):
+        """
+        The line is printed inside the try, so CTRL+C right after it takes the
+        graceful shutdown path instead of escaping run() as a bare
+        KeyboardInterrupt (a traceback and a non-zero exit, no shutdown)
+        """
+        supervisor = RunSupervisor()
+        lines = []
+
+        def fake_mprint(*args, start=''):
+            text = f'{start}' + ' '.join(str(arg) for arg in args)
+            lines.append(text)
+            if text.startswith('Running on PID:'):
+                # what the installed handler does when the signal arrives here
+                supervisor.handle_sigint(signal.SIGINT, None)
+
+        monkeypatch.setattr(supervisor_module, 'mprint', fake_mprint)
+
+        supervisor.run([])
+
+        assert supervisor.sigint_count == 1
+        # The shutdown is reported by run(), not by the handler: the interrupt
+        # arrives inside a stdout write() on POSIX, where a print would replace
+        # it with a reentrant-write error
+        assert any('Received SIGINT, initiating graceful shutdown' in line for line in lines)
+        assert lines[-1].endswith('Supervisor loop ended')
+
+
+class _BufferedWriteHook(io.RawIOBase):
+    """
+    A raw stream that runs a callable from inside one of its writes.
+
+    That is where a POSIX signal handler lands when the signal interrupts a
+    buffered stdout write: CPython calls the handler from PyErr_CheckSignals()
+    while the BufferedWriter that is flushing still holds its lock in the same
+    thread. Entering the state through the raw stream keeps it on the calling
+    thread, so the case needs no signal that has to interrupt a syscall.
+    """
+
+    def __init__(self):
+        super().__init__()
+        # Callable that runs inside the next write, once
+        self.hook = None
+        # Bytes handed to the stream, to tell whether the handler flushed any
+        self.written = 0
+
+    def writable(self):
+        return True
+
+    def write(self, data):
+        self.written += len(data)
+        if self.hook is not None:
+            hook, self.hook = self.hook, None
+            hook()
+        return len(data)
+
+
+class TestSignalDuringStdoutWrite:
+    """
+    The signal context that broke the shutdown on py3.8 / ubuntu-22.04.
+
+    A supervisor blocked in a buffered stdout write takes the signal inside
+    that write: CPython calls the handler from PyErr_CheckSignals() while the
+    thread still holds the buffer lock, so a handler that writes there
+    re-enters the buffer and raises "reentrant call inside
+    <_io.BufferedWriter>" in place of the KeyboardInterrupt it meant to raise.
+    A signal inside a blocked write only exists on POSIX, and whether the write
+    is interrupted at all is up to the runner, so the state is entered here on
+    the calling thread instead: the raw stream of this stdout runs the handler
+    while the buffer is being flushed.
+    """
+
+    def test_a_handler_inside_a_buffered_write_still_raises(self, monkeypatch):
+        """
+        The interrupt survives the write it lands in.
+
+        An empty write to the same buffer raises only for the thread that owns
+        its lock, so reaching that error from the handler proves the state is
+        the one a signal inside a buffered write creates. The handler must then
+        raise KeyboardInterrupt without writing anything: a write of its own
+        would re-enter the buffer the interrupted thread holds, and the
+        shutdown would be lost to that error.
+        """
+
+        class CountingStdout(io.TextIOWrapper):
+            """A stdout that counts its writes, a short one never raises by itself"""
+
+            def __init__(self, buffer):
+                super().__init__(buffer, encoding='utf-8')
+                self.writes = 0
+
+            def write(self, text):
+                self.writes += 1
+                return super().write(text)
+
+        raw = _BufferedWriteHook()
+        buffer = io.BufferedWriter(raw)
+        stdout = CountingStdout(buffer)
+        monkeypatch.setattr(sys, 'stdout', stdout)
+        supervisor = Supervisor()
+        observed = {}
+
+        def hook():
+            with pytest.raises(RuntimeError, match='reentrant call'):
+                buffer.write(b'')
+            observed['written'] = raw.written
+            observed['writes'] = stdout.writes
+            supervisor.handle_sigint(signal.SIGINT, None)
+
+        raw.hook = hook
+
+        with pytest.raises(KeyboardInterrupt):
+            stdout.write('x' * (2 * io.DEFAULT_BUFFER_SIZE))
+
+        # The handler wrote nothing and flushed nothing: the bytes and the
+        # writes the stdout had when the handler ran are all it ever saw
+        assert stdout.writes == observed['writes']
+        assert raw.written == observed['written']
+        assert supervisor.sigint_count == 1
+        assert supervisor._signal_name() == 'SIGINT'
+
+
 class TestHandleBackendMessage:
     """Tests for Supervisor.handle_backend_message."""
 
@@ -1264,3 +1604,133 @@ class TestGracefulShutdown:
         supervisor.graceful_shutdown()
 
         assert supervisor.process is None
+        assert supervisor.parent_conn is None
+
+    def test_an_ignored_signal_is_reported_while_waiting(self, monkeypatch):
+        """A CTRL+C the handler swallowed is logged by the wait loop.
+
+        The handler may not log (a signal lands inside the stdout write it
+        interrupted, see TestHandleSigint), so the shutdown path reports the
+        press it ignored. Only a third press can reach this loop: the second
+        one raises KeyboardInterrupt and force kills.
+        """
+        from alasio.logger.writer import CaptureStream
+
+        capture = CaptureStream()
+        monkeypatch.setattr(sys, 'stdout', capture)
+        supervisor = Supervisor(graceful_shutdown_timeout=5)
+        supervisor.sigint_count = 1
+
+        class PressingProcess(FakeProcess):
+            """A backend that takes one join cycle to exit while the user presses"""
+
+            def join(self, timeout=None):
+                supervisor.sigint_count = 3
+                super().join(timeout)
+
+        supervisor.process = PressingProcess()
+
+        assert supervisor.graceful_shutdown() is True
+        assert capture.any_contains('Already shutting down, please wait... (CTRL+C #3)')
+
+
+class TestHandleRelaunch:
+    """The whole-application relaunch request of the backend."""
+
+    @staticmethod
+    def capture_stdout(monkeypatch):
+        """
+        Args:
+            monkeypatch (pytest.MonkeyPatch): Fixture of the test
+
+        Returns:
+            CaptureStream: Everything the supervisor printed
+        """
+        from alasio.logger.writer import CaptureStream
+
+        capture = CaptureStream()
+        monkeypatch.setattr(sys, 'stdout', capture)
+        return capture
+
+    def test_asks_the_host_with_the_current_token(self, monkeypatch):
+        """The request is authenticated: any worker can write to this stdout."""
+        capture = self.capture_stdout(monkeypatch)
+        supervisor = Supervisor()
+        token = 'a' * 64
+        supervisor.token_manager._window.append(token)
+
+        supervisor.handle_backend_message(b'command:relaunch')
+
+        assert supervisor.relaunch_requested is True
+        # the relaunch is not a restart and not a stop: the host owns the exit
+        assert supervisor.restart_requested is False
+        assert supervisor.stop_requested is False
+        assert supervisor.sigint_count == 0
+        assert capture.any_contains(f'[Supervisor] relaunch:{token}')
+
+    def test_without_an_announced_token_nothing_is_asked(self, monkeypatch):
+        """Not in electron mode: there is no host to ask."""
+        capture = self.capture_stdout(monkeypatch)
+        supervisor = Supervisor()
+
+        supervisor.handle_backend_message(b'command:relaunch')
+
+        assert supervisor.relaunch_requested is True
+        assert not capture.any_contains('[Supervisor] relaunch:')
+
+    def test_the_request_is_not_an_unknown_command(self, monkeypatch):
+        """The message has a handler of its own."""
+        capture = self.capture_stdout(monkeypatch)
+        supervisor = Supervisor()
+
+        supervisor.handle_backend_message(b'command:relaunch')
+
+        assert not capture.any_contains('Unknown command')
+
+
+class TestElectronMode:
+    """The electron mode switch: the host pid in the environment."""
+
+    @staticmethod
+    def _record_spawn_env(monkeypatch):
+        """
+        Patch multiprocessing.Process.start to record the environment state
+        at spawn time without actually spawning a child.
+
+        Args:
+            monkeypatch (pytest.MonkeyPatch): Fixture of the test
+
+        Returns:
+            dict: The environment seen at spawn time
+        """
+        import multiprocessing.process as mp_process
+
+        observed = {}
+
+        def recording_start(self):
+            observed.update(os.environ)
+
+        monkeypatch.setattr(mp_process.BaseProcess, 'start', recording_start)
+        return observed
+
+    def test_the_host_pid_is_the_switch(self, monkeypatch):
+        """Electron writes its own pid; the supervisor only reads it."""
+        monkeypatch.setenv('ALASIO_APP_ELECTRON_PID', '4242')
+        assert Supervisor().is_electron is True
+
+    def test_no_host_pid_is_no_electron_mode(self, monkeypatch):
+        """A hand-started supervisor has no host and generates no token."""
+        monkeypatch.delenv('ALASIO_APP_ELECTRON_PID', raising=False)
+        assert Supervisor().is_electron is False
+
+    def test_the_switch_is_not_rewritten_for_the_child(self, monkeypatch):
+        """The chain inherits the pid; the supervisor adds nothing."""
+        monkeypatch.setenv('ALASIO_APP_ELECTRON_PID', '4242')
+        supervisor, _ = make_supervisor_with_pipe()
+        observed = self._record_spawn_env(monkeypatch)
+
+        supervisor.start_backend([])
+
+        assert observed['ALASIO_APP_ELECTRON_PID'] == '4242'
+        # the old flag is gone from the chain
+        assert 'ELECTRON' not in observed

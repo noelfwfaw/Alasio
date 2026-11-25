@@ -18,10 +18,10 @@
   const failed = $derived(backendStatus === "failed");
   const starting = $derived(backendStatus === "starting");
 
-  // Dev preview mock logs, in chronological order (oldest first). The page
-  // stores lines newest-first for the column-reverse layout, so the mock
-  // is streamed in chronological order (each line unshifted one by one,
-  // see fillDevLogs) and the newest line always lands at the bottom edge.
+  // Dev preview mock logs, in chronological order (oldest first), which is
+  // the order the page stores lines in; the mock is streamed one line at a
+  // time (see fillDevLogs) so the newest line always lands at the bottom
+  // edge.
   // Previewed through DevRouteSwitcher URLs (/loading?backendSuccess=true|false).
   // Guarded by import.meta.env.DEV so the build folds them to empty arrays
   // and the mock data never reaches production bundles (the preview path
@@ -55,9 +55,12 @@
       ]
     : [];
 
-  // Log lines are prepended (newest first) and the column-reverse layout
-  // puts the first DOM child — the newest line — at the container's
-  // bottom edge, so the newest line is always the last row of the log.
+  // Log lines are appended (oldest first) so the visual order matches the
+  // DOM order. Do not render this list newest-first in a column-reverse
+  // container: Chromium extends a mouse selection in DOM order, not in
+  // visual order, so dragging from the lower line upwards would select
+  // only the newline between the lines and nothing of the line the drag
+  // started on.
   // The flex container is a plain block child of the scroll viewport, so
   // its content overflows the viewport downward: the scroll range starts
   // at the oldest line (scrollTop 0) and scrolling to the bottom
@@ -91,10 +94,10 @@
 
   // Dev preview: append mock log lines one by one, DEV_LOG_INTERVAL_MS
   // apart, so the preview animates like a real backend log stream. Each
-  // unshift also re-triggers the auto-scroll effect above, pinning the
+  // append also re-triggers the auto-scroll effect above, pinning the
   // newest line at the bottom edge while older lines are pushed upwards.
   // Must be called outside a tracking context (see the $effect below), or
-  // wrapped in untrack: the first unshift reads `logs` through the $state
+  // wrapped in untrack: the first append reads `logs` through the $state
   // proxy, and an effect that reads the state it mutates re-runs forever
   // (svelte throws effect_update_depth_exceeded).
   async function fillDevLogs(lines: string[]) {
@@ -104,7 +107,7 @@
       // A newer fill (preview switch, retry or unmount) superseded this
       // one; stop inserting to keep the log state consistent.
       if (generation !== devFillGeneration) return;
-      logs.unshift(line);
+      logs.push(line);
       await devLogDelay(DEV_LOG_INTERVAL_MS);
     }
   }
@@ -116,7 +119,7 @@
   $effect(() => {
     const override = getDevOverride();
     if (override?.route !== "loading" || override.backendSuccess === undefined) return;
-    // untrack: the fill mutates `logs`; without it the first unshift would
+    // untrack: the fill mutates `logs`; without it the first append would
     // register `logs` as a dependency of this effect and every inserted
     // line would re-trigger it, restarting the fill forever.
     untrack(() => {
@@ -139,14 +142,14 @@
     // startup-log.ts) so no pre-mount line is lost - the main process
     // does not push before the subscription, and pushes share the IPC
     // ordering with the reply, so the snapshot is complete up to the
-    // subscribe moment. The snapshot replaces the whole view (reversed
-    // to newest-first); a push racing the reply is also still in the
-    // buffer, so the replacement stays consistent.
+    // subscribe moment. The snapshot replaces the whole view (it is
+    // already in display order); a push racing the reply is also still in
+    // the buffer, so the replacement stays consistent.
     const unsubscribe = window.electronAPI.onBackendLog((log: string) => {
-      logs.unshift(log);
+      logs.push(log);
     });
     void window.electronAPI.subscribeBackendLogs().then((snapshot: string[]) => {
-      logs = snapshot.reverse();
+      logs = snapshot;
     });
 
     return unsubscribe;
@@ -181,13 +184,13 @@
          Styling follows the frontend overview LogDisplay/LogData: card
          surface, scroll area, and a per-line hover highlight. The backend
          log has no level/time, so only the shared skeleton is kept. -->
-    <ScrollArea bind:viewportRef={logViewport} type="always" class="bg-card min-h-0 w-full flex-1 border-t border-b">
-      <div class="flex flex-col-reverse">
+    <ScrollArea bind:viewportRef={logViewport} type="always" class="min-h-0 w-full flex-1 border-t border-b bg-card">
+      <div class="flex flex-col">
         {#each logs as log}
           <div
-            class="hover:bg-muted/50 hover:shadow-muted-foreground/15 block px-1 py-0.25 font-mono text-xs hover:shadow-[inset_0_1px_0_0_currentColor,inset_0_-1px_0_0_currentColor]"
+            class="block px-1 py-0.25 font-mono text-xs hover:bg-muted/50 hover:shadow-[inset_0_1px_0_0_currentColor,inset_0_-1px_0_0_currentColor] hover:shadow-muted-foreground/15"
           >
-            <pre class="text-muted-foreground m-0 break-all whitespace-pre-wrap">{log}</pre>
+            <pre class="m-0 break-all whitespace-pre-wrap text-muted-foreground">{log}</pre>
           </div>
         {/each}
       </div>
@@ -199,7 +202,7 @@
     <div class="mt-2 flex h-8 w-full shrink-0 items-center justify-end gap-4">
       {#if failed}
         <div class="flex items-center gap-2">
-          <TriangleAlert class="text-destructive size-4" />
+          <TriangleAlert class="size-4 text-destructive" />
           <p class="ml-0">{t.Loading.BackendStartFailed()}</p>
         </div>
         <Button onclick={retry} disabled={retrying} class="h-8 w-16 font-semibold">
@@ -207,8 +210,8 @@
         </Button>
       {:else if starting}
         <div class="flex items-center gap-2">
-          <LoaderCircle class="text-muted-foreground size-4 animate-spin" />
-          <p class="text-muted-foreground ml-0">{t.Loading.StartingBackend()}</p>
+          <LoaderCircle class="size-4 animate-spin text-muted-foreground" />
+          <p class="ml-0 text-muted-foreground">{t.Loading.StartingBackend()}</p>
         </div>
       {/if}
     </div>

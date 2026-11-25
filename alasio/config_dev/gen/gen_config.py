@@ -1,5 +1,7 @@
+from typing import TYPE_CHECKING, Optional
+
 from alasio.codegen.python import CodeGen
-from alasio.config.entry.const import ModEntryInfo  # noqa: F401
+from alasio.config.entry.mod_entry import ModEntry  # noqa: F401
 from alasio.config_dev.format.extract_method import extract_method
 from alasio.config_dev.format.format_i18n import format_i18n
 from alasio.config_dev.format.format_yaml import yaml_formatter
@@ -7,13 +9,44 @@ from alasio.config_dev.parse.base import DefinitionError
 from alasio.config_dev.parse.cache_alasio import CacheAlasio
 from alasio.config_dev.parse.load_alas_i18n import LoadAlasI18n
 from alasio.config_dev.parse.parse_args import TYPE_ARG_LITERAL, TYPE_ARG_TUPLE, ArgData
-from alasio.config_dev.parse.parse_groups import GroupData, ParseGroups
+from alasio.config_dev.parse.parse_groups import ParseGroups
 from alasio.config_dev.parse.parse_tasks import ParseTasks
 from alasio.ext.cache import cached_property
 from alasio.ext.deep import deep_get, deep_set
 from alasio.ext.file.jsonfile import NoIndent, write_json_custom_indent
 from alasio.ext.file.yamlfile import format_yaml
+from alasio.ext.path.calc import to_posix
 from alasio.logger import logger
+
+if TYPE_CHECKING:
+    from alasio.config_dev.gen.gen_cross import CrossNavGenerator
+
+
+def remove_stale_file(file, gitadd=None):
+    """
+    Remove a generated file that has nothing to generate anymore.
+
+    A nav whose cards, groups or tasks are all removed does not keep the file
+    of the previous generation: a stale translation, a model class or a card
+    entry of something that no longer exists would mislead the next reader, and
+    a model class may still be imported by file name.
+
+    The file is removed with a plain unlink: the generator owns its output,
+    nothing reads or replaces it while the generation runs, so the retries
+    atomic_remove() does for a concurrent writer are not needed. The return
+    value of the removal tells whether there was a file, so no existence check
+    is done beforehand.
+
+    Args:
+        file (PathStr): Generated file to remove
+        gitadd (GitAdd, optional): Tracks the removed file
+    """
+    if not file.file_remove():
+        # no such file, nothing to delete
+        return
+    logger.info(f'Delete file {file}')
+    if gitadd:
+        gitadd.stage_add(file)
 
 
 class ConfigGenerator(ParseGroups, ParseTasks):
@@ -64,7 +97,7 @@ class ConfigGenerator(ParseGroups, ParseTasks):
             你不应该修改这个文件。
 
         Args:
-            entry (ModEntryInfo):
+            entry (ModEntry):
             file (PathStr): Absolute filepath to {nav}.args.yaml
         """
         super().__init__(file)
@@ -78,12 +111,28 @@ class ConfigGenerator(ParseGroups, ParseTasks):
         #         which is arg path appended with ArgData
         self.config_data: "dict[str, dict[str, dict]]" = {}
         self.alasio = CacheAlasio().get(entry)
-        # Cross-nav variant model data
-        # groups from other navs whose model should be generated in this nav's model file
-        self.foreign_model_group_data: "dict[str, GroupData]" = {}
-        # groups in this nav that should NOT have their model generated here
-        # (because it will be generated in the parent nav instead)
-        self.skip_model_group_names: "set[str]" = set()
+        # Cross nav registry, set by CrossNavGenerator.dict_nav_config()
+        # A nav generated on its own has no registry, so it can not inherit a
+        # group declared in another nav.
+        self.cross: "Optional[CrossNavGenerator]" = None
+
+    @cached_property
+    def is_alasio_mixin(self):
+        """
+        This nav is the mixin nav of the alasio entry.
+
+        The mixin nav only declares classes that other groups inherit. Its base
+        classes and methods are written by hand, they can not be derived from
+        {nav}.args.yaml, so {nav}_model.py is maintained by hand. The classes
+        are not shown on the frontend, so the nav has no i18n either.
+
+        Only the alasio entry has a nav named mixin: a mod can not reuse a nav
+        name of alasio, see CrossNavGenerator.dict_nav_config().
+
+        Returns:
+            bool: True for the mixin nav of the alasio entry
+        """
+        return not self.alasio and self.nav_name == 'mixin'
 
     """
     Generate model
@@ -91,11 +140,13 @@ class ConfigGenerator(ParseGroups, ParseTasks):
 
     def get_inherit_name(self, parent):
         """
+        Get the class reference of a parent in the generated code.
+
         Args:
-            parent (str):
+            parent (str): Group name of the parent
 
         Returns:
-            str:
+            str: Class reference, like "a.DashboardTotal" or "Campaign"
         """
         # a dashboard group
         if parent.startswith('Dashboard'):
@@ -104,6 +155,69 @@ class ConfigGenerator(ParseGroups, ParseTasks):
         if self.alasio and parent in self.alasio.groups_data:
             return f'a.{parent}'
         return parent
+
+    @cached_property
+    def parent_imports(self):
+        """
+        Base classes this model file imports from another nav.
+
+        The class of a group is generated in the model file of the nav that
+        declares the group, so a group inheriting a base of another nav imports
+        the class from there. Grouped by the declaring nav and sorted by the nav
+        name, so the generated imports are stable whatever order the yaml has.
+
+        Returns:
+            dict[str, list[str]]:
+                key: nav name declaring the base classes
+                value: list of parent group name, in declaration order
+        """
+        out = {}
+        if not self.cross:
+            return out
+        for group in self.groups_data.values():
+            for parent in group.parent:
+                # a dashboard or alasio group is exported by the group module
+                if self.get_inherit_name(parent) != parent:
+                    continue
+                parent_group = self.cross.groups_data.get(parent, None)
+                parser = parent_group.parser if parent_group is not None else None
+                if parser is None or parser.nav_name == self.nav_name:
+                    continue
+                names = out.setdefault(parser.nav_name, [])
+                if parent not in names:
+                    names.append(parent)
+        return dict(sorted(out.items()))
+
+    def model_module(self, nav):
+        """
+        Relative import module from this model file to the model file of a nav.
+
+        Args:
+            nav (str): Nav declaring the base classes
+
+        Returns:
+            str: Module of that model file, like "..main.main_model"
+
+        Raises:
+            DefinitionError: This nav has no cross nav registry
+        """
+        cross = self.cross
+        if cross is None:
+            raise DefinitionError(
+                f'Cannot import the model of nav "{nav}", this nav is generated without a cross nav registry',
+                file=self.file)
+        current_parts = to_posix(self.model_file).rpartition('/')[0].split('/')
+        file = cross.dict_nav_config[nav].model_file
+        folder, _, name = to_posix(file).rpartition('/')
+        parts = folder.split('/')
+        common = 0
+        for current_part, part in zip(current_parts, parts):
+            if current_part != part:
+                break
+            common += 1
+        # one more level to leave the package of this module
+        prefix = '.' * (len(current_parts) - common + 1)
+        return prefix + '.'.join(parts[common:] + [name[:-3]])
 
     @cached_property
     def model_methods(self):
@@ -131,7 +245,7 @@ class ConfigGenerator(ParseGroups, ParseTasks):
         Returns:
             CodeGen | None:
         """
-        _ = self.model_methods
+        methods = self.model_methods
         gen = CodeGen()
         # no datetime because we have alias: a.T_DATETIME, a.DEFAULT_TIME
         # gen.Import('datetime').as_('d')
@@ -145,27 +259,48 @@ class ConfigGenerator(ParseGroups, ParseTasks):
             gen.Import('alasio.config.alasio.group_base').as_('a')
             gen.CommentCodeGen('alasio.config_dev.gen_alasio')
 
-        def iter_groups():
-            """Yield (name, g) from own groups (skipping cross-nav variants)
-            then foreign model groups."""
-            for name, g in self.groups_data.items():
-                if name in self.skip_model_group_names:
-                    continue
-                yield name, g
-            yield from self.foreign_model_group_data.items()
-
-        # Empty group has no class, so it does not reserve a name either
-        groups = [(name, g) for name, g in iter_groups() if g.args]
+        # Empty group has no class, so it does not reserve a name either,
+        # unless another group inherits it or it has manual methods: the class
+        # of the child refers to it by name, whether the child is in this file
+        # or in another nav, and the manual methods need a class to live in
+        parents = {parent for group in self.groups_data.values() for parent in group.parent}
+        for names in self.parent_imports.values():
+            parents.update(names)
+        groups = [
+            (name, g) for name, g in self.groups_data.items()
+            if g.args or name in parents or name in methods
+        ]
         used_names = {name for name, _ in groups}
+
+        # A base class declared in another nav is imported from the model file
+        # of the nav declaring it. The import is guarded, so a loader that
+        # injects the class skips it and keeps that module out of sys.modules.
+        # The first class of a block is the name such a loader injects.
+        for nav, names in self.parent_imports.items():
+            with gen.If(f't.TYPE_CHECKING or {names[0]!r} not in globals()'):
+                imp = gen.FromImport(self.model_module(nav))
+                for name in names:
+                    imp.Import(name)
+            gen.Empty(2)
 
         # Literal variable name of each literal content of this file
         literal_names: "dict[tuple, str]" = {}
 
         for group_name, group in groups:
+            # Args emitted in the class body. A SoftTotal group gets its Total
+            # from populate_dashboard(), bounded by the hard total of its own
+            # Value, so the bound differs per group and can not be inherited
+            # from the base class annotation.
+            emit_args = group.override_args
+            if group.dashboard == 'SoftTotal' and 'Total' not in emit_args:
+                total = group.args.get('Total', None)
+                if total is not None:
+                    emit_args = dict(emit_args)
+                    emit_args['Total'] = total
             # Get the literal variable of each arg of this group,
             # the new ones are emitted before the class
             refs = {}
-            for arg_name, arg in group.override_args.items():
+            for arg_name, arg in emit_args.items():
                 if arg.dt not in TYPE_ARG_LITERAL:
                     continue
                 name = f'LITERAL_{group_name}_{arg_name}'
@@ -199,7 +334,7 @@ class ConfigGenerator(ParseGroups, ParseTasks):
             else:
                 cls.set_inherit('a.GroupBase')
             with cls:
-                for arg_name, arg in group.override_args.items():
+                for arg_name, arg in emit_args.items():
                     arg: ArgData
                     literal_ref = refs.get(arg_name, '')
                     # Expand tuple
@@ -216,9 +351,9 @@ class ConfigGenerator(ParseGroups, ParseTasks):
                     gen.Anno(arg_name, arg.get_anno()).Var(arg.get_value())
 
                 # keep manual methods
-                methods = self.model_methods.get(group_name)
-                if methods:
-                    for method_name, lines in methods.items():
+                group_methods = methods.get(group_name)
+                if group_methods:
+                    for method_name, lines in group_methods.items():
                         with gen.RawDef():
                             for line in lines:
                                 gen.Raw(line, indent=False)
@@ -267,8 +402,13 @@ class ConfigGenerator(ParseGroups, ParseTasks):
                 value: translation
         """
         old = deep_get(self._i18n_old, [group_name, arg_name], default={})
+        # A filter-order with secondary options has both lists, so the old
+        # translations of the primary and the secondary items are both readable
+        i18n_options = list(arg.option or [])
+        if arg.option_dict:
+            i18n_options.extend(o for options in arg.option_dict.values() for o in options)
         old = LoadAlasI18n().load_arg(
-            old, group_name, arg_name, languages=self.entry.gui_language, options=arg.option)
+            old, group_name, arg_name, languages=self.entry.gui_language, options=i18n_options)
         new = {}
         for lang in self.entry.gui_language:
             # name, name must not be empty, default to {group_name}.{arg_name}
@@ -283,19 +423,18 @@ class ConfigGenerator(ParseGroups, ParseTasks):
             value = deep_get(old, key, default='')
             value = format_i18n(value)
             deep_set(new, key, value)
-        # option
+        # option, the primary items and the secondary options may both be present
         if arg.option or arg.option_dict:
             for lang in self.entry.gui_language:
                 inline = True
+                for option in arg.option or []:
+                    inline &= self._load_arg_option_i18n(old, new, option, lang)
                 if arg.option_dict:
                     for group in arg.option_dict:
                         inline &= self._load_arg_option_i18n(old, new, group, lang)
                     for options in arg.option_dict.values():
                         for option in options:
                             inline &= self._load_arg_option_i18n(old, new, option, lang)
-                else:
-                    for option in arg.option:
-                        inline &= self._load_arg_option_i18n(old, new, option, lang)
                 # if options are all digit and option name is same as option, make it inline
                 if inline:
                     key = [lang, 'option_i18n']
@@ -331,11 +470,13 @@ class ConfigGenerator(ParseGroups, ParseTasks):
         new = {}
         for lang in self.entry.gui_language:
             # name, name must not be empty, default to {group_name}
+            # a name may have multiple lines, like help, so it is formatted
+            # rather than converted to a str
             key = [lang, 'name']
             value = deep_get(old, key, default='')
             if not value:
                 value = group_name
-            deep_set(new, key, str(value))
+            deep_set(new, key, format_i18n(value))
             # help, help can be empty
             key = [lang, 'help']
             value = deep_get(old, key, default='')
@@ -358,7 +499,7 @@ class ConfigGenerator(ParseGroups, ParseTasks):
                 value: translation
         """
         # No i18n for mixin class, because they won't be shown
-        if self.nav_name == 'mixin':
+        if self.is_alasio_mixin:
             return {}
 
         _ = self._i18n_old
@@ -408,13 +549,20 @@ class ConfigGenerator(ParseGroups, ParseTasks):
                     gitadd.stage_add(file)
 
         # {nav}_model.py
-        if self.model_gen:
-            file = self.model_file
-            op = self.model_gen.write(file, skip_same=True)
-            if op:
-                logger.info(f'Write file {file}')
-                if gitadd:
-                    gitadd.stage_add(file)
+        # The model of the mixin nav is maintained by hand: generating it would
+        # drop the classes without args and the hand-written base classes, and
+        # it is never removed either, whatever its groups are
+        if not self.is_alasio_mixin:
+            if self.model_gen:
+                file = self.model_file
+                op = self.model_gen.write(file, skip_same=True)
+                if op:
+                    logger.info(f'Write file {file}')
+                    if gitadd:
+                        gitadd.stage_add(file)
+            else:
+                # no class to generate, the model of the previous generation is stale
+                remove_stale_file(self.model_file, gitadd)
 
         # {nav}_i18n.json
         if self.i18n_data:
@@ -424,6 +572,9 @@ class ConfigGenerator(ParseGroups, ParseTasks):
                 logger.info(f'Write file {file}')
                 if gitadd:
                     gitadd.stage_add(file)
+        else:
+            # nothing to translate, the i18n of the previous generation is stale
+            remove_stale_file(self.i18n_file, gitadd)
 
         # format yaml
         op = format_yaml(self.file, yaml_formatter)

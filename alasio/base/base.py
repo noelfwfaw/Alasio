@@ -1,5 +1,6 @@
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
+import msgspec
 from msgspecerror import get_class_annotation
 
 from alasio.base.exception import ScriptError
@@ -8,6 +9,27 @@ from alasio.config.base import AlasioConfigBase
 from alasio.device.base import DeviceBase
 from alasio.device.config import DeviceConfig
 from alasio.logger import logger
+
+
+class LoopState(msgspec.Struct):
+    """
+    The device state yielded by ModuleBase.loop()
+
+    Attributes:
+        image (np.ndarray): Screenshot captured by the iteration,
+            None if the loop did not take a screenshot in this iteration
+        hierarchy (etree._Element): UI hierarchy dumped by the iteration,
+            None if the loop did not dump the hierarchy in this iteration
+        timeout (T_TIMER_LIMIT): Timer of the loop, None if the loop has no timeout
+        count (int): Number of iterations that captured the device,
+            a screenshot and a hierarchy dump of the same iteration count 1
+    """
+    # Annotated as Any, importing numpy and lxml at module level would cost every
+    # module the whole image stack, see DeviceBase
+    image: Any = None
+    hierarchy: Any = None
+    timeout: Optional[T_TIMER_LIMIT] = None
+    count: int = 0
 
 
 class ModuleBase:
@@ -71,20 +93,29 @@ class ModuleBase:
             logger.warning('ModuleBase received an unknown device, using it anyway')
             self.device = device
 
-    def loop(self, *, skip_first=True, timeout: Optional[T_TIMER_LIMIT] = None):
+    def loop(self, *, skip_first=True, timeout: Optional[T_TIMER_LIMIT] = None,
+             screenshot=True, hierarchy=False):
         """
         A syntactic sugar to start a state loop
 
         Args:
-            skip_first (bool): Usually to be True to reuse the previous screenshot
+            skip_first (bool): Usually to be True to reuse the screenshot and hierarchy
+                of the device, False to capture them before the first iteration.
+                The loop captures nothing in the first iteration when True, so the
+                yielded image and hierarchy are None
             timeout: Seconds of timeout, or (second, count), or a Timer object
+            screenshot (bool): True to take a screenshot on each iteration
+            hierarchy (bool): True to dump the UI hierarchy on each iteration
 
         Yields:
-            np.ndarray: screenshot
+            LoopState: The device state of the iteration, `image` and `hierarchy`
+                are the values the capture of this iteration returned, None if the
+                loop did not capture it. `count` is the number of iterations this
+                loop captured the device for so far
 
         Examples:
             # state machine that handle clicking until destination
-            for _ in self.loop():
+            for state in self.loop():
                 if self.appear(...):
                     break
                 if self.appear_then_click(...):
@@ -92,32 +123,96 @@ class ModuleBase:
 
         Examples:
             # state machine with timeout
-            for _ in self.loop(timeout=2):
+            for state in self.loop(timeout=2):
                 if self.appear(...):
                     logger.info('Wait success')
                     break
             else:
                 logger.warning('Wait timeout')
+
+        Examples:
+            # state machine that reads the UI hierarchy, the screenshot is not needed
+            for state in self.loop(screenshot=False, hierarchy=True, skip_first=False):
+                if state.hierarchy is not None:
+                    break
         """
         if timeout is not None:
             timeout = Timer.from_seconds(timeout).reset()
 
+        count = 0
         while 1:
             if timeout is not None:
                 if timeout.reached():
                     return
 
+            captured_image = None
+            captured_hierarchy = None
             if skip_first:
                 skip_first = False
             else:
-                self.device.screenshot()
+                # the return value rather than self.device.image, a skipped capture
+                # (by the loop or by the device itself) must not yield the previous one
+                if screenshot:
+                    captured_image = self.device.screenshot()
+                if hierarchy:
+                    captured_hierarchy = self.device.dump_hierarchy()
+                # the screenshot and the hierarchy dump of an iteration are one
+                # capture of the device state
+                if screenshot or hierarchy:
+                    count += 1
 
-            try:
-                yield self.device.image
-                continue
-            except AttributeError:
-                pass
+            yield LoopState(
+                image=captured_image,
+                hierarchy=captured_hierarchy,
+                timeout=timeout,
+                count=count,
+            )
 
-            # no cached screenshot, take new screenshot anyway
-            self.device.screenshot()
-            yield self.device.image
+    def loop_screenshot(self, *, skip_first=True, timeout: Optional[T_TIMER_LIMIT] = None):
+        """
+        Shortcut of `loop()` taking screenshots only, see `loop()`
+
+        Args:
+            skip_first (bool): Usually to be True to reuse the screenshot of the device
+            timeout: Seconds of timeout, or (second, count), or a Timer object
+
+        Yields:
+            LoopState:
+        """
+        return self.loop(
+            skip_first=skip_first, timeout=timeout,
+            screenshot=True, hierarchy=False,
+        )
+
+    def loop_hierarchy(self, *, skip_first=True, timeout: Optional[T_TIMER_LIMIT] = None):
+        """
+        Shortcut of `loop()` dumping the UI hierarchy only, the screenshot is not taken, see `loop()`
+
+        Args:
+            skip_first (bool): Usually to be True to reuse the hierarchy of the device
+            timeout: Seconds of timeout, or (second, count), or a Timer object
+
+        Yields:
+            LoopState:
+        """
+        return self.loop(
+            skip_first=skip_first, timeout=timeout,
+            screenshot=False, hierarchy=True,
+        )
+
+    def loop_screenshot_hierarchy(self, *, skip_first=True, timeout: Optional[T_TIMER_LIMIT] = None):
+        """
+        Shortcut of `loop()` taking a screenshot and dumping the UI hierarchy, see `loop()`
+
+        Args:
+            skip_first (bool): Usually to be True to reuse the screenshot and hierarchy
+                of the device
+            timeout: Seconds of timeout, or (second, count), or a Timer object
+
+        Yields:
+            LoopState:
+        """
+        return self.loop(
+            skip_first=skip_first, timeout=timeout,
+            screenshot=True, hierarchy=True,
+        )

@@ -5,15 +5,46 @@ import {
   IPC_SHUTDOWN_STAGE,
   IPC_WINDOW_CONFIRM_CLOSE,
   IPC_WINDOW_HIDE,
+  IPC_WINDOW_IS_MAXIMIZED,
   IPC_WINDOW_MAXIMIZE,
+  IPC_WINDOW_MAXIMIZED_CHANGE,
   IPC_WINDOW_MINIMIZE,
 } from "../shared/ipc";
 import { appState } from "./app-state";
-import { ShutdownStage, shutdownBackend } from "./backend";
+import { ShutdownStage, setQuittingProbe, shutdownBackend } from "./backend";
 import { type StartupWindowMode, getStartupWindowMode } from "./startup-args";
+
+// Minimum size of the main window, in DIP -- the same unit as `width` and
+// `height` below and as the renderer's CSS pixels, at any display scaling.
+// Both are 480, so the window can be shrunk to a 480x480 square: the smallest
+// box the frontend still lays out legibly.
+//
+// Width: 480 is below the frontend's 640 `sm` breakpoint, so the client
+// falls back to the same mobile layout the remote web page serves to a phone
+// (nav in a 3/4 width Sheet, header keeping the menu button, title, mod
+// selector, language/theme buttons and all 168px of window controls). That
+// layout is a first-class one, not a degraded desktop: the drag band still has
+// 180px to grab (480 - 56 menu button - 244 for the actions and window
+// controls). The compact dev pages keep their own wider min-width and scroll
+// sideways, which the layout handles by design.
+//
+// Height: 480 keeps the 48px title band plus a usable page area, and stays
+// below the default 660 so the floor never fills a small screen (a 1366x768
+// laptop at 125% scaling has about 1092x574 DIP of work area).
+const MIN_WINDOW_WIDTH = 480;
+const MIN_WINDOW_HEIGHT = 480;
 
 let mainWindow: BrowserWindow | null = null;
 let isQuitting = false;
+// In-flight graceful shutdown, shared by every entry point that quits the
+// app so a second request (clicking tray Exit twice, or confirming the
+// close dialog while the tray is already quitting) joins the first one
+// instead of starting a second shutdown of the same backend process.
+let quitPromise: Promise<void> | null = null;
+
+// The relaunch path of the backend asks whether the user is already closing
+// the app before it takes the exit over (see backend.ts:requestRelaunch)
+setQuittingProbe(() => isQuitting);
 
 export function createWindow(): BrowserWindow {
   // The window is created hidden in production and revealed once the
@@ -31,14 +62,17 @@ export function createWindow(): BrowserWindow {
   mainWindow = new BrowserWindow({
     width: 960,
     height: 660,
+    minWidth: MIN_WINDOW_WIDTH,
+    minHeight: MIN_WINDOW_HEIGHT,
     frame: false,
     title: "Alasio",
     show: showImmediately,
     // Match the native window background to the display theme (values are
-    // the renderer's --background tokens) so no white flash appears while
-    // the renderer is still loading. The renderer paints its own themed
+    // the renderer's --background tokens from renderer/app.css: #f3f3f3 for
+    // :root and #161618 for .dark) so no white flash appears while the
+    // renderer is still loading. The renderer paints its own themed
     // background as soon as it is up.
-    backgroundColor: appState.displayTheme === "dark" ? "#18181b" : "#f3f3f3",
+    backgroundColor: appState.displayTheme === "dark" ? "#161618" : "#f3f3f3",
     webPreferences: {
       preload: path.join(__dirname, "../preload/index.js"),
       contextIsolation: true,
@@ -78,6 +112,15 @@ export function createWindow(): BrowserWindow {
       showWindow(windowMode);
     });
   }
+
+  // Report the maximize state of the window to the renderer. The title bar
+  // derives its maximize/restore button from it, and the state can be
+  // changed by paths other than those buttons: double-clicking the drag
+  // region, window shortcuts, `--window=maximize` at startup. Keeping the
+  // renderer in the loop instead of toggling a local flag there means the
+  // button always matches the real window.
+  mainWindow.on("maximize", notifyMaximizedState);
+  mainWindow.on("unmaximize", notifyMaximizedState);
 
   // Load renderer
   if (process.env.VITE_DEV_SERVER_URL) {
@@ -159,6 +202,82 @@ export function getMainWindow(): BrowserWindow | null {
   return mainWindow;
 }
 
+/**
+ * Push the current maximize state of the main window to the renderer.
+ */
+function notifyMaximizedState() {
+  sendToRenderer(IPC_WINDOW_MAXIMIZED_CHANGE, mainWindow?.isMaximized() ?? false);
+}
+
+/**
+ * Send a message to the renderer, ignoring windows that are already gone.
+ *
+ * The shutdown flow keeps talking to the renderer (progress stages) while
+ * the window may have been destroyed by another path.
+ *
+ * Args:
+ *     channel (str): IPC channel name
+ *     args (list[any]): Payload of the message
+ */
+function sendToRenderer(channel: string, ...args: unknown[]) {
+  const target = mainWindow;
+  if (!target || target.isDestroyed()) {
+    return;
+  }
+  target.webContents.send(channel, ...args);
+}
+
+/**
+ * Quit the app gracefully, without asking the renderer to confirm.
+ *
+ * The renderer confirmation dialog is for the close button, a single click
+ * that is easy to trigger by accident. A tray menu exit is already a
+ * deliberate two step action (open the menu, pick Exit), so it quits
+ * directly. Both paths share this function: it stops the backend with the
+ * same staged shutdown, then destroys the window and quits.
+ *
+ * Returns:
+ *     Promise[None]: Resolves once the backend is down, before the window is
+ *     destroyed, so an IPC reply based on it still reaches the renderer
+ */
+export function quitApp(): Promise<void> {
+  if (quitPromise) {
+    return quitPromise;
+  }
+  isQuitting = true;
+
+  quitPromise = new Promise<void>((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      // Resolve first so an IPC reply is sent to the renderer before the
+      // window is destroyed (otherwise "reply was never sent" error)
+      resolve();
+      setImmediate(() => {
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.destroy();
+        }
+        app.quit();
+      });
+    };
+
+    shutdownBackend((stage) => {
+      sendToRenderer(IPC_SHUTDOWN_STAGE, stage);
+      if (stage === ShutdownStage.Done) {
+        finish();
+      }
+    }).catch((err) => {
+      // The user already asked to exit: a backend that cannot be stopped
+      // cleanly is reported, not a reason to keep the app open.
+      console.error("[window] Failed to shut down the backend:", err);
+      finish();
+    });
+  });
+
+  return quitPromise;
+}
+
 export function setupWindowIPC() {
   ipcMain.on(IPC_WINDOW_MINIMIZE, () => {
     mainWindow?.minimize();
@@ -172,27 +291,13 @@ export function setupWindowIPC() {
     }
   });
 
+  // The renderer reads the state on mount: the window may already be
+  // maximized before the title bar subscribes to the push channel.
+  ipcMain.handle(IPC_WINDOW_IS_MAXIMIZED, () => mainWindow?.isMaximized() ?? false);
+
   ipcMain.on(IPC_WINDOW_HIDE, () => {
     mainWindow?.hide();
   });
 
-  ipcMain.handle(IPC_WINDOW_CONFIRM_CLOSE, async () => {
-    isQuitting = true;
-
-    return new Promise<void>((resolve) => {
-      shutdownBackend((stage) => {
-        mainWindow?.webContents.send(IPC_SHUTDOWN_STAGE, stage);
-
-        if (stage === ShutdownStage.Done) {
-          // Resolve first so the IPC reply is sent to the renderer
-          // before destroying the window (otherwise "reply was never sent" error)
-          resolve();
-          setImmediate(() => {
-            mainWindow?.destroy();
-            app.quit();
-          });
-        }
-      });
-    });
-  });
+  ipcMain.handle(IPC_WINDOW_CONFIRM_CLOSE, () => quitApp());
 }

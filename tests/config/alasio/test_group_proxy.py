@@ -13,11 +13,15 @@ from alasio.config.alasio.group_proxy import GroupProxy, batch_set
 from alasio.config.alasio.store_model import DashboardAmount
 from alasio.config.base import AlasioConfigBase
 from alasio.config.entry.mod import Mod
+from alasio.config.entry.mod_entry import ModEntry, ModEntryModel
 from alasio.config.entry.utils import validate_task_name
 from alasio.db.conn import SQLITE_POOL
+from alasio.ext import env
 from alasio.ext.cache import cached_property as alasio_cached_property
 from alasio.logger import logger
-from ExampleMod.module.config.const import entry
+
+# The mod the tests of this file run on
+entry = ModEntry(env.ALASIO_ROOT.joinpath('ExampleMod'))
 
 
 # Define a custom decorator with wraps
@@ -253,6 +257,53 @@ class TestGroupProxy:
         # Should proxy to underlying object's str
         assert 'Scheduler' in str_str or 'Enable' in str_str
 
+    def test_proxy_isinstance_of_the_model(self, config):
+        """The proxy passes isinstance() of the model, type() stays GroupProxy"""
+        proxy = config.Scheduler
+        model = type(proxy._obj)
+
+        assert isinstance(proxy, model)
+        assert isinstance(proxy, GroupProxy)
+        # callers rely on the exact type
+        assert type(proxy) is GroupProxy
+
+    def test_proxy_isinstance_of_the_base_model(self, config):
+        """isinstance() also follows the inheritance of the model"""
+        from alasio.config.alasio.group_base import GroupBase
+
+        proxy = config.Scheduler
+        assert isinstance(proxy, GroupBase)
+
+    def test_proxy_isinstance_of_another_model(self, config):
+        """A group is not an instance of an unrelated model"""
+        proxy = config.Scheduler
+
+        class Other(Struct):
+            Value: int = 0
+
+        assert not isinstance(proxy, Other)
+
+    def test_proxy_isinstance_with_a_non_struct(self, config):
+        """The proxy of a non-Struct object still reports its class"""
+        proxy = GroupProxy(_obj=ProxyTestGroup(), _config=config, _task='Main', _group='TestGroup')
+        assert isinstance(proxy, ProxyTestGroup)
+
+    def test_proxy_class_of_the_obj(self, config):
+        """__class__ reports the model class, not GroupProxy"""
+        proxy = config.Scheduler
+        assert proxy.__class__ is type(proxy._obj)
+
+    def test_proxy_setattr_still_registers_after_isinstance(self, config):
+        """Reading __class__ does not break the set interception"""
+        config.auto_save = False
+        proxy = config.Scheduler
+        assert isinstance(proxy, type(proxy._obj))
+
+        proxy.Enable = True
+
+        assert proxy._obj.Enable is True
+        assert ('Main', 'Scheduler', 'Enable') in config._modified
+
 
 class TestModelProxyBatchSet:
     TEST_CONFIG_NAME = ':memory:'
@@ -264,6 +315,7 @@ class TestModelProxyBatchSet:
             root = '.'
             path_config = '.'
             path_assets = '.'
+            data = ModEntryModel.build(name=name, path_main='main.py', path_assets='assets')
 
             @staticmethod
             def alasio():
@@ -566,6 +618,7 @@ class TestDashboardExpire:
             root = '.'
             path_config = '.'
             path_assets = '.'
+            data = ModEntryModel.build(name=name, path_main='main.py', path_assets='assets')
 
             @staticmethod
             def alasio():

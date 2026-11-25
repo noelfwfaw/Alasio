@@ -1,6 +1,5 @@
-import { untrack } from "svelte";
 import { toast } from "svelte-sonner";
-import { renewalCoordinator, websocketClient } from "./client.svelte";
+import { renewalCoordinator } from "./client.svelte";
 import type { RequestEvent } from "./event";
 
 /**
@@ -37,9 +36,16 @@ export interface CallCallbacks {
  */
 export interface RpcContext {
   sendRaw(payload: RequestEvent): void;
+  /** Asks the client to establish a connection if it has none. */
+  connect(): void;
   registerRpcCall(id: string, callbacks: RpcCallbacks): void;
   unregisterRpcCall(id: string): void;
-  hasRpcCall(id: string): boolean;
+  /** Whether a connection is open. */
+  isConnected(): boolean;
+  /** Whether the topic's subscription is established on the live connection. */
+  isTopicReady(topic: string): boolean;
+  /** Increments on every successful connection. */
+  readonly connectionGeneration: number;
 }
 
 /**
@@ -80,12 +86,7 @@ export interface Rpc {
  * It's a factory function used by the TopicClient.
  * @private
  */
-export function createRpc(
-  topic: string,
-  // It receives a context object instead of the full client instance to prevent circular imports.
-  context: RpcContext,
-  options: { pendingDelay?: number; timeout?: number } = {},
-): Rpc {
+export function createRpc(topic: string, context: RpcContext, options: RpcOptions = {}): Rpc {
   // These are Svelte 5 runes, usable directly because of the *.svelte.ts file extension.
   let isPending = $state(false);
   let errorMsg = $state<string | null>(null);
@@ -94,16 +95,24 @@ export function createRpc(
 
   let operationTimeoutId: ReturnType<typeof setTimeout> | undefined;
   let pendingDelayTimeoutId: ReturnType<typeof setTimeout> | undefined;
+  // The call this object is waiting for. A response can still arrive for a
+  // call that was reset or replaced: only the call registered here may touch
+  // the state above.
+  let pendingId: string | null = null;
 
   const PENDING_DELAY = options.pendingDelay ?? 300;
   const TIMEOUT = options.timeout ?? 5000;
 
   const reset = () => {
+    if (pendingId !== null) context.unregisterRpcCall(pendingId);
+    pendingId = null;
     isPending = false;
     errorMsg = null;
     successMsg = null;
     if (operationTimeoutId) clearTimeout(operationTimeoutId);
     if (pendingDelayTimeoutId) clearTimeout(pendingDelayTimeoutId);
+    operationTimeoutId = undefined;
+    pendingDelayTimeoutId = undefined;
   };
 
   const open = () => {
@@ -114,32 +123,37 @@ export function createRpc(
   // Perform an RPC call. `isRetry` marks a call spawned by the renewal
   // retry path: a retried call never retries again (exactly once).
   const call = (func: string, args: any = {}, callbacks?: CallCallbacks, isRetry = false) => {
-    errorMsg = null;
-    successMsg = null;
+    // A new call owns the state: the previous one is over, timers included.
+    reset();
 
-    // Schedule the pending state to appear only if the operation takes longer than PENDING_DELAY.
-    pendingDelayTimeoutId = setTimeout(() => {
-      isPending = true;
-    }, PENDING_DELAY);
+    // Only a live connection can answer a request, and a request that waits in
+    // a queue has no deadline to report: an rpc issued while the connection is
+    // down is simply not sent. The state it asserts is re-asserted by a
+    // resilient rpc once the connection is back. The client is asked to
+    // connect all the same: the call itself is the signal that someone is
+    // waiting for the server (e.g. an effect that runs on a route change).
+    if (!context.isConnected()) {
+      context.connect();
+      return;
+    }
 
     // Generate a unique ID for this specific operation instance.
     const id = `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
-
-    const cleanupAndReset = () => {
-      reset();
-      context.unregisterRpcCall(id);
-    };
+    pendingId = id;
+    const isCurrent = () => pendingId === id;
 
     // Register callbacks with the central manager for this specific operation ID.
     context.registerRpcCall(id, {
       onSuccess: (response: string) => {
-        cleanupAndReset();
+        if (!isCurrent()) return;
+        reset();
         successMsg = response; // Typically the correlation ID.
         isOpen = false; // Automatically close the bound dialog on success.
         callbacks?.onSuccess?.(response);
       },
       onError: (errMessage: string) => {
-        cleanupAndReset();
+        if (!isCurrent()) return;
+        reset();
         errorMsg = errMessage;
         toast.error(`RPC call error on topic="${topic}", func="${func}"`, { description: errorMsg });
         callbacks?.onError?.(errMessage);
@@ -158,15 +172,22 @@ export function createRpc(
       },
     });
 
+    // Schedule the pending state to appear only if the operation takes longer than PENDING_DELAY.
+    pendingDelayTimeoutId = setTimeout(() => {
+      if (isCurrent()) isPending = true;
+    }, PENDING_DELAY);
+
     // Set a timeout for the entire operation.
     operationTimeoutId = setTimeout(() => {
-      const customTimeoutError = "RPC call timeout";
-      if (context.hasRpcCall(id)) {
-        cleanupAndReset();
-        errorMsg = customTimeoutError;
-        toast.error(`RPC call timeout on topic="${topic}", func="${func}"`, { description: errorMsg });
-        callbacks?.onError?.(customTimeoutError);
-      }
+      if (!isCurrent()) return;
+      reset();
+      // A call lost with its connection is reported by the page itself
+      // (and a resilient rpc sends it again on the next connection): a timeout
+      // toast here would be noise, not news.
+      if (!context.isConnected()) return;
+      errorMsg = "RPC call timeout";
+      toast.error(`RPC call timeout on topic="${topic}", func="${func}"`, { description: errorMsg });
+      callbacks?.onError?.(errorMsg);
     }, TIMEOUT);
 
     // Build the payload with full type safety.
@@ -204,59 +225,46 @@ export function createRpc(
 }
 
 /**
- * Creates an RPC instance that automatically re-sends its last call upon WebSocket reconnection,
- * crucially waiting for its dependent topic subscription to be confirmed by the server before firing.
+ * Creates an RPC instance that asserts its last call on the connection that
+ * replaced the one carrying it: a reconnect may land on a new backend session,
+ * and the command that set the page up (the language, the config, the preview)
+ * has to run there too.
  *
- * It wraps the base `createRpc` by adding a reactive `$effect` that monitors both
- * the connection generation and the presence of the topic's data.
+ * The call is sent once the topic's subscription is established on the new
+ * connection (see RpcContext.isTopicReady), so the server never answers
+ * "Cannot do RPC before subscribing topic".
  *
- * @param topic - The WebSocket topic this RPC call depends on. Its presence in `websocketClient.topics`
- *                is used as a signal that the subscription is ready.
- * @param context - The RpcContext, typically the `websocketClient` instance.
+ * @param topic - The WebSocket topic this RPC call depends on.
+ * @param context - The RpcContext, typically a `WebsocketManager` instance.
  * @param options - Configuration options, same as `createRpc`.
  * @returns A stateful `Rpc` object with added resilience.
  */
 export function createResilientRpc(topic: string, context: RpcContext, options: RpcOptions = {}): Rpc {
+  let lastCall: { func: string; args: any; callbacks?: CallCallbacks } | null = null;
+  // Connection that carried the last call; -1 while it was never sent.
+  let sentGeneration = -1;
+
   const rpc = createRpc(topic, context, options);
 
-  let lastCall: { func: string; args: any; callbacks?: CallCallbacks } | null = $state(null);
-  let dataGeneration = $state(-1);
-
   $effect(() => {
-    // 1. Read dependencies.
-    const topicReady = websocketClient.topicReady[topic];
-    if (!topicReady) {
-      // if websocket closed, websocketClient will set all topicReady to false
-      // so we can update dataGeneration to the latest connectionGeneration
-      dataGeneration = untrack(() => websocketClient.connectionGeneration);
-      return;
-    }
-
-    const last = untrack(() => lastCall);
-    if (!last) {
-      // No stored call
-      return;
-    }
-    if (untrack(() => rpc.isPending)) {
-      // last call still running
-      return;
-    }
-    const rpcGeneration = untrack(() => dataGeneration);
-    const currentGeneration = untrack(() => websocketClient.connectionGeneration);
-
-    if (rpcGeneration > 0 && rpcGeneration < currentGeneration) {
-      dataGeneration = currentGeneration;
-      // console.log(
-      //   `[Resilient RPC] Topic '${topic}' is ready, re-calling '${last.func}' for connection generation ${currentGeneration}`,
-      // );
-      rpc.call(last.func, last.args, last.callbacks);
-    }
+    // Both signals are read on every run: an effect only re-runs on the
+    // dependencies it read last time, and the guards below change with them.
+    const ready = context.isTopicReady(topic);
+    const generation = context.connectionGeneration;
+    if (lastCall === null || !ready || generation === sentGeneration) return;
+    // The last call was never sent (it was issued while the connection was
+    // down), or was lost with the connection: this one knows nothing about it,
+    // so it is sent now — on a topic whose subscription is already in place.
+    sentGeneration = generation;
+    rpc.call(lastCall.func, lastCall.args, lastCall.callbacks);
   });
 
-  // MODIFIED: Wrap the `call` method to store the arguments and callbacks for later.
   const call = (func: string, args: any = {}, callbacks?: CallCallbacks) => {
     lastCall = { func, args, callbacks };
-    dataGeneration = untrack(() => websocketClient.connectionGeneration);
+    // createRpc sends only on an open connection: record which one carried the
+    // call, or -1 when it was not sent at all (the effect above sends it once
+    // the connection is back and the topic is ready).
+    sentGeneration = context.isConnected() ? context.connectionGeneration : -1;
     rpc.call(func, args, callbacks);
   };
 

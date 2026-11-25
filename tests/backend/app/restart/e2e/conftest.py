@@ -46,6 +46,7 @@ scenario has to race a fixed window.
 import datetime
 import multiprocessing
 import os
+import socket
 import threading
 from types import SimpleNamespace
 
@@ -65,9 +66,9 @@ from alasio.backend.topic._worker import BackendWorkerManager
 from alasio.backend.topic.scan import ConfigScanSource
 from alasio.backend.worker.event import DECODER_CACHE, ConfigEvent
 from alasio.backend.ws.context import GLOBAL_CONTEXT
-from alasio.config.entry.const import ModEntryInfo
 from alasio.config.entry.loader import MOD_LOADER
 from alasio.config.entry.mod import Mod
+from alasio.config.entry.mod_entry import ModEntry, ModEntryModel
 from alasio.config.table.scan import ConfigInfo
 from alasio.deploy.config import model as deploy_config_module
 from alasio.deploy.pack import job as job_module
@@ -292,6 +293,15 @@ class MockWorkerProcess:
 
     The interface is the slice of ``multiprocessing.Process`` the worker
     manager uses: start / is_alive / join / terminate / pid / exitcode.
+
+    The peer owns its end of the pipe. A Windows pipe whose handle is used by
+    two threads at once is not defined: a handle closed twice, or closed under
+    a pending overlapped read by a thread that never owned it, can close a
+    handle that is already gone (or already recycled), and the process dies
+    with an access violation instead of a test failure. So every close goes
+    through ``_close_conn()``, which closes once and under a lock, and the
+    peer reads its pipe without a timeout: waking a parked read is the job of
+    ``terminate()``, exactly like the death of a real worker process.
     """
     # worker mods whose scheduler ignores the graceful stop (see
     # tests/backend/worker/worker_mods.py)
@@ -310,12 +320,19 @@ class MockWorkerProcess:
     # written before it starts polling), like they do with a real worker. A
     # real wait, not time.sleep: the runs freeze time.sleep
     STOP_DELAY = 0.05
+    # How long terminate() waits for a peer to leave before it ends the wait of
+    # the peer itself, see terminate()
+    TERMINATE_TIMEOUT = 1.0
 
     def __init__(self, mod, config, conn, name=''):
         self.mod = mod
         self.config = config
         self.name = name
         self.conn = conn
+        # serializes the report and the close of the peer: both touch the same
+        # pipe handle, and a close under a pending send is as undefined as a
+        # close under a pending read
+        self._conn_lock = threading.Lock()
         self.pid = 0
         self.exitcode = None
         self._thread = None
@@ -340,7 +357,8 @@ class MockWorkerProcess:
         """Report the state of the worker through the pipe (see REPORT_GATE)"""
         try:
             self.REPORT_GATE.wait()
-            self.conn.send_bytes(msgspec.msgpack.encode(ConfigEvent(t='WorkerState', v='running')))
+            with self._conn_lock:
+                self.conn.send_bytes(msgspec.msgpack.encode(ConfigEvent(t='WorkerState', v='running')))
         except OSError:
             # the manager closed the pipe while the report was parked: the
             # entry was finalized without it
@@ -371,8 +389,41 @@ class MockWorkerProcess:
                 threading.Event().wait(self.STOP_DELAY)
         finally:
             self.exitcode = 0
+            self._close_conn()
+
+    def _close_conn(self):
+        """
+        Close the peer end of the pipe, once and from one thread at a time
+
+        ``Connection.close()`` is idempotent but not atomic: two threads that
+        pass the closed check together close the same handle twice, and the
+        second close hits whatever the system handed the number to next. The
+        lock makes the check and the close one step, so the peer leaving by
+        itself and a terminating thread never close together.
+
+        On POSIX the pipe of a duplex ``Pipe()`` is a socketpair, and closing
+        the descriptor does not wake a read blocked in another thread: only
+        data, EOF or ``shutdown()`` do. The shutdown is the one
+        ``WorkerState.conn_close()`` of the manager does (see
+        ``alasio.backend.worker.manager``), so a peer parked in
+        ``recv_bytes()`` leaves at once instead of on the next command.
+        """
+        with self._conn_lock:
+            conn = self.conn
             try:
-                self.conn.close()
+                sock = socket.socket(fileno=conn.fileno())
+            except (AttributeError, OSError, ValueError):
+                # not a socket (the named pipe of a Windows spawn)
+                pass
+            else:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                finally:
+                    sock.detach()
+            try:
+                conn.close()
             except OSError:
                 pass
 
@@ -384,11 +435,21 @@ class MockWorkerProcess:
             self._thread.join(timeout)
 
     def terminate(self):
-        try:
-            self.conn.close()
-        except OSError:
-            pass
-        self.join(1.0)
+        """
+        End the peer, like the manager ends a worker process
+
+        A real worker is a process: terminating it closes its end of the pipe
+        from the outside, and the read of the worker never returns. The peer
+        of the runs is a thread, so the terminating side ends the wait of that
+        thread through the pipe -- the same wake-up the death of a process is.
+        The peer only closes the pipe when it leaves by itself, and
+        ``_close_conn()`` keeps the two closers apart.
+        """
+        if self._thread is not None and not self.is_alive():
+            # the peer left by itself, its pipe is closed already
+            return
+        self._close_conn()
+        self.join(self.TERMINATE_TIMEOUT)
         if self.exitcode is None:
             self.exitcode = -15
 
@@ -546,7 +607,7 @@ class Backend:
                 'cfg_a' on the default mod
             pack_deps (dict[str, Iterable[str]]): {mod name: the names the
                 entry declares for pack updates}, see
-                ModEntryInfo.pack_update_deps. Defaults to None, every mod
+                ModEntry.pack_deps. Defaults to None, every mod
                 declares none
             monkeypatch: The pytest monkeypatch fixture (the manager spawn is
                 watched through it)
@@ -557,9 +618,11 @@ class Backend:
             mods = {'WorkerTestScheduler': f'http://{UPDATE_HOST}'}
         pack_deps = pack_deps or {}
         self.mods = {
-            name: Mod(ModEntryInfo(
-                name=name, root=str(project.mod_root(name)), mirrors=mirrors,
-                pack_update_deps=dict.fromkeys(pack_deps.get(name, ()))))
+            name: Mod(ModEntry(
+                root=str(project.mod_root(name)),
+                data=ModEntryModel.build(
+                    name=name, mirrors=mirrors, pack_deps=tuple(pack_deps.get(name, ())),
+                )))
             for name, mirrors in mods.items()
         }
         if configs is None:

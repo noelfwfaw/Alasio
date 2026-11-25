@@ -5,6 +5,7 @@ from pathlib import Path
 import isort
 import ruff
 
+from alasio.codegen.ruff.stdlist import STD_SET
 from alasio.ext import env
 from alasio.ext.cache import cached_property
 from alasio.ext.concurrent.cmd import parse_result, run_cmd
@@ -51,10 +52,32 @@ def is_valid_py(file):
     return suffix in PY_SUFFIX
 
 
+def to_toml_list(items):
+    """
+    Format strings as a single line TOML array.
+
+    Args:
+        items (list[str]): Items to format
+
+    Returns:
+        str: TOML array, `["assets", "module"]`
+    """
+    quoted = ', '.join(f'"{item}"' for item in items)
+    return f'[{quoted}]'
+
+
 class RuffFormatter:
     LINE_LENGTH = 120
 
-    def __init__(self):
+    def __init__(self, cwd=None):
+        """
+        Args:
+            cwd (str): Project root to work on. Relative paths are resolved
+                against it and the project modules are detected there.
+                Defaults to the project root from the environment, or the
+                current working directory.
+        """
+        self._cwd_override = PathStr.new(os.path.abspath(cwd)) if cwd else None
         _ = self.cwd
         _ = self.ruff_bin
         _ = self.rules
@@ -78,19 +101,14 @@ class RuffFormatter:
                 return env.PROJECT_ROOT
         except Exception:
             pass
-        # maybe module/config/const.py has `entry.root = ...`
-        try:
-            from module.config.const import entry
-            if entry.root:
-                return entry.root
-        except Exception:
-            pass
         # just cwd
         return os.getcwd()
 
     @cached_property
     def cwd(self):
-        cwd = PathStr.new(self._get_cwd())
+        cwd = self._cwd_override
+        if cwd is None:
+            cwd = PathStr.new(self._get_cwd())
         print(f'Ruff format cwd: {cwd}')
         return cwd
 
@@ -118,19 +136,15 @@ class RuffFormatter:
     @cached_property
     def known_first_party(self):
         """
+        Project modules, the folders and python files in cwd.
+
         Returns:
-            str: assets,module,...
+            list[str]: ['assets', 'module', ...]
         """
-        modules = []
-        for folder in self.cwd.iter_foldernames():
-            if is_valid_module(folder):
-                modules.append(folder)
-        for file in self.cwd.iter_files('.py'):
-            stem = file.stem
-            if is_valid_module(stem):
-                modules.append(stem)
-        modules = ','.join(modules)
-        print(f'Ruff known-first-party: {modules}')
+        folders = [folder for folder in self.cwd.iter_foldernames() if is_valid_module(folder)]
+        files = [file.stem for file in self.cwd.iter_files('.py') if is_valid_module(file.stem)]
+        modules = folders + files
+        print(f'Ruff known-first-party: {",".join(modules)}')
         return modules
 
     @cached_property
@@ -145,22 +159,13 @@ class RuffFormatter:
         Returns:
             list[str]: Flattened ['--config', 'KEY = VALUE', ...] arguments
         """
-        def to_list(text: str):
-            items = [f'"{item}"' for item in text.split(',')]
-            items = ', '.join(items)
-            return f'[{items}]'
-
         pairs = [
             f'line-length = {self.LINE_LENGTH}',
-            f'lint.select = {to_list(self.rules)}',
+            f'lint.select = {to_toml_list(self.rules.split(","))}',
             'lint.isort.combine-as-imports = true',
-            f'lint.isort.known-first-party = {to_list(self.known_first_party)}',
+            f'lint.isort.known-first-party = {to_toml_list(self.known_first_party)}',
         ]
-        args = []
-        for pair in pairs:
-            args.append('--config')
-            args.append(pair)
-        return args
+        return [item for pair in pairs for item in ('--config', pair)]
 
     def format_code(self, file: str):
         if os.path.isabs(file):
@@ -212,6 +217,9 @@ class RuffFormatter:
         code = code.decode('utf-8')
         # isort.api.sort_code_string() requires isort>=5.0.0
         # show_diff=False requires requires isort>=5.2.0
+        # known_standard_library overrides the table isort ships, which stops at
+        # python 3.12 and counts the union of 3.6 to 3.12: the code generator
+        # sorts by STD_SET, so isort has to sort by the same names
         new = isort.api.sort_code_string(
             code,
             line_length=self.LINE_LENGTH,
@@ -219,6 +227,10 @@ class RuffFormatter:
             combine_as_imports=True,
             show_diff=False,
             quiet=False,
+            known_standard_library=STD_SET,
+            # The same project modules ruff uses, isort does its own detection
+            # otherwise and would treat an installed project package as third-party
+            known_first_party=list(self.known_first_party),
         )
         if new == code:
             print('Import sorting all good')

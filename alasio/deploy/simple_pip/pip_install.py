@@ -33,15 +33,15 @@ import py_compile
 import stat
 import sys
 import zipfile
-from importlib.util import cache_from_source
 
 from alasio.backport import removeprefix, removesuffix
+from alasio.deploy.simple_pip.pyc import pyc_path
 from alasio.deploy.simple_pip.python_probe import PythonProbe, Scheme, prefix_of
 from alasio.deploy.simple_pip.whl_record import RecordEntry, RecordManager
 from alasio.ext.cache import cached_property
 from alasio.ext.concurrent.threadpool import THREAD_POOL
 from alasio.ext.path import PathStr
-from alasio.ext.path.calc import to_posix
+from alasio.ext.path.calc import is_abspath, subpath_to, to_posix
 from alasio.logger import logger
 
 # Categories of the .data directory of a wheel, PEP 427 maps the files of a
@@ -231,11 +231,19 @@ class DistInfo:
             list[PathStr]: Paths of the directories
         """
         site_packages = self.site_packages
-        inside_prefix = f'{self.prefix}/'
+        prefix = self.prefix
         out = set()
         for path in self.record_paths.values():
             folder = path.uppath()
-            while folder != site_packages and folder.startswith(inside_prefix):
+            # The prefix is a directory of the environment, the root "/" of a
+            # POSIX environment included: subpath_to() checks the boundary at
+            # a separator, a plain f'{prefix}/' would build "//" for the root
+            # and then no directory would be inside of it
+            while (
+                folder != site_packages
+                and folder != prefix
+                and subpath_to(folder, prefix) is not None
+            ):
                 out.add(folder)
                 folder = folder.uppath()
         # The longest path is the deepest directory, it has to be removed first
@@ -322,10 +330,13 @@ class SimplePip:
         """
         Args:
             site_packages (str | PathStr): Path of the site-packages directory,
-                a native path is accepted, it is normalized to the posix style
+                a native path is accepted, it is normalized to the posix style,
+                a posix path without a drive is a path of the current drive on
+                Windows
             prefix (str | PathStr): Root of the python environment. Defaults to
                 None, derived from the layout of site-packages (see prefix_of),
-                from_python() passes the sys.prefix of the interpreter it probed
+                from_python() passes the sys.prefix of the interpreter it probed,
+                the posix style of site_packages applies to it as well
             scheme (Scheme): Install scheme of the environment. Defaults to
                 None, derived from the layout of site-packages (see
                 Scheme.from_layout), from_python() passes the scheme of the
@@ -335,7 +346,13 @@ class SimplePip:
             ValueError: If site_packages or prefix is not an absolute path
         """
         site_packages = PathStr.new(site_packages)
-        if not os.path.isabs(site_packages):
+        # The paths of this module are posix style: an environment of Windows
+        # keeps its drive (E:/envs/alasio/Lib/site-packages), an environment of
+        # another platform starts at the root (/envs/alasio/lib/python3.8).
+        # is_abspath() reads both as absolute, whatever the interpreter: it
+        # does not ask os.path.isabs(), whose answer for a posix path on
+        # Windows changed in python 3.13.
+        if not is_abspath(site_packages):
             raise ValueError(f'site-packages is not an absolute path: "{site_packages}"')
         self.site_packages = site_packages
 
@@ -343,7 +360,7 @@ class SimplePip:
             self.prefix = prefix_of(site_packages)
         else:
             prefix = PathStr.new(prefix)
-            if not os.path.isabs(prefix):
+            if not is_abspath(prefix):
                 raise ValueError(f'prefix is not an absolute path: "{prefix}"')
             self.prefix = prefix
 
@@ -457,6 +474,11 @@ class SimplePip:
         under their real location ("../../Scripts/xxx"), so pip can uninstall
         the installation.
 
+        The wheel is validated as a whole before the environment is touched:
+        every member is resolved to its target first, so an invalid wheel is
+        refused while the previous installation of the distribution is still
+        in place.
+
         Args:
             wheel (str | PathStr): Path of the .whl file
 
@@ -479,29 +501,21 @@ class SimplePip:
                 package_name, _, _ = package_version.partition('-')
                 data_folder = f'{package_version}.data'
 
-                # 3. Uninstall the previous installation of the package
-                self.uninstall(package_name)
+                # 3. Plan the installation before the environment is touched,
+                #    a wheel that is refused leaves the installed version in place
+                members = self._plan_members(zf, dist_info_folder, data_folder, package_name, wheel)
 
-                # 4. Warn about the files that are not installed
+                # 4. Warn about the files that are not installed, before the
+                #    installation can no longer be undone
                 self._warn_entry_points(zf, dist_info_folder)
 
-                # 5. Extract files
+                # 5. Uninstall the previous installation of the package
+                self.uninstall(package_name)
+
+                # 6. Extract files
                 logger.info(f'Installing {package_name} to {self.site_packages}')
                 record = RecordManager()
-                for member in zf.infolist():
-                    if member.is_dir():
-                        continue
-
-                    rel_path = member.filename
-                    # Skip RECORD, the RECORD of the installation is written
-                    # at the end, it lists the files created at install time
-                    if rel_path == f'{dist_info_folder}/RECORD':
-                        continue
-
-                    target = self._member_target(rel_path, data_folder, package_name, wheel)
-                    if target is None:
-                        continue
-
+                for member, target in members:
                     data = zf.read(member)
                     pool.start_thread_soon(self._write_file, target, data, zip_item_is_executable(member))
 
@@ -510,19 +524,19 @@ class SimplePip:
                     record_rel_path = to_posix(os.path.relpath(target, self.site_packages))
                     record.add_content(record_rel_path, data)
 
-        # 6. Compile .py files
+        # 7. Compile .py files
         files = list(record.iter_py_files())
         logger.info(f'Compiling {len(files)} py files')
         with THREAD_POOL.wait_jobs() as pool:
             for entry in files:
                 pool.start_thread_soon(self._create_pyc, record, entry.path)
 
-        # 7. Write INSTALLER
+        # 8. Write INSTALLER
         installer_rel_path = f'{dist_info_folder}/INSTALLER'
         record.add_content(installer_rel_path, b'pip\n')
         (self.site_packages / installer_rel_path).file_write(b'pip\n')
 
-        # 8. Write updated RECORD
+        # 9. Write updated RECORD
         record.add_content(f'{dist_info_folder}/RECORD', None)
         record_file = self.site_packages / dist_info_folder / 'RECORD'
         record_file.file_write(record.dump_bytes())
@@ -556,6 +570,50 @@ class SimplePip:
         if f'{dist_info_folder}/METADATA' not in names:
             raise ValueError(f'Invalid wheel, missing .dist-info/METADATA: {wheel}')
         return dist_info_folder
+
+    def _plan_members(self, zf, dist_info_folder, data_folder, package_name, wheel):
+        """
+        Resolve the install path of every file of a wheel before installing it.
+
+        The wheel is read as a whole before the environment is touched, so a
+        member that would be installed outside of the install directory, or an
+        unknown .data category, aborts the installation while the previous
+        installation of the distribution is still in place. Resolving the
+        targets in the middle of the installation used to remove the previous
+        version first, leaving a half installed tree with no .dist-info to
+        uninstall it by.
+
+        Args:
+            zf (zipfile.ZipFile): Opened wheel
+            dist_info_folder (str): Name of the .dist-info directory
+            data_folder (str): Name of the .data directory, "<name>-<version>.data"
+            package_name (str): Name of the distribution
+            wheel (str): Path of the wheel, for error messages
+
+        Returns:
+            list[tuple[zipfile.ZipInfo, PathStr]]: The members to install and
+                their target, in the order of the wheel
+
+        Raises:
+            ValueError: If a member holds an unknown .data category, or
+                would be installed outside of the install directory
+        """
+        out = []
+        for member in zf.infolist():
+            if member.is_dir():
+                continue
+
+            rel_path = member.filename
+            # Skip RECORD, the RECORD of the installation is written at the
+            # end, it lists the files created at install time
+            if rel_path == f'{dist_info_folder}/RECORD':
+                continue
+
+            target = self._member_target(rel_path, data_folder, package_name, wheel)
+            if target is None:
+                continue
+            out.append((member, target))
+        return out
 
     @staticmethod
     def _warn_entry_points(zf, dist_info_folder):
@@ -643,8 +701,9 @@ class SimplePip:
         """
         py_file = str(self.site_packages / path)
         try:
-            # Compile to .pyc
-            pyc_file = cache_from_source(py_file)
+            # The in-tree name of the installation, see pyc_path() for why it is
+            # not importlib.util.cache_from_source()
+            pyc_file = pyc_path(py_file)
             py_compile.compile(py_file, cfile=pyc_file, dfile=path)
         except Exception as e:
             # Some .py files might not be compilable (e.g. templates, incomplete scripts)

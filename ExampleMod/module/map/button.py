@@ -11,7 +11,7 @@ carries a per server area, a gif template and a binary template; the example mod
 has one server and no gif asset, so none of that is here.
 """
 import cv2
-from module.config.const import entry
+from module.config._index.mod_entry import MOD_ENTRY
 from module.map.utils import area_offset
 
 from alasio.base.image.color import color_similar, get_color
@@ -49,7 +49,7 @@ class Button:
         # the project root, so a module does not depend on the working folder of
         # the process.
         if file and not PathStr.new(file).is_abspath():
-            self.file = entry.root.joinpath(file)
+            self.file = MOD_ENTRY.root.joinpath(file)
 
     def __str__(self):
         return self.name

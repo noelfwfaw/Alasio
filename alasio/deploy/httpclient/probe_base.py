@@ -31,10 +31,13 @@ their resolve() reference this list):
 - a failed request (the failure types the domain declares) makes the instance
   probe the same path once - the mirror that failed stays a candidate, a
   transport failure may be a blip - and retry the request on the winner
-  exactly once. A path this instance already probed stays as it is (one probe
-  per path per instance) and the failure is raised as the answer. No candidate
-  that can serve the path: the original failure is raised as-is, the caller
-  keeps its own fallback (see DeployJob.update()).
+  exactly once. The re-probe runs whether the mirror came from the record or
+  from the probe of this very request: a probe only proves that a candidate
+  serves the path (the default HEAD), not that its content is usable, see
+  AsyncProbe.fetch(). A path an earlier request of this instance probed stays
+  as it is (one probe per path per instance) and the failure is raised as the
+  answer. No candidate that can serve the path: the original failure is raised
+  as-is, the caller keeps its own fallback (see DeployJob.update()).
 
 Every entry of the flow is best effort about the record: the database is a
 hint, a failure of it only makes the next probe run (probe_db).
@@ -95,6 +98,20 @@ class ProbeBase:
             str: The key of this set, e.g. '`repo`', '`repo/alas`'
         """
         return probe_db.key_text(self.SCENE, self.name)
+
+    @property
+    def mirror_url(self):
+        """
+        Url of the mirror resolved for this instance.
+
+        The mirror is resolved by the record of the machine or by a probe of
+        the first request, see the flavor's resolve().
+
+        Returns:
+            str: The url of the resolved mirror, '' when no mirror is resolved
+                yet
+        """
+        return self.mirrors.url_of(self._mirror)
 
     # ------------------------------------------------------------------
     # The record (a hint, see probe_db): synchronous, the async flavor

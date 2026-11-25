@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 
 from alasio.backend.worker.bridge import BackendBridge
 from alasio.backend.worker.event import ConfigEvent
+from alasio.base.background import BackgroundManager
 from alasio.base.exception import (
     EmulatorNotRunningError, GameBugError, GameNotRunningError, GamePageUnknownError, GameStuckError,
     GameTooManyClickError, RequestHumanTakeover, ScriptError, TaskStop
@@ -52,9 +53,10 @@ def interruptable_sleep(second):
     end = time.perf_counter() + second
     backend = BackendBridge()
     while 1:
-        if backend.scheduler_stopping.is_set():
+        # a scheduler-stopping request wakes this wait immediately, while the
+        # timeout keeps the 0.5s poll interval
+        if backend.scheduler_stopping.wait(timeout=0.5):
             raise SchedulerStop
-        time.sleep(0.5)
         if time.perf_counter() >= end:
             return True
 
@@ -216,6 +218,26 @@ class AlasioScheduler(SchedulerTask):
         self.device.on_idle()
         self._send_scheduler_running(None)
 
+    def _on_scheduler_stop(self):
+        """
+        Stop the background manager after the scheduler loop ended
+
+        The pending tasks are dropped, the running tasks are waited for: they
+        are already writing their result, so the script ends when they are
+        done. The counts are read for the log line only, they may change before
+        shutdown() takes the lock and shutdown() itself decides what there is
+        to wait for. Never skip the shutdown because the counts were zero, a
+        task submitted in between would outlive the scheduler.
+        """
+        background = BackgroundManager()
+        running, pending = background.snapshot()
+        if running or pending:
+            logger.info(
+                f'Waiting for {running} unfinished background task(s), '
+                f'dropping {pending} pending task(s)'
+            )
+        background.shutdown(wait=True)
+
     def _wait_future(self, task: str, future: datetime):
         """
         Args:
@@ -264,12 +286,12 @@ class AlasioScheduler(SchedulerTask):
         backend.send_worker_state('scheduler-waiting')
         count = 0
         while 1:
-            time.sleep(0.5)
-            count += 1
-            # check scheduler_stopping every 0.5s
-            if backend.scheduler_stopping.is_set():
+            # a scheduler-stopping request wakes this wait immediately, while the
+            # timeout keeps the 0.5s poll interval of the checks below
+            if backend.scheduler_stopping.wait(timeout=0.5):
                 logger.info('SchedulerStop: backend request scheduler-stopping')
                 raise SchedulerStop
+            count += 1
             # check if reached future
             if getnow() > future:
                 reached = True
@@ -391,5 +413,6 @@ class AlasioScheduler(SchedulerTask):
                 if backend.inited:
                     backend.send_worker_state('error')
                 break
+        self._on_scheduler_stop()
         self._on_task_switch(None)
         self._on_idle()

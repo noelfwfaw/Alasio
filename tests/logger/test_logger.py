@@ -1,6 +1,7 @@
 import re
 
 import pytest
+from exceptiongroup import ExceptionGroup
 
 from alasio.ext import env
 from alasio.ext.path import PathStr
@@ -20,12 +21,16 @@ class BaseLoggerTest:
         """
         # Store original env values
         original_root = env.PROJECT_ROOT
-        original_electron = env.ELECTRON
+        original_electron = env.ELECTRON_PID
+        # the level is a global of the logger: a test that raises it (DEBUG) has
+        # to put it back, or every later capture in the same worker holds the
+        # debug lines of the code under test
+        original_level = logger._level
 
         # Create temp directory for test logs
         self.test_dir = PathStr.new(__file__).uppath(1)
         env.PROJECT_ROOT = self.test_dir
-        env.ELECTRON = ""
+        env.ELECTRON_PID = ""
 
         # init fd
         writer = LogWriter()
@@ -40,7 +45,8 @@ class BaseLoggerTest:
 
         # Restore original env values
         env.PROJECT_ROOT = original_root
-        env.ELECTRON = original_electron
+        env.ELECTRON_PID = original_electron
+        logger.set_level(original_level)
 
         # Clean up log directory
         log_dir = self.test_dir / 'log'
@@ -545,3 +551,128 @@ class TestLoggerException(BaseLoggerTest):
         # Verify nested group
         assert "nested errors" in content
         assert "nested error 1" in content
+
+    def test_exception_outside_except_block(self):
+        """
+        Nothing is being handled, so there is no traceback to render: the
+        message is logged alone, like error() logs it
+        """
+        with logger.mock_capture_writer() as capture:
+            logger.exception('No exception is being handled')
+
+        assert capture.concat() == 'ERROR | No exception is being handled\n'
+        assert 'e' not in capture.backend.logs[0]
+
+    def test_exception_object_outside_except_block(self):
+        """
+        The traceback of exception() is the one of the exception being
+        handled, not the one of the object being logged, so an exception
+        logged after its block keeps its message alone. A caller that logs it
+        later passes `exc_info=<exception>`
+        """
+        exc = ValueError('Invalid value')
+
+        with logger.mock_capture_writer() as capture:
+            logger.exception(exc)
+
+        assert capture.concat() == 'ERROR | ValueError: Invalid value\n'
+        assert 'e' not in capture.backend.logs[0]
+
+    def test_exception_with_exc_info_object(self):
+        """
+        exc_info names the exception to render, so it can be logged outside
+        the block that raised it
+        """
+        try:
+            raise ValueError('Stored error')
+        except ValueError as e:
+            stored = e
+
+        with logger.mock_capture_writer() as capture:
+            logger.exception('Logging a stored error', exc_info=stored)
+
+        head, _, traceback = capture.concat().partition('\n')
+        assert head == 'ERROR | Logging a stored error'
+        assert 'ValueError: Stored error' in traceback
+        assert 'e' in capture.backend.logs[0]
+
+    def test_exception_with_exc_info_false(self):
+        """
+        exc_info=False keeps the message alone even inside an except block
+        """
+        with logger.mock_capture_writer() as capture:
+            try:
+                raise ValueError('Not rendered')
+            except ValueError:
+                logger.exception('No traceback', exc_info=False)
+
+        assert capture.concat() == 'ERROR | No traceback\n'
+        assert 'e' not in capture.backend.logs[0]
+
+    @pytest.mark.parametrize('event, expected', [
+        (ValueError, 'ValueError'),
+        (123, '123'),
+        (None, 'None'),
+    ])
+    def test_exception_with_non_str_event(self, event, expected):
+        """
+        Whatever is logged is stringified like the other levels do, instead of
+        reaching the message formatter as an object
+        """
+        with logger.mock_capture_writer() as capture:
+            logger.exception(event)
+
+        assert capture.concat() == f'ERROR | {expected}\n'
+
+    def test_exception_message_matches_error(self):
+        """
+        exception() renders the message of an exception the same way error()
+        does, and adds the traceback on top of it
+        """
+        exc = ValueError('Invalid value')
+
+        with logger.mock_capture_writer() as capture:
+            logger.error(exc)
+            logger.exception(exc)
+
+        assert [log['m'] for log in capture.backend.logs] == [
+            'ValueError: Invalid value',
+            'ValueError: Invalid value',
+        ]
+
+    def test_exception_group_outside_except_block(self):
+        """
+        A group carries its own traceback, so it still renders one after the
+        block that raised it
+        """
+        try:
+            raise ExceptionGroup('multiple errors', [ValueError('error 1')])
+        except ExceptionGroup as e:
+            group = e
+
+        with logger.mock_capture_writer() as capture:
+            logger.exception(group)
+
+        head, _, traceback = capture.concat().partition('\n')
+        assert head == 'ERROR | ExceptionGroup: multiple errors (1 sub-exception)'
+        assert 'ValueError: error 1' in traceback
+        assert 'Sub-exception' in traceback
+
+    def test_exception_group_message_matches_error(self):
+        """
+        A group is stringified like it is at the other levels: the title and the
+        tree of the sub-exceptions, the same message error() logs
+        """
+        group = ExceptionGroup('multiple errors', [ValueError('error 1'), TypeError('error 2')])
+
+        with logger.mock_capture_writer() as capture:
+            logger.error(group)
+            logger.exception(group)
+
+        assert [log['m'] for log in capture.backend.logs] == [
+            """\
+ExceptionGroup: multiple errors (2 sub-exceptions)
+- ExceptionGroup: multiple errors (2 sub-exceptions)
+  - ValueError: error 1
+  - TypeError: error 2""",
+        ] * 2

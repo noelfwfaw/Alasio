@@ -7,11 +7,26 @@ import { vitePreprocess } from "@sveltejs/vite-plugin-svelte";
 import tailwindcss from "@tailwindcss/vite";
 import { type Plugin, defineConfig } from "vite";
 import electron from "vite-plugin-electron";
-import { cspInlineHashDev } from "./scripts/csp-inline-hash/vite.ts";
+import { rendererCsp } from "./scripts/csp/config.ts";
 import { mainI18nConfig, rendererI18nConfig } from "./scripts/i18n/config.ts";
 import { i18nPlugin } from "./scripts/i18n/vite.ts";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
+
+/**
+ * Path aliases of the renderer tree. The type checker reads the same names from
+ * `paths` in tsconfig.json; SvelteKit 3 removed `files.lib` and deprecated its
+ * `alias` option, so `$lib` (which pointed at `files.lib`) is declared here.
+ * `$shared` is the one tree outside `renderer/`: the modules the main process,
+ * the preload and the renderer all use (the IPC channel names, the route the
+ * window reopens).
+ */
+const rendererAliases: Record<string, string> = {
+  $lib: join(__dirname, "renderer/lib"),
+  $src: join(__dirname, "renderer"),
+  $routes: join(__dirname, "renderer/routes"),
+  $shared: join(__dirname, "shared"),
+};
 
 /**
  * vite's mergeConfig replaces array values, so the `server.watch.ignored`
@@ -119,6 +134,9 @@ function svelteKitGeneratedHmrGuard(): Plugin {
 }
 
 export default defineConfig({
+  resolve: {
+    alias: rendererAliases,
+  },
   // i18nPlugin is listed first so its config hook scans sources before the
   // sveltekit build starts. It owns every i18n config of the project:
   // only this top-level config is resolved by `svelte-kit sync`, so the
@@ -142,18 +160,14 @@ export default defineConfig({
 
       // Keep the existing electron project layout under renderer/
       files: {
-        lib: "renderer/lib",
         routes: "renderer/routes",
         appTemplate: "renderer/app.html",
       },
 
-      // Path aliases are declared here instead of tsconfig.json "paths",
-      // so svelte-kit sync generates them into .svelte-kit/tsconfig.json.
-      // $lib is generated automatically from kit.files.lib.
-      alias: {
-        $src: "renderer",
-        $routes: "renderer/routes",
-      },
+      // The policy is written by SvelteKit (a meta tag in the built page, the
+      // response header in dev); scripts/csp/config.ts computes it from
+      // renderer/app.html, its inline script needs a hash per algorithm.
+      csp: rendererCsp(),
     }),
     tailwindcss(),
     electron([
@@ -197,9 +211,6 @@ export default defineConfig({
     },
     svelteKitGeneratedHmrGuard(),
     ignoreBuildOutput("**/dist/**"),
-    // dev: intercept html responses before sveltekit injects its
-    // bootstrap script (enforce pre inside the plugin)
-    cspInlineHashDev(),
   ],
   server: {
     fs: {

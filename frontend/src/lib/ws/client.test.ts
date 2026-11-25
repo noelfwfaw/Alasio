@@ -293,18 +293,37 @@ describe("TestTopicReady", () => {
     expect(client.topicReady).toEqual({});
   });
 
-  it("tracks ready state per topic after subscription", () => {
+  it("marks a topic ready once its subscribe is on the wire", () => {
+    // A topic is usable for rpcs as soon as its subscribe message has been
+    // sent: both travel in order over one socket, so the server registers the
+    // subscription before it reads the rpc. Data is a separate matter (Preview
+    // pushes none at all).
     const client = new WebsocketManager();
     client.connect();
     FakeWebSocket.last!.serverOpen();
-    client.sub("ConfigScan");
-    FakeWebSocket.last!.serverMessage(JSON.stringify({ t: "ConfigScan", o: "full", v: [] }));
 
-    expect(client.topicReady).toEqual({ ConnState: true });
+    client.sub("ConfigScan");
+    expect(client.topicReady).toEqual({ ConnState: true, ConfigScan: true });
+    expect(client.isTopicReady("ConfigScan")).toBe(true);
+    expect(client.isTopicReady("Preview")).toBe(false);
 
     client.unsub("ConfigScan");
     expect(client.topicReady).toEqual({ ConnState: true });
     expect(client.topics).not.toHaveProperty("ConfigScan");
+  });
+
+  it("marks the re-subscribed topics ready on the new connection", () => {
+    const client = new WebsocketManager();
+    client.connect();
+    FakeWebSocket.last!.serverOpen();
+    client.sub("Preview");
+
+    const ws = dropAndReconnect(1000);
+    expect(client.isTopicReady("Preview")).toBe(false);
+
+    ws.serverOpen();
+    expect(lastSent(ws)).toEqual({ t: "Preview" });
+    expect(client.isTopicReady("Preview")).toBe(true);
   });
 });
 
@@ -1081,6 +1100,20 @@ describe("TestMessageQueue", () => {
     expect(lastSent(FakeWebSocket.last!)).toEqual({ t: "ConfigScan" });
   });
 
+  it("sends the subscription before the messages that waited for the connection", () => {
+    // An rpc of a topic whose subscribe is still on its way would be rejected
+    // with "Cannot do RPC before subscribing topic".
+    const client = new WebsocketManager();
+    client.sub("Preview");
+    client.sendRaw({ t: "Preview", o: "rpc", f: "preview_start", v: {}, i: "rpc-1" });
+
+    FakeWebSocket.last!.serverOpen();
+    expect(FakeWebSocket.last!.sent.map(parseSent)).toEqual([
+      { t: "Preview" },
+      { t: "Preview", o: "rpc", f: "preview_start", v: {}, i: "rpc-1" },
+    ]);
+  });
+
   it("serializes the payload with the exact protocol shape", () => {
     const client = new WebsocketManager();
     client.sendRaw({ t: "ConfigScan", o: "rpc", f: "config_add", v: { name: "a" }, i: "rpc-1" });
@@ -1088,6 +1121,50 @@ describe("TestMessageQueue", () => {
     expect(decodeText(FakeWebSocket.last!.sent[0] as ArrayBuffer)).toBe(
       '{"t":"ConfigScan","o":"rpc","f":"config_add","v":{"name":"a"},"i":"rpc-1"}',
     );
+  });
+});
+
+describe("TestDisconnectedPageRecovery", () => {
+  /** Drives the client through a full outage: the retries run out. */
+  function exhaustRetries() {
+    for (const delay of [1000, 2000, 4000, 8000, 16000]) {
+      FakeWebSocket.last!.serverClose(1006);
+      vi.advanceTimersByTime(delay);
+    }
+    // The sixth failure hits the attempt cap: the page is invalidated and the
+    // client stops trying on its own.
+    FakeWebSocket.last!.serverClose(1006);
+    expect(invalidateAll).toHaveBeenCalled();
+    expect(FakeWebSocket.last!.readyState).toBe(FakeWebSocket.CLOSED);
+  }
+
+  it("does not let the last page's unsub kill the subscription of the page the retry re-mounts", () => {
+    // The disconnected page unmounts its topic subscribers while the client
+    // is still offline. The unsub has nothing to cancel on a connection that
+    // is not open, and queuing it made it arrive after the subscribe of the
+    // page the retry button re-mounts: the fresh subscription was dropped
+    // server-side, and the next rpc failed with "Cannot do RPC before
+    // subscribing topic".
+    const client = new WebsocketManager();
+    client.connect();
+    FakeWebSocket.last!.serverOpen();
+    client.sub("Preview");
+    expect(lastSent(FakeWebSocket.last!)).toEqual({ t: "Preview" });
+
+    exhaustRetries();
+    const created = FakeWebSocket.instances.length;
+
+    client.unsub("Preview");
+    // Leaving the page does not start a connection attempt on its own.
+    expect(FakeWebSocket.instances).toHaveLength(created);
+    expect(client.subscriptions).toEqual({});
+
+    // The user clicks retry before the connection is back: the page mounts
+    // and subscribes again, then the connection opens.
+    client.sub("Preview");
+    FakeWebSocket.last!.serverOpen();
+
+    expect(FakeWebSocket.last!.sent.map(parseSent)).toEqual([{ t: "Preview" }]);
   });
 });
 

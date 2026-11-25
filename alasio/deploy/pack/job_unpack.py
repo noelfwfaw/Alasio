@@ -72,20 +72,24 @@ class UnpackJob(JobBase):
         Args:
             data (bytes | PackDecodeBase): Full pack data: the validated
                 decoder of ServerFile.get_full_pack() (reused as it is, the
-                pack is not decoded a second time), or raw bytes, which
-                unpack() decodes and validates
+                pack is not decoded a second time), raw bytes, which
+                unpack() decodes and validates, or an object of the same
+                shape over a pack already in memory (see
+                alasio.deploy_dev.pack_server.repo_export.PackFullView)
             root (str, optional): Folder to update. Defaults to None,
                 env.PROJECT_ROOT
             name (str, optional): Ledger key of the target. Defaults to
                 '', the project tree target
         """
-        if isinstance(data, PackDecodeBase):
-            # the pack of ServerFile.get_full_pack(), already validated: the
-            # decoder is reused as it is (no second decode / checksum)
+        if isinstance(data, (bytes, bytearray, memoryview)):
+            self._decoder = None
+        else:
+            # a decoder: the validated pack of a download, or a view over the
+            # encoder of a pack this run wrote. Its data is the serialized
+            # pack, empty when the pack is not assembled in the memory (the
+            # job file is the caller's to skip then)
             self._decoder = data
             data = data.data
-        else:
-            self._decoder = None
         super().__init__(data, root=root, name=name)
 
     async def run(self):
@@ -184,7 +188,7 @@ class UnpackJob(JobBase):
         # and it joins the records of the job file of a previous run
         # (read before this run replaced it): a file that only an
         # intermediate version has is in neither base alone
-        old_fileinfo = {**self._old_fileinfo_from_index(), **self.residue_fileinfo}
+        old_fileinfo = {**self.old_fileinfo, **self.residue_fileinfo}
 
         # unpack index
         index_tmp = self.workspace.joinpath(self.NEW_INDEX)

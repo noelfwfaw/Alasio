@@ -367,6 +367,31 @@ class BaseTopic(AsyncReactiveCallback, BaseMixin, metaclass=SingletonNamed):
             self._nursery = trio.lowlevel.current_task().parent_nursery
         await self._resubscribe
 
+    async def wait_mod_ready(self, mod_name):
+        """
+        [Trio] Wait until the models and the json of a mod are warm
+
+        A topic whose view reads a mod calls this with the mod it resolved,
+        before building that view: the request then waits for the background
+        warmup in the event loop instead of loading the same files a second
+        time in its own thread. Topics whose data does not come from a mod
+        never call it, so they are never delayed by, and never depend on, the
+        selected mod.
+
+        The wait is bounded by the warmup of one mod and ends on failure too
+        (see ModPreload); an empty name (no config selected) and a mod this
+        process does not warm up (a worker imports the game script, which
+        imports the models itself) do not wait.
+
+        Args:
+            mod_name (str): Mod the caller is about to read
+        """
+        # local import: the topic layer imports this module, and the config
+        # entry layer must stay out of the import graph of a worker
+        from alasio.config.entry.preload import MOD_PRELOAD
+
+        await MOD_PRELOAD.wait(mod_name)
+
     async def get_source(self):
         """
         Resolve the source this topic should bind to.
@@ -382,6 +407,11 @@ class BaseTopic(AsyncReactiveCallback, BaseMixin, metaclass=SingletonNamed):
         TaskQueue / one-shot sources / DevAssets) must `await
         source.reinit()` before returning. Sources without a full data
         source have an empty reinit, calling it costs nothing.
+
+        A topic whose view reads a mod must `await self.wait_mod_ready(mod)`
+        first, with the mod it resolved: that is the only place the warmup
+        of a mod delays a round, so a topic that does not read a mod is
+        never delayed by, and never depends on, the selected one.
 
         May await ConnState etc. reactive dependencies; they form the
         observation chain that re-runs _resubscribe on changes, so a
@@ -434,6 +464,13 @@ class BaseTopic(AsyncReactiveCallback, BaseMixin, metaclass=SingletonNamed):
         try:
             if method.require_electron or self.REQUIRE_ELECTRON:
                 self._check_electron()
+            # an rpc validates with the model of its mod: wait for the warmup
+            # of the mod before the call runs. The read happens here, outside
+            # any reactive computation, so it registers no dependency.
+            from alasio.backend.topic.state import ConnState
+
+            state = ConnState(self.conn_id, self.server)
+            await self.wait_mod_ready(await state.mod_name)
             await method.call_async(self, value)
         except (ValidationError, DecodeError, UnicodeDecodeError, AccessDenied, RpcValueError) as e:
             # input errors

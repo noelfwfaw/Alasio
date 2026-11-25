@@ -6,6 +6,7 @@ from alasio.ext import env
 from alasio.ext.cache import cached_property_threadsafe
 from alasio.ext.path import PathStr
 from alasio.ext.path.atomic import atomic_open
+from alasio.ext.path.validate import validate_filename
 from alasio.ext.singleton import Singleton
 
 if TYPE_CHECKING:
@@ -17,7 +18,7 @@ if TYPE_CHECKING:
 class LogWriter(metaclass=Singleton):
     def __init__(self):
         self.create_date: "date | None" = None
-        self.is_electron = bool(env.ELECTRON)
+        self.is_electron = bool(env.ELECTRON_PID)
 
     @cached_property_threadsafe
     def backend(self) -> "BackendBridge | PseudoBackendBridge":
@@ -29,29 +30,85 @@ class LogWriter(metaclass=Singleton):
             return PseudoBackendBridge()
 
     @cached_property_threadsafe
-    def file(self):
-        root = env.PROJECT_ROOT.abspath()
-        folder = root / 'log'
-        self.create_date = date.today()
+    def name(self):
+        """
+        Name of the file the next line is written to.
 
+        A write goes to the file of the process until a block gives the lines
+        a file of their own, see set_name(). It is a cached property like the
+        rest of the writer, so the name and the path and the fd of the file
+        are switched under the same lock and dropped together.
+
+        The name of the process comes from sys.argv[0]: `python -m a.b` sets
+        it to the path of the module file, so its stem is the module name
+        ('main' for `python -m pack_server.main`), while `python -m a` runs
+        a/__main__.py, whose stem says nothing, and the folder of the module
+        is the name then.
+
+        Returns:
+            str: Name of the file, without the date and the suffix
+        """
         if self.backend.inited:
-            name = self.backend.config_name
-            # write logs to xxx/log/2020-01-01_{config_name}.txt
-            return folder / f'{self.create_date}_{name}.txt'
+            return self.backend.config_name
+        path = PathStr.new(sys.argv[0])
+        if path.rootstem == '__main__':
+            # python -m package -> .../package/__main__.py
+            return PathStr.new(path.uppath(1)).name
+        return path.rootstem
+
+    @cached_property_threadsafe
+    def file(self):
+        # the date is read once and kept: check_rotate() compares it with the
+        # date of the day, and a second read here could name a file of another
+        # day than the one the writer rotated for
+        self.create_date = date.today()
+        return env.PROJECT_ROOT.abspath() / 'log' / f'{self.create_date}_{self.name}.txt'
+
+    def set_name(self, name):
+        """
+        Write the following lines into log/{date}_{name}.txt.
+
+        A process that runs several units of work one after another (the pack
+        server runs one config at a time) gives each its own file, so the
+        lines of one unit are read without the lines of the others. The file
+        of the previous unit is closed here: the next line opens the new one.
+        The name is a file name, not a path: a name that is not usable is
+        refused instead of writing outside the log folder.
+
+        Args:
+            name (str): Name of the file, without the date and the suffix.
+                None for the default name of the process
+
+        Returns:
+            str: The name that was set before this call, None when the file was
+                the one of the process, so a caller can restore it
+
+        Raises:
+            ValueError: If the name is not a single usable file name
+        """
+        if name is not None:
+            validate_filename(name)
+        # read the cached name without calculating it: a writer that never
+        # named a block has none in the cache, and the file of the process is
+        # in force then
+        previous = cached_property_threadsafe.get(self, 'name', None)
+        if name == previous:
+            # the file in force already has this name: nothing to close and
+            # nothing to recalculate
+            return previous
+        if name is None:
+            # back to the file of the process, computed from sys.argv[0]
+            cached_property_threadsafe.pop(self, 'name', None)
         else:
-            # xxx/path/module.py -> module
-            name = PathStr.new(sys.argv[0]).rootstem
-            # write logs to xxx/log/2020-01-01_{module_name}.txt
-            return folder / f'{self.create_date}_{name}.txt'
+            cached_property_threadsafe.set(self, 'name', name)
+        # the file of the previous name is closed here: the next line opens the
+        # file of the new name
+        self.close_fd()
+        return previous
 
     @cached_property_threadsafe
     def fd(self):
-        file = self.file
-        try:
-            return atomic_open(file, mode='a', encoding='utf-8')
-        except FileNotFoundError:
-            file.uppath().makedirs(exist_ok=True)
-            return atomic_open(file, mode='a', encoding='utf-8')
+        return atomic_open(self.file, mode='a', encoding='utf-8')
 
     @cached_property_threadsafe
     def stdout(self):
@@ -84,6 +141,9 @@ class LogWriter(metaclass=Singleton):
         self._close_fd_value(fd)
 
     def close(self):
+        # the name belongs to the block that set it: a closed writer is the
+        # default one of the process again
+        cached_property_threadsafe.pop(self, 'name')
         cached_property_threadsafe.pop(self, 'backend')
         cached_property_threadsafe.pop(self, 'file')
         cached_property_threadsafe.pop(self, 'stdout')
@@ -344,6 +404,14 @@ class CaptureWriter:
 
     def check_rotate(self):
         pass
+
+    def set_name(self, name):
+        """
+        A captured run writes nowhere, so there is no file to name.
+
+        Args:
+            name (str): Ignored, the name of the block that is running
+        """
 
     def close(self):
         pass

@@ -2,60 +2,65 @@ from collections import defaultdict
 
 from msgspec import ValidationError
 
-import alasio.config.entry.const as const
 from alasio.config.entry.mod import Mod
+from alasio.config.entry.mod_entry import MOD_FOLDERS, ModEntry
 from alasio.config.entry.model import ConfigSetEvent
 from alasio.config.entry.utils import validate_nav_name
 from alasio.ext import env
 from alasio.ext.cache import cached_property
 from alasio.ext.deep import *
-from alasio.ext.file.loadpy import LOADPY_CACHE
 from alasio.ext.file.msgspecfile import deepcopy_msgpack
-from alasio.ext.path.calc import is_abspath, joinnormpath
+from alasio.ext.path.calc import joinnormpath
 from alasio.logger import logger
 
 
 class ModLoader:
-    def __init__(self, root=None, dict_mod_entry=None):
+    def __init__(self, root=None, mod_folders=None):
         """
         Args:
             root (PathStr): Absolute path to run path
-            dict_mod_entry (dict[str, ModEntryInfo]):
-                see const.DICT_MOD_ENTRY
+            mod_folders (tuple[str, ...]): Folders next to the root that may
+                hold a mod, see MOD_FOLDERS. Defaults to None, the
+                folders of the library
         """
         if root is None:
             root = env.PROJECT_ROOT
         self.root = root
-        if dict_mod_entry is None:
+        if mod_folders is None:
             # dynamic use, just maybe someone want to monkeypatch it
-            dict_mod_entry = const.DICT_MOD_ENTRY
-        self.dict_mod_entry = dict_mod_entry
+            mod_folders = MOD_FOLDERS
+        self.mod_folders = mod_folders
 
     @cached_property
     def self_mod(self):
         """
+        The mod declared by the project root itself, when it declares one.
+
         Returns:
             Mod | None:
         """
-        file = self.root.joinpath('module/config/const.py')
+        entry = ModEntry(self.root)
         try:
-            module = LOADPY_CACHE.get(file)
-        except ImportError:
-            return None
-        try:
-            entry = module.entry
-            if not isinstance(entry, const.ModEntryInfo):
-                return None
-            # try to access name
-            if not isinstance(entry.name, str):
-                return None
-        except (AttributeError, TypeError):
+            # the declaration is read here, so a broken one is reported at
+            # startup instead of at the first use of the mod
+            _ = entry.data
+        except FileNotFoundError:
+            # the project root is not a mod, the mods next to it are
             return None
         return Mod(entry)
 
     @cached_property
     def dict_mod(self):
         """
+        The mods of the library: the project root itself and the folders
+        declared by MOD_FOLDERS that hold a valid declaration.
+
+        A folder without ``module/config/_index/mod_entry.yaml`` is not a mod
+        and is skipped, a folder that declares one is a mod whether or not its
+        config index is generated. A folder whose declaration cannot be read
+        is reported and skipped: one broken mod must not take the backend
+        down.
+
         Returns:
             dict[str, Mod]:
                 key: mod_name
@@ -69,22 +74,20 @@ class ModLoader:
             out[self_mod.name] = self_mod
 
         # add sub mods
-        for entry in self.dict_mod_entry.values():
-            # No duplicate or nested mod
-            if entry.name in out:
+        for folder in self.mod_folders:
+            root = joinnormpath(env.PROJECT_ROOT, folder)
+            entry = ModEntry(root)
+            # the declaration is read here, so a broken one is reported now
+            # instead of at the first use of the mod
+            if not entry.validate():
                 continue
-            if not entry.root:
-                # logger.warning(f'Mod entry root empty: name={name}, entry={entry.root}')
-                # continue
-                entry.root = env.PROJECT_ROOT
-            elif not is_abspath(entry.root):
-                entry.root = joinnormpath(env.PROJECT_ROOT, entry.root)
-            # folder must be mod like
-            if not entry.exist():
+            name = entry.name
+            # No duplicate or nested mod
+            if name in out:
                 continue
             # set
             mod = Mod(entry)
-            out[entry.name] = mod
+            out[name] = mod
 
         return out
 
@@ -121,7 +124,7 @@ class ModLoader:
 
         Args:
             mod_name (str):
-            lang (str):
+            lang (str): GUI language to read, taken as is
 
         Returns:
             dict[str, dict[str, dict]]:
@@ -145,16 +148,10 @@ class ModLoader:
             # Copy the whole meta, so scheduler and future attributes pass
             # through unchanged, only the i18n gets flattened.
             row = dict_copy(meta)
-            # no such language, try "en-US", then use keypath
             name = deep_get(row, ['i18n', lang])
             if name is None:
-                name = deep_get(row, ['i18n', 'en-US'])
-                # still no luck, use key as name
-                if name is None:
-                    if card_name == '_info':
-                        name = nav_name
-                    else:
-                        name = card_name
+                # no such language, use key as name
+                name = nav_name if card_name == '_info' else card_name
             # flatten i18n: keep the name of the requested language only
             row['i18n'] = name
             out[nav_name][card_name] = row
@@ -166,7 +163,8 @@ class ModLoader:
             mod_name (str):
             config_name (str):
             nav_name (str):
-            lang (str):
+            lang (str): GUI language to read, taken as is: the caller resolves
+                it against the gui_language of the mod
 
         Returns:
 
@@ -211,13 +209,14 @@ class ModLoader:
                 except KeyError:
                     # this shouldn't happen
                     continue
-                # insert i18n
-                i18n_data = deep_get(i18n, [group_name, arg_name, lang], default='')
-                try:
-                    group_data.update(i18n_data)
-                except TypeError:
-                    # this shouldn't happen, as i18n_data should be dict
-                    continue
+                # insert i18n, a missing translation leaves the row as it is
+                i18n_data = deep_get(i18n, [group_name, arg_name, lang])
+                if i18n_data:
+                    try:
+                        group_data.update(i18n_data)
+                    except TypeError:
+                        # this shouldn't happen, as i18n_data should be dict
+                        pass
                 continue
 
             # normal args
@@ -230,13 +229,14 @@ class ModLoader:
                     # this shouldn't happen
                     continue
                 i18n_group = arg_data.get('i18ngroup', group_name)
-                # insert i18n
-                i18n_data = deep_get(i18n, [i18n_group, arg_name, lang], default='')
-                try:
-                    arg_data.update(i18n_data)
-                except TypeError:
-                    # this shouldn't happen, as i18n_data should be dict
-                    continue
+                # insert i18n, a missing translation leaves the row as it is
+                i18n_data = deep_get(i18n, [i18n_group, arg_name, lang])
+                if i18n_data:
+                    try:
+                        arg_data.update(i18n_data)
+                    except TypeError:
+                        # this shouldn't happen, as i18n_data should be dict
+                        pass
 
                 # insert config
                 if arg_name == '_info':
@@ -348,22 +348,29 @@ class ModLoader:
                   for task_group in list_task_group]
         return mod.config_group_batch_reset(config_name, events)
 
-    def get_queue_i18n(self, mod_name):
+    def get_queue_i18n(self, mod_name, lang):
         """
+        Get the display name of every task of the task queue.
+
         Args:
             mod_name (str):
+            lang (str): GUI language to read, taken as is: the caller resolves
+                it against the gui_language of the mod
 
         Returns:
-            dict[str, dict[str, str]]:
-                key: {task_name}.{lang}
-                value: i18n translation
+            dict[str, str]:
+                key: {task_name}
+                value: name of the task in the requested language, the task
+                    name itself when the language has no translation
         """
         try:
             mod = self.dict_mod[mod_name]
         except KeyError:
             logger.warning(f'No such mod: "{mod_name}"')
-            return []
-        return mod.queue_index_data()
+            return {}
+        # {task_name}.{lang}=i18n -> {task_name}=i18n
+        data = mod.queue_index_data()
+        return {task: i18n.get(lang, task) for task, i18n in deep_iter_depth1(data)}
 
 
 MOD_LOADER = ModLoader(env.PROJECT_ROOT)

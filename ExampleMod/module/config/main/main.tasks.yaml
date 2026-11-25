@@ -14,12 +14,10 @@ Main:
     EnemyPriority:
     Hard: CampaignHard
   displays:
-    - info: Main
-      groups: Scheduler
+    - [{ info: Main }, Scheduler]
     - Campaign
     - StopCondition
-    - info: Fleet
-      groups: [ Fleet1, Fleet2 ]
+    - [{ info: Fleet }, Fleet1, Fleet2]
     - [ Emotion, Emotion1, Emotion2 ]
     - Submarine
     - HpControl

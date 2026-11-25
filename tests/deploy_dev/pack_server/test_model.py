@@ -13,14 +13,18 @@ import pytest
 from alasio.deploy_dev.pack_server import model
 from alasio.deploy_dev.pack_server.gate import RunDirError, check_run_dir
 from alasio.deploy_dev.pack_server.model import (
-    LookbackConfig, PackRepoConfig, PackRepoModel, PythonDepsConfig, PythonMirrorInfo, RepoConfig
+    ConfigError, EnvConfig, LookbackConfig, PackRepoConfig, PackRepoModel, RepoConfig
 )
 from alasio.ext import env
-from alasio.ext.file.yamlconfig import build_help_map
+from alasio.ext.file.yamlconfig import ANY_KEY, build_help_map
 from alasio.ext.file.yamlfile import yaml_loads
 from alasio.ext.path import PathStr
 from alasio.logger import logger
 from alasio.testing.filesystem import fs  # noqa: F401
+
+pytestmark = [
+    pytest.mark.parallel,
+]
 
 FILE = 'LmeSzinc_AzurLaneAutoScript.yaml'
 
@@ -60,15 +64,28 @@ def read_config(file):
         return yaml_loads(f.read().encode('utf-8'))
 
 
-def iter_help_line():
+def iter_help_line(help_map=None):
     """
-    Iter the help lines of PackRepoModel, the comment lines YamlConfig writes
-    above the keys of the generated file
+    Iter the help lines of the default PackRepoModel, the comment lines
+    YamlConfig writes above the keys of the generated file
+
+    The help map describes the model, and the default model publishes nowhere,
+    so the lines of a remote have no key in the file to be written above: a
+    path through ANY_KEY is skipped. The example of the group comment is the
+    documentation of the remote fields instead.
+
+    Args:
+        help_map (dict): {path: help_text | None} map of the model, the whole
+            map by default
 
     Yields:
         str: Help text line, the text after the "# " of a comment line
     """
-    for help_text in build_help_map(PackRepoModel).values():
+    if help_map is None:
+        help_map = build_help_map(PackRepoModel)
+    for path, help_text in help_map.items():
+        if help_text is None or ANY_KEY in path:
+            continue
         yield from ([help_text] if isinstance(help_text, str) else help_text)
 
 
@@ -93,48 +110,28 @@ class TestLookbackConfig:
         assert LookbackConfig().AdditionalCommit == []
 
 
-class TestPythonMirrorInfo:
-    """One download source of the dependencies of a PypiMirror list."""
+class TestEnvConfig:
+    """The environment of the machine the pack server runs on."""
 
     def test_default(self):
-        """The default entry downloads from the official PyPI."""
-        info = PythonMirrorInfo()
-        assert info.Url == 'https://pypi.org/simple'
-        assert info.Deps == []
-
-    def test_default_not_shared(self):
-        """The default dependency list is not shared among instances, a filled one stays empty."""
-        first = PythonMirrorInfo(Deps=['httpx'])
-        first.Deps.append('trio')
-        assert PythonMirrorInfo().Deps == []
-
-
-class TestPythonDepsConfig:
-    """The python dependencies to build packs of."""
-
-    def test_default(self):
-        """The default group is empty: no dependency file, the official PyPI."""
-        deps = PythonDepsConfig()
-        assert deps.RequirementFiles == []
-        assert deps.PypiMirror == 'https://pypi.org/simple'
-        assert not hasattr(deps, 'PackUpdate')
-
-    def test_default_not_shared(self):
-        """The default list is not shared among instances, a filled one stays empty."""
-        first = PythonDepsConfig()
-        first.RequirementFiles.append('requirements.txt')
-        assert PythonDepsConfig().RequirementFiles == []
+        """No proxy by default: the downloads of the server go out directly."""
+        assert EnvConfig().Proxy == ''
 
 
 class TestPackRepoModel:
     """The pack config of a repo."""
 
     def test_default(self):
-        """The default config of a repo is empty, with the default restrictions."""
+        """The default config of a repo is empty, with the default restrictions and no proxy."""
         model = PackRepoModel()
         assert model.Repo == RepoConfig()
         assert model.Lookback == LookbackConfig()
-        assert model.PythonDeps == PythonDepsConfig()
+        assert model.Env == EnvConfig()
+        assert model.Env.Proxy == ''
+
+    def test_no_python_deps_group(self):
+        """The python dependencies are declared by the mod entry, not by the config."""
+        assert not hasattr(PackRepoModel(), 'PythonDeps')
 
 
 class TestPackRepoConfig:
@@ -143,7 +140,7 @@ class TestPackRepoConfig:
     def test_read_missing_file(self, fs, run_dir):
         """A file that does not exist is created from the model, then the empty config is refused."""
         with logger.mock_capture_writer() as capture:
-            with pytest.raises(ValueError, match='Empty Author'):
+            with pytest.raises(ConfigError, match='Empty Author'):
                 PackRepoConfig(FILE)
         assert capture.concat() == f"""\
 WARNING | Invalid pack config value: [Errno 2] No such file or directory: '{run_dir}/config/LmeSzinc_AzurLaneAutoScript.yaml', file={run_dir}/config/LmeSzinc_AzurLaneAutoScript.yaml
@@ -191,7 +188,7 @@ Repo:
     def test_empty_repo_value(self, fs, run_dir, empty, contents):
         """An empty Author / Repo / Remote / Branch is refused, every user of the config needs them."""
         fs.create_file(config_file(run_dir), contents=contents)
-        with pytest.raises(ValueError, match=f'{empty}.*{FILE}'):
+        with pytest.raises(ConfigError, match=f'{empty}.*{FILE}'):
             PackRepoConfig(FILE)
 
     def test_write_template(self, fs, run_dir):
@@ -258,8 +255,8 @@ Lookback:
         assert config.data.Lookback.Parent == 'parent-0'
         assert config.data.Lookback.AdditionalCommit == ['4f3a8b2c1d5e6f708192a3b4c5d6e7f8091a2b3c']
 
-    def test_read_python_deps(self, fs, run_dir):
-        """The PythonDeps group is read: the files and the list form of the mirror."""
+    def test_stale_python_deps_is_ignored(self, fs, run_dir):
+        """A PythonDeps group of a config of an earlier version is ignored, no fallback error."""
         fs.create_file(config_file(run_dir), contents="""\
 Repo:
   Remote: https://github.com/LmeSzinc/AzurLaneAutoScript
@@ -269,80 +266,12 @@ Repo:
 PythonDeps:
   RequirementFiles:
     - requirements.txt
-    - backend/pyproject.toml
-  PypiMirror:
-    - Url: https://mirrors.aliyun.com/pypi/simple
-      Deps:
-        - requests
-    - Url: https://pack.example.com/pypi
-      Deps:
-        - httpx2
-        - starlette
-""")
-        config = PackRepoConfig(FILE)
-        assert config.errors == []
-        deps = config.data.PythonDeps
-        assert deps.RequirementFiles == ['requirements.txt', 'backend/pyproject.toml']
-        assert deps.PypiMirror == [
-            PythonMirrorInfo(Url='https://mirrors.aliyun.com/pypi/simple', Deps=['requests']),
-            PythonMirrorInfo(Url='https://pack.example.com/pypi', Deps=['httpx2', 'starlette']),
-        ]
-        assert not hasattr(deps, 'PackUpdate')
-
-    def test_stale_pack_update_is_ignored(self, fs, run_dir):
-        """The PackUpdate key of a config of an earlier version is ignored."""
-        fs.create_file(config_file(run_dir), contents="""\
-Repo:
-  Remote: https://github.com/LmeSzinc/AzurLaneAutoScript
-  Author: LmeSzinc
-  Repo: AzurLaneAutoScript
-  Branch: master
-PythonDeps:
-  RequirementFiles:
-    - requirements.txt
-  PackUpdate:
-    - requests
-""")
-        config = PackRepoConfig(FILE)
-        assert config.errors == []
-        deps = config.data.PythonDeps
-        assert deps.RequirementFiles == ['requirements.txt']
-        assert not hasattr(deps, 'PackUpdate')
-
-    def test_read_python_deps_mirror_url(self, fs, run_dir):
-        """PypiMirror accepts one url string, every dependency is downloaded from it."""
-        fs.create_file(config_file(run_dir), contents="""\
-Repo:
-  Remote: https://github.com/LmeSzinc/AzurLaneAutoScript
-  Author: LmeSzinc
-  Repo: AzurLaneAutoScript
-  Branch: master
-PythonDeps:
   PypiMirror: https://mirrors.aliyun.com/pypi/simple
 """)
         config = PackRepoConfig(FILE)
         assert config.errors == []
-        assert config.data.PythonDeps.PypiMirror == 'https://mirrors.aliyun.com/pypi/simple'
-
-    def test_read_python_deps_invalid_mirror(self, fs, run_dir):
-        """A PypiMirror that is neither a url nor a list falls back to the official PyPI."""
-        fs.create_file(config_file(run_dir), contents="""\
-Repo:
-  Remote: https://github.com/LmeSzinc/AzurLaneAutoScript
-  Author: LmeSzinc
-  Repo: AzurLaneAutoScript
-  Branch: master
-PythonDeps:
-  PypiMirror: 123
-""")
-        with logger.mock_capture_writer() as capture:
-            config = PackRepoConfig(FILE)
-        assert capture.concat() == f"""\
-WARNING | Invalid pack config value: ErrorInfo(msg='Expected `str | array`, got `int` - at `$.PythonDeps.PypiMirror`', type=<ErrorType.TYPE_MISMATCH>, loc=('PythonDeps', 'PypiMirror'), ctx=ErrorCtx(expected='str | array', got='int')), file={run_dir}/config/LmeSzinc_AzurLaneAutoScript.yaml
-INFO | Write config {run_dir}/config/LmeSzinc_AzurLaneAutoScript.yaml
-"""
-        assert len(config.errors) == 1
-        assert config.data.PythonDeps.PypiMirror == 'https://pypi.org/simple'
+        # the dependency file and the mirrors are declared by the mod entry
+        assert not hasattr(config.data, 'PythonDeps')
 
     def test_read_invalid_parent_rule(self, fs, run_dir):
         """A parent rule that is not one of the model values falls back to the default."""
@@ -407,6 +336,99 @@ Lookback:
         assert config.errors == []
         assert config.data.Lookback.AdditionalCommit == ['abc', 'def']
 
+    def test_write_remote_comments(self, fs, run_dir):
+        """A remote of the Publish map is written with the help of its fields.
+
+        The keys of the map are chosen by the operator, so the help of a field
+        of a remote is matched through a wildcard at the depth of the key: a
+        remote written back gets the comments of the fields it holds.
+        """
+        fs.create_file(config_file(run_dir), contents="""\
+Repo:
+  Remote: https://github.com/LmeSzinc/AzurLaneAutoScript
+  Author: LmeSzinc
+  Repo: AzurLaneAutoScript
+  Branch: master
+Lookback:
+  MaxCommitDay: abc
+Publish:
+  cos-main:
+    Driver: cos
+    Bucket: alasio-1250000000
+    Region: ap-guangzhou
+  nas:
+    Driver: webdav
+    BaseUrl: https://nas.example/dav/pack
+""")
+        # the invalid lookback value forces the file to be written back
+        with logger.mock_capture_writer():
+            config = PackRepoConfig(FILE)
+        assert len(config.errors) == 1
+        with open(config.file, encoding='utf-8') as f:
+            text = f.read()
+        assert text[text.index('\nPublish:\n') + 1:] == '''\
+Publish:
+  cos-main:
+    # Driver selects the variant of this entry
+    Driver: cos
+    # Concurrent transfers in flight to this remote, 1 to 8
+    # Past 8 the queue only moves into the connection pool, the uplink is the limit
+    Concurrency: 4
+    # Retire grace of this remote in seconds
+    # A generation the mirror no longer serves is kept for this long after the
+    # generation replacing it was published, so a client that read the old
+    # barrier a moment before the switch can finish its update
+    # Must cover the CDN TTL plus one full client update
+    # Must be positive: 0 would delete a generation a client may still be reading
+    GraceSeconds: 3600
+    # Environment variable prefix of the credentials of this remote
+    # '' for the default prefix of the driver: ALASIO_COS for 'cos'
+    # 'ALASIO_COS_BACKUP' -> ALASIO_COS_BACKUP_SECRET_ID / _SECRET_KEY
+    EnvPrefix: ''
+    # Read/write timeout of one request
+    # A 100 MB pack on a 10 Mbit/s uplink takes about 80 s
+    TimeoutSeconds: 120
+    # COS bucket name with the APPID suffix, e.g. 'alasio-1250000000'
+    Bucket: alasio-1250000000
+    # COS region, e.g. 'ap-guangzhou'
+    Region: ap-guangzhou
+    # Custom origin endpoint, '' for https://{Bucket}.cos.{Region}.myqcloud.com
+    # A host only, never a CDN domain: the publication lists and writes the origin
+    Endpoint: ''
+    # Key prefix inside the bucket, 'pack' by default
+    # The object key is {Prefix}/{workspace}/{relative path}
+    # '' publishes at the root of the bucket: {workspace}/{relative path}
+    Prefix: pack
+  nas:
+    # Driver selects the variant of this entry
+    Driver: webdav
+    # Concurrent transfers in flight to this remote, 1 to 8
+    # Past 8 the queue only moves into the connection pool, the uplink is the limit
+    Concurrency: 4
+    # Retire grace of this remote in seconds
+    # A generation the mirror no longer serves is kept for this long after the
+    # generation replacing it was published, so a client that read the old
+    # barrier a moment before the switch can finish its update
+    # Must cover the CDN TTL plus one full client update
+    # Must be positive: 0 would delete a generation a client may still be reading
+    GraceSeconds: 3600
+    # Environment variable prefix of the credentials of this remote
+    # '' for the default prefix of the driver: ALASIO_COS for 'cos'
+    # 'ALASIO_COS_BACKUP' -> ALASIO_COS_BACKUP_SECRET_ID / _SECRET_KEY
+    EnvPrefix: ''
+    # Read/write timeout of one request
+    # A 100 MB pack on a 10 Mbit/s uplink takes about 80 s
+    TimeoutSeconds: 120
+    # URL of the collection that holds the workspaces, no trailing slash
+    # The object URL is {BaseUrl}/{workspace}/{relative path}
+    # The origin, never a CDN domain: the publication lists and writes the origin
+    # Example: 'https://nas.example:5006/dav/pack'
+    BaseUrl: https://nas.example/dav/pack
+    # Verify the TLS certificate of the server
+    # false only for a self-signed host in a network you trust
+    VerifyTls: true
+'''
+
     def test_invalid_value_falls_back(self, fs, run_dir):
         """A value that fails the validation falls back to the default and is written back."""
         fs.create_file(config_file(run_dir), contents="""\
@@ -437,7 +459,7 @@ INFO | Write config {run_dir}/config/LmeSzinc_AzurLaneAutoScript.yaml
         """A file that is not valid yaml is replaced by the model defaults, then the empty config is refused."""
         fs.create_file(config_file(run_dir), contents='Lookback: [unclosed\n')
         with logger.mock_capture_writer() as capture:
-            with pytest.raises(ValueError, match='Empty Author'):
+            with pytest.raises(ConfigError, match='Empty Author'):
                 PackRepoConfig(FILE)
         assert capture.concat() == f"""\
 WARNING | Invalid pack config value: while parsing a flow sequence
@@ -447,6 +469,67 @@ did not find expected ',' or ']'
 INFO | Write config {run_dir}/config/LmeSzinc_AzurLaneAutoScript.yaml
 """
         assert read_config(config_file(run_dir)) == msgspec.to_builtins(PackRepoModel())
+
+    @pytest.mark.parametrize('proxy', [
+        'http://127.0.0.1:7890',
+        'https://user:pass@proxy.example:8080',
+        'socks5://127.0.0.1:7890',
+        'socks5h://127.0.0.1:7890',
+    ])
+    def test_read_proxy(self, fs, run_dir, proxy):
+        """A proxy url the http client can use is read as it is."""
+        fs.create_file(config_file(run_dir), contents=f"""\
+Repo:
+  Remote: https://github.com/LmeSzinc/AzurLaneAutoScript
+  Author: LmeSzinc
+  Repo: AzurLaneAutoScript
+  Branch: master
+Env:
+  Proxy: {proxy}
+""")
+        config = PackRepoConfig(FILE)
+        assert config.errors == []
+        assert config.data.Env.Proxy == proxy
+
+    @pytest.mark.parametrize('proxy', [
+        '127.0.0.1:7890',
+        'ftp://127.0.0.1:7890',
+        'http://',
+    ])
+    def test_invalid_proxy(self, fs, run_dir, proxy):
+        """A value the http client cannot use fails the config, the run never starts."""
+        fs.create_file(config_file(run_dir), contents=f"""\
+Repo:
+  Remote: https://github.com/LmeSzinc/AzurLaneAutoScript
+  Author: LmeSzinc
+  Repo: AzurLaneAutoScript
+  Branch: master
+Env:
+  Proxy: {proxy}
+""")
+        with pytest.raises(ConfigError) as e:
+            PackRepoConfig(FILE)
+        assert str(e.value).startswith('Invalid Env.Proxy of the pack config')
+        assert config_file(run_dir) in str(e.value)
+        # the value of the operator is kept, the operator fixes the file
+        assert read_config(config_file(run_dir))['Env']['Proxy'] == proxy
+
+    def test_invalid_proxy_empty_host(self, fs, run_dir):
+        """A proxy url without a host is refused with its own message."""
+        fs.create_file(config_file(run_dir), contents="""\
+Repo:
+  Remote: https://github.com/LmeSzinc/AzurLaneAutoScript
+  Author: LmeSzinc
+  Repo: AzurLaneAutoScript
+  Branch: master
+Env:
+  Proxy: http://
+""")
+        with pytest.raises(ConfigError) as e:
+            PackRepoConfig(FILE)
+        assert str(e.value) == (
+            "Invalid Env.Proxy of the pack config, the host is empty: 'http://', "
+            f'file="{config_file(run_dir)}"')
 
     def test_config_of_each_file(self, fs, run_dir):
         """Every file has its own config, the reader is not bound to a single file."""
@@ -475,12 +558,12 @@ Repo:
     def test_file_outside_config_folder(self, fs, run_dir):
         """A path that escapes the config folder is refused."""
         fs.create_file(f'{run_dir}/{FILE}', contents='Repo:\n  Author: LmeSzinc\n')
-        with pytest.raises(ValueError):
+        with pytest.raises(ConfigError):
             PackRepoConfig(f'../{FILE}')
 
     def test_run_dir_is_a_mod(self, fs, run_dir, monkeypatch):
         """The pack server refuses to read the config of a mod directory."""
-        fs.create_file(f'{run_dir}/module/main.py', contents='')
+        fs.create_file(f'{run_dir}/module/config/_index/mod_entry.yaml', contents='name: m\n')
         # check_run_dir runs once per process (init_once), the bare check runs
         # the gate for the run directory of this test
         monkeypatch.setattr(model, 'check_run_dir', check_run_dir.__wrapped__)

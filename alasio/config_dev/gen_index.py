@@ -1,5 +1,7 @@
+from alasio.config_dev.gen.gen_config import remove_stale_file
 from alasio.config_dev.gen.gen_config_generated import GenConfigGenerated
 from alasio.config_dev.gen.gen_config_index import GenConfigIndex
+from alasio.config_dev.gen.gen_mod_entry import GenModEntry
 from alasio.config_dev.gen.gen_queue_index import GenQueueIndex
 from alasio.config_dev.gen.gen_task_entry import GenTaskEntry
 from alasio.deploy.config.model import DeployModel
@@ -16,6 +18,7 @@ class IndexGenerator(
     GenQueueIndex,
     GenConfigGenerated,
     GenTaskEntry,
+    GenModEntry,
 ):
     """
     维护一个MOD下所有设置文件的数据一致性，生成json索引文件。
@@ -61,12 +64,17 @@ class IndexGenerator(
 
         self.build_group_mro()
 
-        # setup cross-nav variant model data before nav generation
-        self._setup_cross_nav_model_data()
+        # the model class of a group is generated in its own nav, so the model
+        # files of the navs must not import each other in a cycle
+        self.validate_nav_model_parents()
 
         # update nav configs
         for nav in self.dict_nav_config.values():
             nav.generate(gitadd=gitadd)
+
+        # model.index.json, written after the model files of the navs exist,
+        # and before the task check below: a mod without task still has models
+        self.generate_model_index(gitadd=gitadd)
 
         # model.index.json
         _ = self.model_data
@@ -84,11 +92,8 @@ class IndexGenerator(
                     if gitadd:
                         gitadd.stage_add(f)
             else:
-                if f.exists():
-                    logger.info(f'Delete file {f}')
-                    f.atomic_remove()
-                    if gitadd:
-                        gitadd.stage_add(f)
+                # nothing to write, the index of the previous generation is stale
+                remove_stale_file(f, gitadd)
 
         # task.index.json
         write(self.task_index_file, self.task_index_data)
@@ -106,6 +111,10 @@ class IndexGenerator(
 
         # config_generated.py
         self.generate_config_generated_file(gitadd=gitadd)
+
+        # mod_entry.yaml, the declaration of the mod itself: written last, so
+        # the file only follows the model once the config of the mod is valid
+        self.generate_mod_entry(gitadd=gitadd)
 
         # task_entry.py
         self.generate_task_entry_file(gitadd=gitadd)

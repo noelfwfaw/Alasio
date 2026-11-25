@@ -1,15 +1,17 @@
 import re
+import time
 
 from alasio.assets_dev.parse import AssetAll, AssetImage, AssetModule, AssetMultilang
+from alasio.backport import removeprefix
 from alasio.base.image.imfile import image_fixup
 from alasio.codegen.python import CodeGen
 from alasio.config.const import Const
 from alasio.ext import env
 from alasio.ext.cache import cached_property
-from alasio.ext.file.watchdog import PathEvent, Watchdog
+from alasio.ext.file.watcher import PathWatcher, WatchEvent
 from alasio.ext.path import PathStr
 from alasio.ext.path.atomic import atomic_remove
-from alasio.ext.path.calc import get_rootstem, get_suffix, subpath, uppath
+from alasio.ext.path.calc import get_multisuffix, get_rootstem, get_suffix, subpath, uppath
 from alasio.git.stage.gitadd import GitAdd
 from alasio.logger import logger
 
@@ -63,20 +65,39 @@ class AssetsExtractor:
             return False
 
         # check name format
-        if REGEX_ASSETS_NAME.match(name):
-            return True
-        else:
+        if not REGEX_ASSETS_NAME.match(name):
             return False
+
+        # check the suffixes after the asset name, a file is named like
+        # <asset>.<frame>.<lang>.<attr>.<ext>
+        # AssetImage ignores an unknown suffix, the file would be loaded as
+        # another frame image of the same asset, and could silently replace the
+        # image of the asset instead of being reported
+        for suffix in get_multisuffix(file).lower().split('.')[1:-1]:
+            if suffix in Const.ASSETS_ATTR:
+                continue
+            if suffix in Const.ASSETS_LANG:
+                continue
+            if suffix.isdigit():
+                continue
+            return False
+
+        return True
 
     def patch_const(self):
         pass
 
     @cached_property
-    def watchdog(self) -> Watchdog:
+    def watcher(self) -> PathWatcher:
         self.patch_const()
         path = self.root.joinpath(Const.ASSETS_PATH)
-        paths = [path.joinpath(lang) for lang in Const.ASSETS_LANG]
-        return Watchdog(paths)
+        watcher = PathWatcher()
+        for lang in Const.ASSETS_LANG:
+            watcher.subscribe(path.joinpath(lang), recursive=True)
+        # Only changes are reported. The baseline is taken once and dropped,
+        # so assets that already exist are not handled as new files
+        watcher.update()
+        return watcher
 
     @cached_property
     def assets(self) -> AssetAll:
@@ -268,13 +289,20 @@ class AssetsExtractor:
         cached_property.pop(self, 'assets')
 
     def file_to_module(self, file):
-        # /assets/combat/interact/xxx.png -> combat/interact
+        # /assets/share/combat/interact/xxx.png -> combat/interact
         path = uppath(file)
         path = subpath(path, self.root.joinpath(Const.ASSETS_PATH))
         path = path.replace('\\', '/')
+        # AssetImage.module is relative to the language folder, so is a module
+        # name, the language folder must be stripped to match
+        for lang in Const.ASSETS_LANG:
+            lang = f'{lang}/'
+            if path.startswith(lang):
+                path = removeprefix(path, lang)
+                break
         return path
 
-    def generate_on_change(self, events: "list[PathEvent]", gitadd=None):
+    def generate_on_change(self, events: "list[WatchEvent]", gitadd=None):
         """
         Args:
             gitadd (GitAdd): Input a GitAdd object to track the generated files
@@ -297,7 +325,7 @@ class AssetsExtractor:
 
         self.generate(modules, gitadd=gitadd)
 
-    def image_fixup(self, event: "PathEvent"):
+    def image_fixup(self, event: "WatchEvent"):
         """
         Returns:
             bool: If file changed
@@ -316,19 +344,21 @@ class AssetsExtractor:
         else:
             return False
 
-    def watch_files(self, include_existing=False, interval=2):
+    def watch_files(self, interval=2):
         """
         Watch files and generate on change
-        """
-        events = self.watchdog.watch_files(include_existing=include_existing, interval=interval)
-        if not events:
-            return
 
-        with GitAdd(self.root) as gitadd:
-            for event in events:
-                logger.info(event)
-                if self.is_assets_file(event.path):
-                    gitadd.stage_add(event.path)
-                if self.image_fixup(event):
-                    self.watchdog.mark_modified(event)
-            self.generate_on_change(events, gitadd=gitadd)
+        Args:
+            interval (float): Seconds to sleep after each poll
+        """
+        events = [event for event in self.watcher.update() if event.type == 'F']
+        if events:
+            with GitAdd(self.root) as gitadd:
+                for event in events:
+                    logger.info(event)
+                    if self.is_assets_file(event.path):
+                        gitadd.stage_add(event.path)
+                    if self.image_fixup(event):
+                        self.watcher.mark_modified(event.path)
+                self.generate_on_change(events, gitadd=gitadd)
+        time.sleep(interval)

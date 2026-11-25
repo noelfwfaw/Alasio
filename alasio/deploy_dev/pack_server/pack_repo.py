@@ -4,7 +4,7 @@ Clone and update the git repo of a pack config in the run directory.
 The repo of a config lives in {run directory}/repo/{Author}_{Repo}, next to
 the config/ folder and the pack/ folder. The pack server clones it once and
 fetches it on every later run, then opens it with the pure python git of
-alasio.git and generates the packs from it, see PackRepoGen.
+alasio.git and generates the packs from it, see repo.
 
 The clone carries no working tree: the pack generation reads the git objects
 of the clone only, and a checked out working tree would be rewritten by every
@@ -185,7 +185,7 @@ class PackRepo:
 
     Usage:
         repo = PackRepo(config).run()
-        gen = PackRepoGen(repo, config)
+        gen = Repo(repo, config)
         gen.run()
         gen.commit()
     """
@@ -250,7 +250,7 @@ class PackRepo:
         working tree, see the module docstring). An existing repo is set to
         the remote of the config, fetched, and its local branches are set to
         the fetched remote branches. The repo is complete before the packs
-        are generated from it, see PackRepoGen.
+        are generated from it, see repo.
 
         Returns:
             GitRepo: The repo of the config, read lazily (read_lazy), ready
@@ -266,6 +266,7 @@ class PackRepo:
         check_run_dir()
         folder = self.repo_folder
         git = GitCmdline()
+        logger.hr('Git repo', level=2)
         if self._is_clone(folder):
             self._update(git, folder)
         else:

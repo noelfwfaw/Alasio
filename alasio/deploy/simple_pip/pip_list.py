@@ -39,6 +39,10 @@ def normalize_name(name):
     Returns:
         str: Normalized name, e.g. "ruamel-yaml"
     """
+    # a lowercase name whose only separator is a single '-' is already
+    # normalized, the common case of a requirements file
+    if name.islower() and '_' not in name and '.' not in name and '--' not in name:
+        return name
     # A run of "-", "_" and "." is a single "-", PEP 503. The compiled
     # pattern of a str pattern is cached by re, no global compile is needed
     return re.sub(r'[-_.]+', '-', name).lower()
@@ -124,7 +128,7 @@ class PipList:
         - pip_list() is the raw scan: one entry per metadata entry, a
           distribution with several entries is listed several times
         - pack_list() is the version of every distribution the mod updates
-          by pack (mod.entry.pack_update_deps), read from its pack ledger
+          by pack (mod.entry.pack_deps), read from its pack ledger
         - list() is the aggregate: one distribution per normalized name,
           keyed by it, the trusted version and the conflicts logged, see
           its docstring
@@ -164,7 +168,7 @@ class PipList:
         site_packages (PathStr): Normalized path of the directory, posix
             style, e.g. the site-packages of an environment
         mod (Mod | None): The mounted mod whose entry declares the pack
-            updated distributions (entry.pack_update_deps) that
+            updated distributions (entry.pack_deps) that
             pack_list() reads the pack ledgers of, None to read no ledger
     """
 
@@ -176,7 +180,7 @@ class PipList:
                 that does not exist is not an error, list() reports no
                 distribution of it
             mod (Mod, optional): The mounted mod whose entry declares the
-                pack updated distributions (entry.pack_update_deps) that
+                pack updated distributions (entry.pack_deps) that
                 pack_list() reads the pack ledgers of, e.g. the mod the
                 dependencies of the directory belong to. Defaults to None,
                 no pack ledger is read
@@ -246,6 +250,63 @@ class PipList:
             out[dist_key] = dist
         return dict(sorted(out.items()))
 
+    def find(self, dist_key):
+        """
+        Find the installation of one distribution, the lookup of a name.
+
+        The entries of the directory are filtered by their name before any
+        of them is read: the name of a metadata entry starts with the
+        escaped name of its distribution (PEP 427), so the metadata of the
+        installations of the other distributions is never opened. The
+        lookup is the cheap read of one distribution, pip_list() is the
+        listing of the directory.
+
+        Only the metadata entries whose name is the one of the
+        distribution are read, an entry that records another name (an
+        installation whose directory was renamed by hand, PEP 503
+        matches it through the header) is not found: use list() for a
+        listing that resolves every entry.
+
+        Args:
+            dist_key (str): PEP 503 normalized name of the distribution,
+                e.g. "ruamel-yaml"
+
+        Returns:
+            Distribution | None: The installation of the distribution, the
+                lowest path when the directory holds several entries of
+                it (the entry list() keeps), None when the directory holds
+                no entry of the name
+        """
+        # The escaped name of a metadata entry, PEP 427: a run of "-", "_"
+        # and "." became "_", e.g. "ruamel.yaml" -> "ruamel_yaml". The
+        # version is appended to it with a "-", e.g. "ruamel_yaml-0.18.6",
+        # and the entry of a legacy installation carries the name only
+        escaped = dist_key.replace('-', '_')
+        prefix = f'{escaped}-'
+        found = []
+        try:
+            entries = os.scandir(self.site_packages)
+        except (FileNotFoundError, NotADirectoryError):
+            return None
+        with entries:
+            for entry in entries:
+                entry_name = entry.name
+                if entry_name.endswith(DIST_INFO_SUFFIX):
+                    entry_dist = removesuffix(entry_name, DIST_INFO_SUFFIX)
+                elif entry_name.endswith(EGG_INFO_SUFFIX):
+                    entry_dist = removesuffix(entry_name, EGG_INFO_SUFFIX)
+                else:
+                    continue
+                if entry_dist != escaped and not entry_dist.startswith(prefix):
+                    continue
+                dist = self._read_entry(entry)
+                if dist is not None and dist.dist_key == dist_key:
+                    found.append(dist)
+        if not found:
+            return None
+        # the entry list() keeps for the name, see its docstring
+        return min(found, key=lambda dist: dist.info)
+
     def pip_list(self):
         """
         List the metadata entries of the directory, the raw scan.
@@ -281,7 +342,7 @@ class PipList:
         """
         List the distributions the pack ledgers of the mod record.
 
-        The names come from mod.entry.pack_update_deps, the distributions
+        The names come from mod.entry.pack_deps, the distributions
         the mod updates from its pack channels instead of pip. The ledger
         folder of a name is {site_packages}/.pack/{dist-key} (the PEP 503
         normalized name, the key of the channel and the ledger folder of
@@ -309,7 +370,7 @@ class PipList:
         if self.mod is None:
             return []
         names = {}
-        for name in self.mod.entry.pack_update_deps:
+        for name in self.mod.entry.pack_deps:
             names.setdefault(normalize_name(name), name)
         out = []
         for dist_key, name in names.items():
@@ -438,14 +499,68 @@ class PipList:
         return version
 
 
+def iter_metadata_headers(content):
+    """
+    Iter the headers of a metadata file, METADATA or PKG-INFO.
+
+    The file is an email style header block (PEP 566): one ``Name: value`` per
+    line, the block ends at the empty line before the body, and a line that
+    starts with a space or a tab continues the value of the header above it
+    (RFC 822, joined with a space). A line of the width only is a continuation
+    too: the License of a METADATA written by a build backend holds them, and
+    the headers after it, ``Requires-Dist`` included, still belong to the
+    block.
+
+    The headers are yielded in the order of the file, a repeated name several
+    times: ``Requires-Dist`` repeats once per dependency, so a reader that
+    wants all of them must not collect the block in a dict (see the callers).
+
+    Args:
+        content (str): Content of the metadata file, the body included: the
+            read stops at the empty line that ends the header block
+
+    Yields:
+        tuple[str, str]: (lowercase header name, value), the continuation lines
+            of a value already joined
+    """
+    key = ''
+    value = ''
+    for line in content.splitlines():
+        if not line:
+            # the empty line that ends the header block, RFC 822. A line of the
+            # width only is a continuation, not that line
+            break
+        if line[0] in ' \t':
+            # a folded continuation of the header above
+            if key:
+                value = ' '.join(part for part in (value, line.strip()) if part)
+            continue
+        if key:
+            yield key, value
+        key, sep, value = line.partition(':')
+        key = key.strip().lower()
+        if not sep or not key:
+            # a line that holds no header, e.g. of a broken metadata file: the
+            # continuation lines after it fold into nothing
+            key = ''
+            continue
+        value = value.strip()
+    if key:
+        yield key, value
+
+
 def _read_headers(file):
     """
     Read the headers of a metadata file, METADATA or PKG-INFO.
 
-    Only the headers are read: the body of the file holds the description
-    of a distribution and can be hundreds of KB, the listing needs two
-    headers. The header block ends at the first empty line, RFC 822, so
-    the read stops there and the body is never read.
+    The file is sliced to its header block and parsed by
+    iter_metadata_headers(), the parser the release side and the pack_deps
+    tool use, so every caller reads a header the same way. The slice here is
+    the one difference between this caller and the others: the parser takes a
+    text, this one has a path, and the body of the file (the description of
+    the distribution, a few hundred KB to a few MB) must not be read for a
+    listing that needs two headers. The boundary is the same one the parser
+    stops at, an empty line, RFC 822.
 
     Args:
         file (str): Path of the metadata file
@@ -458,7 +573,7 @@ def _read_headers(file):
             file can not be read, e.g. a missing or a broken file
     """
     headers = {}
-    key = ''
+    block = []
     try:
         # The metadata of a distribution is UTF-8, PEP 566, a file written
         # by hand or edited by a tool may hold a byte order mark or other
@@ -466,24 +581,15 @@ def _read_headers(file):
         # byte in them must not fail the whole listing
         with open(file, 'r', encoding='utf-8-sig', errors='replace') as f:
             for line in f:
-                if not line.strip():
-                    # The empty line that ends the header block, RFC 822
+                if not line.strip('\r\n'):
+                    # the empty line that ends the header block, RFC 822: the
+                    # body below it is not read, it can be hundreds of KB and
+                    # the listing needs two headers
                     break
-                if line[0] in ' \t':
-                    # A folded continuation of the value of the header above
-                    if key:
-                        headers[key] = ' '.join(part for part in (headers[key], line.strip()) if part)
-                    continue
-                key, sep, value = line.partition(':')
-                key = key.strip().lower()
-                if not sep or not key:
-                    # A line that holds no header, e.g. of a broken metadata
-                    # file: the next continuation folds into nothing
-                    key = ''
-                    continue
-                if key not in headers:
-                    headers[key] = value.strip()
+                block.append(line)
     except OSError:
         # Missing, unreadable, a directory, ...
         return {}
+    for key, value in iter_metadata_headers(''.join(block)):
+        headers.setdefault(key, value)
     return headers

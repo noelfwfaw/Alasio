@@ -136,18 +136,19 @@ class TestEnterExit:
         assert abs(real_now.timestamp() - time.time()) < 1.0
 
     def test_exit_restores_datetime_utcnow(self):
+        # the wall clock before the patch: inside the context both datetime and
+        # time are patched, so only a value taken outside can prove the exit
+        # cleaned up
+        before = datetime.datetime.now(tz=datetime.timezone.utc).replace(tzinfo=None)
         pt = PatchTime(42)
         with pt:
             utcnow = datetime.datetime.utcnow()
             assert utcnow.hour == 0  # 1970-01-01 00:00:42
-        # After exit, should be restored
-        real_utcnow = datetime.datetime.utcnow()
-        # utcnow() returns a naive datetime (no tzinfo).
-        # Use real_utcnow directly (comparison with time.time() in local timezone is unreliable).
-        # Instead verify that the result is close to the expected real time by constructing a timezone-aware UTC
-        # datetime.
-        real_utc = datetime.datetime.now(tz=datetime.timezone.utc)
-        assert abs((real_utcnow - real_utc.replace(tzinfo=None)).total_seconds()) < 1.0
+        # After exit, utcnow() is the real clock again. The call itself is
+        # deprecated since python 3.12, the value it returns (the naive UTC of
+        # the moment) is read with now(tz=utc).
+        real_utcnow = datetime.datetime.now(tz=datetime.timezone.utc).replace(tzinfo=None)
+        assert abs((real_utcnow - before).total_seconds()) < 1.0
 
     def test_exit_restores_time_functions(self):
         pt = PatchTime(42)
@@ -325,6 +326,36 @@ class TestEdgeCases:
             assert time.time() == 100.0
         with pt:
             assert time.time() == 100.0
+
+
+class TestPreciseSleep:
+    """The precise sleep of the project follows the frozen clock
+
+    It does not call time.sleep() on a platform with a high resolution timer,
+    its implementation is resolved once, so patching time.sleep alone would
+    leave a real sleep inside a frozen clock: nothing advances and a loop that
+    waits for a deadline never ends.
+    """
+
+    def test_sleep_advances_the_frozen_clock(self):
+        """A sleep of the project advances the mocked time and is recorded"""
+        from alasio.backport.sleep import sleep
+
+        with PatchTime(100.0) as pt:
+            sleep(0.25)
+            assert time.time() == pytest.approx(100.25)
+            assert pt.sleep_calls == [0.25]
+
+    def test_the_platform_implementation_is_restored(self):
+        """The mock is removed on exit, the real implementation comes back"""
+        from alasio.backport import sleep as sleep_module
+
+        with PatchTime(100.0):
+            assert sleep_module._impl.__name__ == 'mock_sleep'
+
+        assert sleep_module._impl.__name__ != 'mock_sleep'
+        sleep_module.sleep(0.001)
+        assert sleep_module._impl.__name__ != 'mock_sleep'
 
 
 class TestTimestampConversionConsistency:

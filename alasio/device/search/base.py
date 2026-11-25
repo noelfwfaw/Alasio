@@ -5,7 +5,7 @@ from alasio.device.serialstr import SerialStr
 from alasio.ext.cache import cached_property
 from alasio.ext.path import PathStr
 from alasio.ext.path.atomic import atomic_read_text
-from alasio.ext.path.calc import joinpath
+from alasio.ext.path.calc import joinpath, normpath, to_posix
 
 
 def vbox_file_to_serial(file: str) -> str:
@@ -78,6 +78,25 @@ class EmuType:
 
 
 class EmuStr(PathStr):
+    @classmethod
+    def new(cls, path):
+        """
+        Create an EmuStr object from a path, normalizing Windows separators
+
+        Emulator paths come from Windows only sources, the command line of a
+        process and the registry, so they use '\\' whatever host parses them.
+        normpath() keeps a backslash on posix, where it is a valid character of
+        a file name, and emutype() splits on '/', so the separators are
+        converted here instead of relying on the host platform.
+
+        Args:
+            path (str): Path string
+
+        Returns:
+            EmuStr: Normalized path string
+        """
+        return cls(normpath(to_posix(path)))
+
     def emutype(self) -> str:
         """
         Returns:
@@ -210,7 +229,14 @@ class EmulatorInstance:
         if isinstance(other, list) and self.emutype in other:
             return True
         if isinstance(other, EmulatorInstance):
-            return super().__eq__(other) and self.emutype == other.emutype
+            # Compare the fields, so equality stays consistent with __hash__:
+            # two instances of the same emulator type but with a different
+            # name or serial are two different instances
+            return (
+                self.serial == other.serial
+                and self.name == other.name
+                and self.path == other.path
+            )
         return super().__eq__(other)
 
     def __hash__(self):

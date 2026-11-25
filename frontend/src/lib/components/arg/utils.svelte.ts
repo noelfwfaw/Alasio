@@ -5,18 +5,27 @@ export const DEFAULT_TIME = "2020-01-01T00:00:00Z";
 export const DEFAULT_TIME_DISPLAY = "2020-01-01 00:00:00";
 export const DEFAULT_TIME_MS = new Date(DEFAULT_TIME).getTime();
 
+/**
+ * A translated text: one line, or one entry per line.
+ *
+ * The i18n files may write a text with multiple lines either as a str with
+ * `\n` or as a list of lines, the generator normalizes both to a str when the
+ * text has one line and to a list of str when it has more.
+ */
+export type I18nTextData = string | string[];
+
 export type ArgData = {
   task: string;
   group: string;
   arg: string;
   dt: string;
   value: any;
-  name?: string;
-  help?: string;
+  name?: I18nTextData;
+  help?: I18nTextData;
 
   /**
    * Dashboard type if arg is dashboard arg (`dt` startswith "dashboard")
-   * Might be "Amount", "Total", "DynamicTotal", "Progress", "Planner"
+   * Might be "Amount", "Total", "Remain", "DynamicTotal", "SoftTotal", "Progress", "Planner"
    */
   dashboard?: string;
   /**
@@ -65,8 +74,20 @@ export type ArgData = {
    * `{chapter1: [1-1, 1-2], chapter2: [2-1, 2-2]}`
    * The group is only a navigation aid of the frontend, the value stores the
    * option only
+   *
+   * Secondary options of an item if arg is `dt=filter-order-item` or
+   * `dt=filter-order-pair`, might be
+   * `{PlateT4: [gun, general], BookT3: [red, blue]}`. An item of the value then
+   * carries one of its own secondary options as `item-option` (`PlateT4-gun`),
+   * an item without an entry here is stored as itself (`Chip`)
    */
   option_dict?: Record<string, any[]>;
+  /**
+   * Built-in commands of a `dt=filter-order-pair` value: entries that carry no
+   * item at all and turn into a concrete behaviour at runtime, like the
+   * `shortest` of a commission filter
+   */
+  option_command?: any[];
   option_i18n?: Record<any, string>;
   // Msgspec constraints
   // https://jcristharif.com/msgspec/constraints.html
@@ -97,8 +118,8 @@ export type InfoData = {
   arg: string;
   // usually to be "card-{task}-{group}"
   card: string;
-  name?: string;
-  help?: string;
+  name?: I18nTextData;
+  help?: I18nTextData;
 };
 
 export type CardData = {
@@ -132,13 +153,109 @@ export type ArgProps = InputProps & {
   isAdvanced?: boolean;
 };
 
-export function getArgName(arg: ArgData | InfoData) {
+export function getArgName(arg: ArgData | InfoData): I18nTextData {
   // Show name if available
   if (arg.name) {
     return arg.name;
   }
   // Othersize show as {group_name}.{arg_name}
   return `${arg.group || "<UnknownGroup>"}.${arg.arg || "<UnknownArg>"}`;
+}
+
+/**
+ * The rows of a translated text, as one entry per line.
+ *
+ * A caller that lays out each line itself (a row of the navigation, a label
+ * that measures its own wrapping) uses this instead of the text itself, so a
+ * str and a str[] read the same way.
+ *
+ * Args:
+ *   text: Translated text of an arg or a group, or nothing
+ *
+ * Returns:
+ *   The lines of the text, empty for an empty text
+ */
+export function i18nTextToLines(text: I18nTextData | undefined | null): string[] {
+  if (!text) return [];
+  if (typeof text === "string") return [text];
+  return text;
+}
+
+/**
+ * Flatten a translated text to one line, for the places that can only show a
+ * str: a fixed height bar, an aria-label, a sentence of a dialog.
+ *
+ * Args:
+ *   text: Translated text of an arg or a group, or nothing
+ *
+ * Returns:
+ *   The lines joined by a space, empty for an empty text
+ */
+export function i18nTextToOneLine(text: I18nTextData | undefined | null): string {
+  if (!text) return "";
+  if (typeof text === "string") return text;
+  return text.join(" ");
+}
+
+/**
+ * Args of a dashboard group that are managed by the framework and must not be
+ * rendered as editable rows in the config card.
+ *
+ * @param argKey Arg name
+ * @param dashboardType Dashboard type from `_info.dashboard`, e.g. "Planner"
+ * @returns True if the arg is internal to the dashboard type
+ */
+export function isDashboardInternalArg(argKey: string, dashboardType: string): boolean {
+  if (argKey === "_info") return true;
+  if (argKey === "Time" || argKey === "ServerUpdate") return true;
+  // Value is the built-in dashboard value of every type except Planner, where
+  // it is a regular arg and may be used as a Value/Total pair.
+  if (argKey === "Value" && dashboardType !== "Planner") return true;
+  if ((dashboardType === "DynamicTotal" || dashboardType === "SoftTotal") && argKey === "Total") return true;
+  if (dashboardType === "Planner" && (argKey === "Progress" || argKey === "Eta")) return true;
+  return false;
+}
+
+/**
+ * True when arg is one side of a complete Value/Total pair.
+ *
+ * @param argKey Arg name
+ * @param groupData Dashboard group args
+ * @returns True for both the Value and the Total of a complete pair
+ */
+export function isDashboardPairArg(argKey: string, groupData: Record<string, ArgData>): boolean {
+  if (argKey.endsWith("Value")) {
+    return `${argKey.slice(0, -"Value".length)}Total` in groupData;
+  }
+  if (argKey.endsWith("Total")) {
+    return `${argKey.slice(0, -"Total".length)}Value` in groupData;
+  }
+  return false;
+}
+
+/**
+ * Format the Value/Total pairs of a dashboard group for display.
+ *
+ * A pair is an arg ending with "Value" and its matching "Total" arg. Unpaired
+ * args are ignored. One pair renders as "8 / 10"; multiple pairs render as
+ * "(8, 33) / (10, 44)" in the order of the Value args.
+ *
+ * @param groupData Dashboard group args
+ * @returns Pair text, empty when no complete pair exists
+ */
+export function getDashboardPairText(groupData: Record<string, ArgData>): string {
+  const values: string[] = [];
+  const totals: string[] = [];
+  for (const [argKey, arg] of Object.entries(groupData)) {
+    if (!argKey.endsWith("Value")) continue;
+    const total = groupData[`${argKey.slice(0, -"Value".length)}Total`];
+    if (!total) continue;
+    values.push(String(arg.value ?? "NaN"));
+    totals.push(String(total.value ?? "NaN"));
+  }
+  if (values.length === 0) return "";
+  if (values.length === 1) return `${values[0]} / ${totals[0]}`;
+  return `(${values.join(", ")}) / (${totals.join(", ")})`;
 }
 
 /**

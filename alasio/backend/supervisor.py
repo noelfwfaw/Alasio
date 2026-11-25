@@ -11,7 +11,7 @@ import threading
 import time
 
 from alasio.backend.entry import backend_process_entry
-from alasio.backend.mpipe.token_supervisor import SupervisorTokenManager
+from alasio.backend.mpipe.token_supervisor import PRINT_LOCK, SupervisorTokenManager
 
 
 def loop_until_timeout(timeout):
@@ -32,12 +32,15 @@ def mprint(*args, start=''):
     abort the supervision or shutdown flow, otherwise a dead host can
     leave the supervisor and its backend running as orphans.
 
+    Never call this from a signal handler, see Supervisor.handle_sigint.
+
     Args:
         *args: Values printed after the [Supervisor] prefix
         start (str): Prefix inserted before the [Supervisor] marker
     """
     try:
-        print(f'{start}[Supervisor]', *args)
+        with PRINT_LOCK:
+            print(f'{start}[Supervisor]', *args)
     except (AttributeError, OSError, ValueError):
         # stdout is missing, closed or its pipe is broken: drop the line
         pass
@@ -81,10 +84,11 @@ class Supervisor:
         # Communication pipe - supervisor's end only
         self.parent_conn: "multiprocessing.PipeConnection | None" = None
 
-        # Whether this supervisor was started with --electron. Only then
-        # tokens are generated / rotated / announced and ELECTRON=1 is set
-        # for the backend chain.
-        self.is_electron = False
+        # Whether this supervisor was started by electron. Only then are tokens
+        # generated / rotated / announced. Electron writes its own pid into the
+        # spawn environment and the whole chain inherits it, so the pid is the
+        # switch -- there is no separate command line flag any more.
+        self.is_electron = bool(os.environ.get('ALASIO_APP_ELECTRON_PID', ''))
 
         # Guards every parent_conn.send_bytes on the supervisor side:
         # rotation delivery (through the token manager), stdin forwarding
@@ -116,10 +120,21 @@ class Supervisor:
 
         # Track SIGINT count to handle multiple CTRL+C presses
         self.sigint_count = 0
+        # Signal behind the last interruption, reported by the shutdown line
+        # run() prints. The handler only records it: handling a signal may not
+        # log (see handle_sigint).
+        self.sigint_signum = signal.SIGINT
 
         # Set when a stop is requested through stdin, so the supervisor exits
         # after the backend is gone instead of restarting it
         self.stop_requested = False
+
+        # Set when the backend asks for a whole-application relaunch
+        # (command:relaunch): the updater it started replaces the electron
+        # archive and starts a new chain, so this supervisor must not restart
+        # the backend it is about to lose -- it exits once the backend is gone,
+        # whatever the reason of the exit turns out to be
+        self.relaunch_requested = False
 
         # One-shot resume credential (token-checksum) announced by the backend
         # through command:resume:<credential>. The next start_backend()
@@ -215,8 +230,8 @@ class Supervisor:
         # Note that we use daemon=False here, because backend needs to spawn workers
         # and python does not allow daemonic processes to have children
         # It's fine without daemon as backend will exit if pipe broken
-        # Token window for the new backend (empty without --electron: the
-        # backend token table stays empty and sensitive APIs are locked).
+        # Token window for the new backend (empty without an electron host:
+        # the backend token table stays empty and sensitive APIs are locked).
         tokens = self.token_manager.window()
         self.process = ctx.Process(
             target=backend_process_entry,
@@ -231,15 +246,11 @@ class Supervisor:
         # hang. The thread is restarted by recv_loop once the backend has
         # finished starting up, so buffered commands are not lost.
         self.stop_stdin_listener()
-        # ELECTRON=1 must be set before process.start(): multiprocessing
-        # spawn inherits the parent environment, so the whole chain
-        # (backend → worker → worker children) gets it. Only set in
-        # electron mode.
-        if self.is_electron:
-            os.environ['ELECTRON'] = '1'
-        # Inject the announced resume credential the same way: only write when
-        # the backend announced one, so an inherited value (e.g. passed down
-        # by an update relaunch) is never modified without an announcement.
+        # The announced resume credential is written into the environment before
+        # process.start(): multiprocessing spawn inherits the parent environment,
+        # so the backend child reads it. Only write when the backend announced
+        # one, so an inherited value (e.g. passed down by an update relaunch) is
+        # never modified without an announcement.
         if self.resume_token:
             os.environ['ALASIO_RESUME_TOKEN'] = self.resume_token
         try:
@@ -592,6 +603,17 @@ class Supervisor:
             # message arriving after the window already ended, where the
             # listener is up already and there is nothing to do.
             pass
+        elif msg == b'command:relaunch':
+            # The backend asks for a whole-application relaunch: the updater it
+            # started replaces the electron archive and starts a new chain. The
+            # host is told through an authenticated line (any worker can write
+            # to this stdout, so the token is what makes the request credible),
+            # and this supervisor never restarts the backend from here on --
+            # the host stops the chain, and a backend started by the restart
+            # path would race the updater for the same archive.
+            self.relaunch_requested = True
+            mprint('Backend requested relaunch, asking the host')
+            self.token_manager.announce_relaunch()
         elif msg.startswith(b'command:resume:'):
             # One-shot resume credential announcement (graceful restart or
             # crash takeover): the next start_backend() injects it into the
@@ -618,27 +640,44 @@ class Supervisor:
         - Second CTRL+C: Trigger force kill
         - Third+ CTRL+C: Ignored (already shutting down)
 
+        The handler only counts and raises, it never logs. It runs in the
+        thread that took the signal, and on POSIX that thread is inside a
+        write() whenever a signal interrupts one: CPython calls the handler
+        from PyErr_CheckSignals() while the buffered stdout lock of that same
+        thread is still held, so an mprint() here re-enters the buffer and
+        raises "reentrant call inside <_io.BufferedWriter>" in place of the
+        KeyboardInterrupt. Graceful shutdown is then skipped and the exit is
+        reported as an unexpected error. run() prints the shutdown lines once
+        the interrupt has left the signal context.
+
         Args:
             signum: Signal number
             frame: Current stack frame
         """
         self.sigint_count += 1
-        try:
-            sig = signal.Signals(signum).name
-        except ValueError:
-            sig = f'Unknown-signal-{signum}'
+        self.sigint_signum = signum
 
-        if self.sigint_count == 1:
-            # First CTRL+C - trigger graceful shutdown
-            mprint(f"Received {sig}, initiating graceful shutdown...", start='\n')
+        if self.sigint_count <= 2:
+            # First CTRL+C: graceful shutdown, second: force kill. Both
+            # interrupt whatever the main thread is waiting on.
             raise KeyboardInterrupt
-        elif self.sigint_count == 2:
-            # Second CTRL+C - trigger force kill
-            mprint(f"Received {sig}, force killing backend...", start='\n')
-            raise KeyboardInterrupt
-        else:
-            # Third+ CTRL+C - ignore, already shutting down
-            mprint(f"Already shutting down, please wait... (CTRL+C #{self.sigint_count})", start='\n')
+        # Third+ CTRL+C: ignore, the shutdown is already running
+
+    def _signal_name(self):
+        """
+        Name of the signal behind the last interruption.
+
+        Formatted here rather than in handle_sigint: the handler may only
+        count and raise, the shutdown path owns the log line.
+
+        Returns:
+            str: Signal name such as 'SIGINT', or 'Unknown-signal-N' when the
+                platform has no name for that number
+        """
+        try:
+            return signal.Signals(self.sigint_signum).name
+        except ValueError:
+            return f'Unknown-signal-{self.sigint_signum}'
 
     def wait_for_backend(self) -> int:
         """
@@ -679,9 +718,17 @@ class Supervisor:
                 mprint(f"ERROR: Failed to sending stop to backend: {e}")
 
         # Wait for backend to exit gracefully
+        reported = self.sigint_count
         for _ in loop_until_timeout(timeout=self.graceful_shutdown_timeout):
             # interruptable join(), so KeyboardInterrupt can be injected here
             self.process.join(timeout=0.2)
+            if self.sigint_count > reported:
+                # A CTRL+C the handler swallowed (the shutdown already runs)
+                # is reported from here: the handler may not log, and the
+                # second press never reaches this loop (it raises and force
+                # kills).
+                reported = self.sigint_count
+                mprint(f"Already shutting down, please wait... (CTRL+C #{reported})", start='\n')
             if not self.process.is_alive():
                 break
         else:
@@ -692,6 +739,7 @@ class Supervisor:
         # cleanup on success
         self.process = None
         self._cleanup_conn()
+        return True
 
     def force_shutdown(self):
         """
@@ -763,26 +811,32 @@ class Supervisor:
             mprint("ERROR: backend entry is still placeholder, nothing to run")
             return
 
-        mprint(f"Running on PID: {os.getpid()}")
-
-        # Electron mode: generate and announce T1, start the rotation
-        # thread. Without --electron no token is generated: the backend
-        # token table stays empty and sensitive APIs are locked.
-        self.is_electron = bool(args) and '--electron' in args
-        if self.is_electron:
-            self.token_manager.init_token()
-            self.token_manager.start_rotation()
-
-        # Set up custom SIGINT handler to track CTRL+C count
+        # Install the signal handlers before the first line of the run is
+        # printed: whoever reacts to that line -- the host process, a user
+        # watching the console -- may send CTRL+C from that moment on, so the
+        # line must not mark a moment when a signal still gets the default
+        # handler. The line is printed inside the try below, so a signal
+        # arriving right after it takes the same graceful shutdown path as any
+        # later one.
         signal.signal(signal.SIGINT, self.handle_sigint)
         signal.signal(signal.SIGTERM, self.handle_sigint)
         if sys.platform == "win32":
             signal.signal(signal.SIGBREAK, self.handle_sigint)
 
-        # The stdin listener thread ("command:stop" from Electron) is started
-        # and stopped by start_backend around every spawn
-
         try:
+            mprint(f"Running on PID: {os.getpid()}")
+
+            # Electron mode (tokens generated, rotated and announced) is decided
+            # by the host pid electron wrote into the spawn environment; without
+            # one the backend token table stays empty and sensitive APIs are
+            # locked.
+            if self.is_electron:
+                self.token_manager.init_token()
+                self.token_manager.start_rotation()
+
+            # The stdin listener thread ("command:stop" from Electron) is
+            # started and stopped by start_backend around every spawn
+
             # Main supervision loop
             while True:
                 # Start the backend
@@ -802,6 +856,12 @@ class Supervisor:
                 # Stop was requested through stdin, exit without restarting
                 if self.stop_requested:
                     mprint("Stop requested through stdin, exiting")
+                    break
+
+                # A relaunch was requested: the updater is waiting for this
+                # chain to be gone and starts the next one itself
+                if self.relaunch_requested:
+                    mprint("Relaunch requested by the backend, exiting without restarting")
                     break
 
                 # Check if this was a startup failure
@@ -831,14 +891,20 @@ class Supervisor:
                     break
                 continue
 
-        except (KeyboardInterrupt, ParentProcessExited):
+        except (KeyboardInterrupt, ParentProcessExited) as e:
             # First CTRL+C, or the parent process exited: initiate graceful
-            # shutdown
+            # shutdown. The line is printed here, never in the handler: a
+            # handler that logs runs inside the stdout write() it interrupted
+            # and loses its KeyboardInterrupt to a reentrant-write error (see
+            # handle_sigint). A parent exit carries no signal to report.
             try:
+                if isinstance(e, KeyboardInterrupt):
+                    mprint(f"Received {self._signal_name()}, initiating graceful shutdown...", start='\n')
                 if not self.graceful_shutdown():
                     self.force_shutdown()
             except KeyboardInterrupt:
                 # Second CTRL+C - force kill immediately
+                mprint(f"Received {self._signal_name()}, force killing backend...", start='\n')
                 self.force_shutdown()
 
         except Exception as e:

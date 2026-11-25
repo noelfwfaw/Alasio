@@ -1,0 +1,1267 @@
+"""
+Tests for the flow of a repo of the pack server: Repo.
+
+One run generates the workspace of the config in the run directory, from a
+mock git repo and an in-memory pypi mirror (MockMirror, the mirror of the fetch
+tests): the wheels of the dependency versions, the packs of the dependencies,
+the packs of the repo tree, and latest.pack, the publication barrier. The
+channel is verified with the decode side of the library: the full pack of the
+target decodes to the install tree of its wheel, the update packs are applied
+to an unpacked old version with UpdateJob and compared against the tree of the
+new version.
+"""
+import os
+
+import pytest
+import trio
+
+from alasio.config.entry.mod_entry import MOD_ENTRY_PATH
+from alasio.deploy.pack.decode_base import PackDecodeBase
+from alasio.deploy.pack.job_unpack import UnpackJob
+from alasio.deploy.pack.packdep import PACKDEP_PATH, decode_packdep
+from alasio.deploy.pack.server_file import LatestInfo
+from alasio.deploy_dev.pack import pack_wheel
+from alasio.deploy_dev.pack._pack_cache import PackCache
+from alasio.deploy_dev.pack_server import repo_base, repo_dep
+from alasio.deploy_dev.pack_server.fetch_wheel import WheelNotFoundError
+from alasio.deploy_dev.pack_server.manifest import LocalManifest, Manifest, is_private_path
+from alasio.deploy_dev.pack_server.model import LookbackConfig, PackRepoModel, RepoConfig
+from alasio.deploy_dev.pack_server.repo import Repo
+from alasio.deploy_dev.pack_server.repo_base import DEFAULT_INDEX
+from alasio.deploy_dev.pack_server.repo_export import ReleaseExportError
+from alasio.ext.path.atomic import file_read_bytes
+from alasio.ext.path.iter import iter_files
+from alasio.git.mock.mock_repo import MockGitRepo
+from alasio.logger import logger
+from alasio.testing.filesystem import fs  # noqa: F401
+from tests.deploy.simple_pip.conftest import build_wheel, site_packages
+from tests.deploy_dev.pack_server.conftest import join_path
+
+# the dependency files of the mock repo: httpx is pinned to a new version on
+# every commit, demo is pinned but is not a name the entry declares, so it gets
+# no pack, and msgspec is provided to pip with the wheels of its index
+
+pytestmark = [
+    pytest.mark.parallel,
+]
+
+# base url of the mock mirror, the index the pins of the dependency files are
+# annotated with: a compiled dependency file annotates every pin with the index
+# it was resolved from
+MIRROR_URL = 'http://mirror'
+
+# base url of the index the repo provides: a second base of the mock mirror,
+# with a path, like the index of a real mod
+PROVIDED_URL = 'http://provided.example/simple'
+
+# base url of an index that is neither the mirror of the pins nor the index of
+# the repo, the source of a pin the repo does not provide
+OTHER_URL = 'https://other.example/simple'
+
+# the proxy of the downloads of the tests: a local port the tests never connect
+# to, the client it builds is replaced by the one of the mock mirror
+PROXY = 'http://127.0.0.1:7890'
+
+
+def requirement(pin, source=MIRROR_URL):
+    """
+    Build a pin line with the '# from' annotation of a compiled dependency file.
+
+    Args:
+        pin (str): Pin as written in the file, e.g. 'httpx==0.28.1'
+        source (str): Base url of the index the pin came from. Defaults to
+            MIRROR_URL, the mock mirror of the tests
+
+    Returns:
+        str: The pin and its annotation, each on a line of its own
+    """
+    return f'{pin}\n    # from {source}\n'
+
+
+# the library the mock repo packs, and the electron archive its wheel carries:
+# the export copies the archive into resources/app.asar of the tree, so every
+# run of the mock repo needs the library to be one of its pack deps
+ALASIO_VERSION = '2.0.3'
+ALASIO_ASAR = b'APP-ASAR-CONTENT'
+
+# the pin line of the library: the archive of the client is a file of its pack
+# channel, so every repo that exports a release pins the library
+LIBRARY_REQUIREMENT = requirement(f'alasio=={ALASIO_VERSION}')
+
+
+REQUIREMENTS = {
+    'c1': (
+        requirement('httpx==0.27.7') + requirement('demo==1.0')
+        + LIBRARY_REQUIREMENT
+    ),
+    'c2': (
+        requirement('httpx==0.27.8') + requirement('demo==1.0')
+        + LIBRARY_REQUIREMENT
+    ),
+    'c3': (
+        requirement('httpx==0.28.1') + requirement('demo==1.0')
+        + requirement('msgspec==0.22.0', f'{PROVIDED_URL}/')
+        + LIBRARY_REQUIREMENT
+    ),
+}
+
+# entry of the mock repo: by default it declares the dependency the tests build
+# a pack channel of, see entry_source
+DEFAULT_ENTRY = "Mod:\n  name: m\nUpdate:\n  pack_deps:\n  - httpx\n  - alasio\n"
+
+# the deployment config template of the mock repo, the file the export copies to
+# config/deploy.yaml. The webapp locates a project by it, and a mod declares the
+# values of its own runtime here, so it is a file of the version and not
+# generated from a model of this library
+DEPLOY_TEMPLATE = 'config/deploy.template.yaml'
+DEPLOY_TEMPLATE_TEXT = """\
+Repo:
+  Repository: https://github.com/Author/Repo
+  Branch: master
+Python:
+  PythonExecutable: ./toolkit/python.exe
+Adb:
+  AdbExecutable: ./toolkit/Lib/site-packages/adbutils/binaries/adb.exe
+Update:
+  AutoUpdate: true
+"""
+
+# folder of the workspace of the config in the run directory
+WORKSPACE = 'pack/Author_Repo_master'
+
+# folder of the channel of the dependency of the tests
+DEP_FOLDER = f'{WORKSPACE}/packdep/httpx'
+
+# the content of the module that changes between two versions of the wheel
+CORE_V1 = b''.join(b'VALUE_%d = %d\n' % (index, index) for index in range(80))
+CORE_V2 = CORE_V1 + b'VALUE_NEW = 99\n'
+
+
+@pytest.fixture(autouse=True)
+def _fresh_cache(monkeypatch):
+    """
+    Fresh cache of the wheel pipeline for one test, see test_pack_wheel.
+    """
+    monkeypatch.setattr(pack_wheel, 'WHEEL_CACHE', PackCache())
+
+
+def entry_source(*names, provide=None, requirements_file=None):
+    """
+    Build the declaration of a mod entry declaring pack_deps.
+
+    Args:
+        *names (str): Names to declare, none for a declaration that omits the
+            key (an entry never declares the mirror the pack server fetches
+            from: the pins of the dependency file do)
+        provide (Iterable[str] | None): Value of the
+            provide_wheel declaration, None for a declaration
+            that omits the key (the default of ModEntry)
+        requirements_file (str | None): Value of the requirements_file
+            declaration, None for a declaration that omits the key
+
+    Returns:
+        str: Content of the mod entry file
+    """
+    lines = ['Mod:', '  name: m', 'Update:']
+    if names:
+        lines.append('  pack_deps:')
+        lines.extend(f'  - {name}' for name in names)
+    else:
+        # the declaration updates nothing by pack: an omitted key would mean
+        # the default, the library itself
+        lines.append('  pack_deps: []')
+    if provide is not None:
+        lines.append('  provide_wheel:')
+        lines.extend(f'  - {url!r}' for url in provide)
+    if requirements_file is not None:
+        lines.append(f'  requirements_file: {requirements_file!r}')
+    return '\n'.join(lines) + '\n'
+
+
+def make_repo(requirements=None, branch='master', entry=DEFAULT_ENTRY):
+    """
+    Build a mock repo of a linear commit chain with a requirements file.
+
+    Args:
+        requirements (dict | None): {commit: content of requirements.txt}, the
+            oldest commit first, the parent of a commit is the one before it.
+            Defaults to REQUIREMENTS
+        branch (str): Branch of the head. Defaults to 'master'.
+        entry (str | dict | None): Source of the mod entry. A str is
+            registered at every commit, a dict is {commit: source} (a commit
+            without an entry is not registered), None registers no entry.
+            Defaults to DEFAULT_ENTRY, an entry declaring httpx.
+
+    Returns:
+        MockGitRepo: Repo, the head of the branch is the newest commit
+    """
+    requirements = REQUIREMENTS if requirements is None else requirements
+    repo = MockGitRepo()
+    parent = None
+    for index, (commit, content) in enumerate(requirements.items()):
+        repo.register_file(commit, 'requirements.txt', content.encode('utf-8'))
+        repo.register_file(
+            commit, DEPLOY_TEMPLATE, DEPLOY_TEMPLATE_TEXT.encode('utf-8'))
+        source = entry.get(commit) if isinstance(entry, dict) else entry
+        if source is not None:
+            repo.register_file(commit, MOD_ENTRY_PATH, source.encode('utf-8'))
+        repo.register_commit(
+            commit, parents=[parent] if parent else None,
+            author_name='Author', author_time=index, message=f'commit {commit}')
+        parent = commit
+    repo.register_branch(branch, parent)
+    repo.register_head(parent)
+    return repo
+
+
+def make_config():
+    """
+    Build a pack config of the tests: the window only, the rest comes from the
+    mod entry of the repo.
+
+    Returns:
+        PackRepoModel: Config
+    """
+    return PackRepoModel(
+        Repo=RepoConfig(
+            Remote='https://github.com/Author/Repo',
+            Author='Author',
+            Repo='Repo',
+            Branch='master',
+        ),
+        Lookback=LookbackConfig(MaxCommitDay=0),
+    )
+
+
+def make_proxy_config(proxy=PROXY):
+    """
+    Build a pack config whose downloads go through a proxy.
+
+    Args:
+        proxy (str): Proxy url. Defaults to PROXY, the proxy of the tests
+
+    Returns:
+        PackRepoModel: Config
+    """
+    config = make_config()
+    config.Env.Proxy = proxy
+    return config
+
+
+def demo_files(version, core):
+    """
+    Files of the httpx wheel of a version.
+
+    Args:
+        version (str): Version of the wheel
+        core (bytes): Content of the module that changes between versions
+
+    Returns:
+        dict[str, bytes]: {member of the wheel: content}
+    """
+    return {
+        'httpx/__init__.py': b'',
+        'httpx/core.py': core,
+        f'httpx/version-{version}.txt': f'{version}\n'.encode('utf-8'),
+    }
+
+
+def register_wheel(mirror, version, core):
+    """
+    Build a wheel of the tests on the fake filesystem and register it in the mirror.
+
+    Args:
+        mirror (MockMirror): Mirror to register the wheel in
+        version (str): Version of the wheel
+        core (bytes): Content of the module that changes between versions
+
+    Returns:
+        bytes: Content of the wheel
+    """
+    path = f'/w/httpx-{version}-py3-none-any.whl'
+    build_wheel(path, demo_files(version, core), name='httpx', version=version)
+    content = file_read_bytes(path)
+    mirror.register('httpx', version, content=content)
+    return content
+
+
+def register_library(mirror, version=ALASIO_VERSION, asar=ALASIO_ASAR):
+    """
+    Build the wheel of the library and register it in the mirror.
+
+    The wheel carries the electron archive the export copies into the tree, so
+    every run of the mock repo has a client to ship like a real mod does.
+
+    Args:
+        mirror (MockMirror): Mirror to register the wheel in
+        version (str): Version of the library
+        asar (bytes): Content of app.asar inside the wheel
+    """
+    path = f'/w/alasio-{version}-py3-none-any.whl'
+    build_wheel(path, {
+        'alasio/__init__.py': f'VERSION = "{version}"\n'.encode(),
+        'alasio/deploy_data/webapp/app.asar': asar,
+    }, name='alasio', version=version)
+    mirror.register('alasio', version, content=file_read_bytes(path))
+
+
+def register_wheels(mirror):
+    """
+    Register the wheels of the mock repo.
+
+    Args:
+        mirror (MockMirror): Mirror to register the wheels in
+    """
+    register_wheel(mirror, '0.27.7', CORE_V1)
+    register_wheel(mirror, '0.27.8', CORE_V1)
+    register_wheel(mirror, '0.28.1', CORE_V2)
+    register_library(mirror)
+
+
+def cache_file(run_dir, version, name='httpx'):
+    """
+    Path of the fetched wheel of a version in the cache of the workspace.
+
+    Returns:
+        PathStr: {run}/pack/Author_Repo_master/.wheel_cache/httpx/{version}/...
+    """
+    return join_path(
+        run_dir, WORKSPACE, '.wheel_cache', name, version,
+        f'{name}-{version}-py3-none-any.whl')
+
+
+def wheel_file(run_dir, version, name='httpx'):
+    """
+    Path of the provided wheel of a version in the pip index of the workspace.
+
+    Returns:
+        PathStr: {run}/pack/Author_Repo_master/wheel/httpx/{version}/...
+    """
+    return join_path(
+        run_dir, WORKSPACE, 'wheel', name, version,
+        f'{name}-{version}-py3-none-any.whl')
+
+
+def pack_file(run_dir, *parts):
+    """
+    Path of a file of the channel of the dependency in the run directory.
+
+    Returns:
+        PathStr: {run}/pack/Author_Repo_master/packdep/httpx/...
+    """
+    return join_path(run_dir, DEP_FOLDER, *parts)
+
+
+def repo_file(run_dir, *parts):
+    """
+    Path of a file of the packs of the repo tree in the run directory.
+
+    Returns:
+        PathStr: {run}/pack/Author_Repo_master/packrepo/...
+    """
+    return join_path(run_dir, WORKSPACE, 'packrepo', *parts)
+
+
+def run_commit(repo, config, client):
+    """
+    Run and commit a Repo, the normal flow after the repo is cloned.
+
+    Returns:
+        Repo: The flow that ran
+    """
+    gen = Repo(repo, config, client=client)
+    gen.run()
+    gen.commit()
+    return gen
+
+
+def read_tree(root):
+    """
+    Read a folder of the test as {relative path: content}.
+
+    The log folder of the logger is not part of the tree.
+
+    Args:
+        root (str): Root folder
+
+    Returns:
+        dict[str, bytes]: {filepath: content}
+    """
+    root = str(root)
+    tree = {}
+    for path in iter_files(root, recursive=True):
+        relative = os.path.relpath(path, root).replace(os.sep, '/')
+        if relative.split('/')[0] == 'log':
+            continue
+        tree[relative] = file_read_bytes(path)
+    return tree
+
+
+class TestDeps:
+    """The dependencies of the window, and what each of them asks for."""
+
+    def test_deps(self, fs, run_dir, mirror):
+        """A declared name carries the pins of the window, the latest first."""
+        gen = Repo(make_repo(), make_config())
+        deps = gen.base.deps
+        # demo is pinned by the files but is neither declared nor provided: no
+        # entry, nothing to build of it
+        assert list(deps) == ['httpx', 'alasio']
+        info = deps['httpx']
+        assert info.name == 'httpx'
+        assert info.latest.version == '0.28.1'
+        assert list(info.lookbacks) == ['0.27.8', '0.27.7']
+        assert [pin.version for pin in info.versions] == ['0.28.1', '0.27.8', '0.27.7']
+        # the entry declares httpx for pack updates, its source is not provided
+        assert info.pack_dep is True
+        assert info.provide_wheel is False
+        # the library is declared by the entry and pinned by the files, and it
+        # is the channel the export ships the archive of the client from
+        library = deps['alasio']
+        assert library.latest.version == ALASIO_VERSION
+        assert library.lookbacks == {}
+        assert library.pack_dep is True
+        assert library.provide_wheel is False
+
+    def test_undeclared_name(self, fs, run_dir, mirror):
+        """A pinned name the mod entry does not declare is not in the mapping."""
+        gen = Repo(make_repo(entry=entry_source('demo')), make_config())
+        deps = gen.base.deps
+        assert list(deps) == ['demo']
+        assert deps['demo'].latest.version == '1.0'
+        assert deps['demo'].lookbacks == {}
+        assert deps['demo'].pack_dep is True
+
+    def test_name_without_pin(self, fs, run_dir, mirror):
+        """A declared name the window does not pin is reported, nothing is built of it."""
+        with logger.mock_capture_writer() as capture:
+            gen = Repo(make_repo(entry=entry_source('requests')), make_config())
+            assert gen.base.deps == {}
+        assert capture.concat() == """\
+INFO | Using pack_deps of module/config/_index/mod_entry.yaml at c3: requests
+WARNING | Dependency "requests" is not pinned to a version in the lookback window, nothing is built of it; a dependency of the mod entry pack_deps must be pinned with "==" in the dependency file of the repo
+"""
+
+    def test_name_is_normalized(self, fs, run_dir, mirror):
+        """The names of the entry and of the files are compared PEP 503 normalized."""
+        requirements = {'c1': requirement('ruamel.yaml==0.18.6')}
+        gen = Repo(make_repo(requirements, entry=entry_source('ruamel_yaml')), make_config())
+        deps = gen.base.deps
+        assert list(deps) == ['ruamel-yaml']
+        assert deps['ruamel-yaml'].latest.version == '0.18.6'
+
+    def test_entry_without_pack_deps(self, fs, run_dir, mirror):
+        """An entry without pack_deps declares no dependency."""
+        gen = Repo(make_repo(entry=entry_source()), make_config())
+        assert gen.base.deps == {}
+
+    def test_entry_missing(self, fs, run_dir, mirror):
+        """A repo without an entry gets the defaults: the library updated by pack."""
+        with logger.mock_capture_writer() as capture:
+            gen = Repo(make_repo(entry=None), make_config())
+            assert list(gen.base.deps) == ['alasio']
+        assert capture.concat() == """\
+INFO | Using pack_deps of module/config/_index/mod_entry.yaml at c3: alasio, msgspecerror
+WARNING | Dependency "msgspecerror" is not pinned to a version in the lookback window, nothing is built of it; a dependency of the mod entry pack_deps must be pinned with "==" in the dependency file of the repo
+"""
+
+    def test_entry_broken(self, fs, run_dir, mirror):
+        """A declaration that cannot be read fails the sample, nothing is silently dropped."""
+        entry = 'Mod:\n  name: m\nUpdate:\n  pack_deps: [unclosed\n'
+        gen = Repo(make_repo(entry=entry), make_config())
+        with pytest.raises(ValueError, match='invalid yaml'):
+            _ = gen.base.deps
+
+    def test_name_without_latest(self, fs, run_dir, mirror):
+        """A name the latest commit drops is not built, its historical packs are kept."""
+        requirements = {
+            'c1': requirement('httpx==0.27.7'),
+            'c2': requirement('demo==1.0'),
+        }
+        gen = Repo(make_repo(requirements, entry=entry_source('httpx')), make_config())
+        with logger.mock_capture_writer() as capture:
+            assert gen.base.deps == {}
+        assert capture.concat() == """\
+INFO | Using pack_deps of module/config/_index/mod_entry.yaml at c2: httpx
+WARNING | Dependency "httpx" is not pinned by the latest commit, no pack is built of it, its historical packs are kept
+"""
+
+
+class TestFetchIndex:
+    """The index of a fetch: the source the dependency file annotates the pin with."""
+
+    def test_pin_source(self, fs, run_dir, mirror):
+        """A pin is fetched from its own index, not from a mirror of the entry."""
+        mirror.alias(OTHER_URL)
+        register_wheels(mirror)
+        requirements = {'c1': requirement('httpx==0.28.1', f'{OTHER_URL}/') + LIBRARY_REQUIREMENT}
+        run_commit(make_repo(requirements), make_config(), mirror.client)
+        assert mirror.requests == [
+            f'{OTHER_URL}/httpx/',
+            'https://other.example/packages/httpx-0.28.1-py3-none-any.whl',
+            'http://mirror/alasio/',
+            'http://mirror/packages/alasio-2.0.3-py3-none-any.whl',
+        ]
+        assert cache_file(run_dir, '0.28.1').isfile()
+
+    def test_pin_without_source(self, fs, run_dir, mirror):
+        """A pin without an annotation is fetched from the official PyPI index."""
+        mirror.alias(DEFAULT_INDEX)
+        register_wheels(mirror)
+        requirements = {'c1': 'httpx==0.28.1\n' + LIBRARY_REQUIREMENT}
+        run_commit(make_repo(requirements), make_config(), mirror.client)
+        assert mirror.requests == [
+            f'{DEFAULT_INDEX}/httpx/',
+            'https://pypi.org/packages/httpx-0.28.1-py3-none-any.whl',
+            'http://mirror/alasio/',
+            'http://mirror/packages/alasio-2.0.3-py3-none-any.whl',
+        ]
+
+    def test_pin_index_is_normalized(self, fs, run_dir, mirror):
+        """The case of the host and the trailing slash of the annotation do not change the index."""
+        mirror.alias(OTHER_URL)
+        register_wheels(mirror)
+        requirements = {
+            'c1': requirement('httpx==0.28.1', 'https://Other.Example/simple/')
+            + LIBRARY_REQUIREMENT,
+        }
+        run_commit(make_repo(requirements), make_config(), mirror.client)
+        # the index is requested as the annotation normalized it
+        assert mirror.requests[0] == f'{OTHER_URL}/httpx/'
+
+
+class TestProvidedPins:
+    """The pins whose index the repo provides, and the index they are fetched from."""
+
+    def test_provide_wheel_default(self, fs, run_dir):
+        """An entry that declares no provided index keeps the default of ModEntry."""
+        from alasio.config.entry.mod_entry import DEFAULT_UPDATE_PROVIDE_PYPI_MIRRORS
+
+        gen = Repo(make_repo(), make_config())
+        url = DEFAULT_UPDATE_PROVIDE_PYPI_MIRRORS[0]
+        assert gen.base.provide_wheel == {url.rstrip('/'): url}
+
+    def test_provide_wheel_normalized(self, fs, run_dir):
+        """The declared indexes are normalized, the repeated one is kept once."""
+        entry = entry_source('httpx', provide=(
+            'http://Deps.Example:80/simple/',
+            'http://deps.example/simple',
+        ))
+        gen = Repo(make_repo(entry=entry), make_config())
+        assert gen.base.provide_wheel == {
+            'http://deps.example/simple': 'http://Deps.Example:80/simple/',
+        }
+
+    def test_provided_pins(self, fs, run_dir):
+        """Every pin of the latest commit from a provided index is provided, declared or not."""
+        requirements = {
+            'c1': requirement('httpx==0.27.7'),
+            'c2': requirement('httpx==0.27.8', f'{PROVIDED_URL}/'),
+            'c3': (
+                requirement('httpx==0.28.1', f'{PROVIDED_URL}/')
+                + requirement('demo==1.0', PROVIDED_URL)
+            ),
+        }
+        entry = entry_source('httpx', provide=(f'{PROVIDED_URL}/',))
+        gen = Repo(make_repo(requirements, entry=entry), make_config())
+        deps = gen.base.deps
+        assert list(deps) == ['httpx', 'demo']
+        # httpx is declared by the entry, so it is a pack channel, and a pack
+        # channel is not provided too: the pack already serves the version
+        assert deps['httpx'].latest.version == '0.28.1'
+        assert deps['httpx'].pack_dep is True
+        assert deps['httpx'].provide_wheel is False
+        # demo is not declared, it is provided anyway: the client installs it
+        # with pip
+        assert deps['demo'].latest.version == '1.0'
+        assert deps['demo'].provide_wheel is True
+        assert deps['demo'].pack_dep is False
+        assert deps['demo'].lookbacks == {}
+
+    def test_provided_pin_of_an_unprovided_source(self, fs, run_dir):
+        """A pin from an index the repo does not provide is not provided."""
+        requirements = {'c1': requirement('httpx==0.28.1', f'{OTHER_URL}/')}
+        entry = entry_source('httpx', provide=(PROVIDED_URL,))
+        gen = Repo(make_repo(requirements, entry=entry), make_config())
+        info = gen.base.deps['httpx']
+        assert info.provide_wheel is False
+        assert info.pack_dep is True
+
+    def test_provided_pins_of_a_repo_without_pack_deps(self, fs, run_dir):
+        """A repo that declares no pack channel still provides its pins."""
+        requirements = {'c1': requirement('httpx==0.28.1', f'{PROVIDED_URL}/')}
+        entry = entry_source(provide=(PROVIDED_URL,))
+        gen = Repo(make_repo(requirements, entry=entry), make_config())
+        info = gen.base.deps['httpx']
+        assert info.provide_wheel is True
+        assert info.pack_dep is False
+
+
+class TestRun:
+    """Generate the workspace of a repo."""
+
+    def test_channel(self, fs, run_dir, mirror):
+        """The wheels, the packs of the dependency and the packs of the tree are generated."""
+        register_wheels(mirror)
+        gen = Repo(make_repo(), make_config(), client=mirror.client)
+        assert gen.run() is None
+
+        # 1. the wheel of every version is fetched to the private cache
+        for version in ('0.27.7', '0.27.8', '0.28.1'):
+            assert cache_file(run_dir, version).isfile()
+        assert not any('demo' in url for url in mirror.requests)
+
+        # 2. the full pack of the target version and the update pack of every
+        # other version to it
+        decoder = PackDecodeBase(file_read_bytes(pack_file(run_dir, '0.28.1', 'full.pack')))
+        decoder.validate()
+        assert decoder.current_version == '0.28.1'
+        assert decoder.old_version == ''
+        for old in ('0.27.7', '0.27.8'):
+            update = PackDecodeBase(
+                file_read_bytes(pack_file(run_dir, '0.28.1', f'update_{old}.pack')))
+            update.validate()
+            assert update.old_version == old
+        # the channel of the dependency has the folder of the target only
+        assert list(join_path(run_dir, DEP_FOLDER).iter_foldernames()) == ['0.28.1']
+
+        # 3. the packs of the repo tree, the full pack carries the packdep
+        full = PackDecodeBase(file_read_bytes(repo_file(run_dir, 'c3', 'full.pack')))
+        full.validate()
+        assert full.current_version == 'c3'
+        entries = decode_packdep(bytes(full.catfile(full.fileinfo[PACKDEP_PATH])))
+        assert list(entries) == ['alasio', 'httpx']
+        assert entries['httpx'].version == '0.28.1'
+        assert entries['httpx'].index_checksum == \
+            bytes(decoder.extract_index_pack())[-20:]
+
+        # 4. latest.pack is not written by run(), it is the barrier
+        assert not repo_file(run_dir, 'latest.pack').exists()
+
+        gen.commit()
+        assert repo_file(run_dir, 'latest.pack').isfile()
+        library = PackDecodeBase(file_read_bytes(join_path(
+            run_dir, WORKSPACE, 'packdep', 'alasio', ALASIO_VERSION, 'full.pack')))
+        assert gen.dep.published == {
+            'httpx': ('0.28.1', bytes(decoder.extract_index_pack())[-20:]),
+            'alasio': (ALASIO_VERSION, bytes(library.extract_index_pack())[-20:]),
+        }
+
+    def test_no_pip_index_without_provided_pins(self, fs, run_dir, mirror):
+        """A repo that provides no index publishes no wheel."""
+        register_wheels(mirror)
+        run_commit(make_repo(), make_config(), mirror.client)
+        assert not join_path(run_dir, WORKSPACE, 'wheel').exists()
+
+    def test_no_dependency(self, fs, run_dir, mirror):
+        """A repo without a dependency channel ships no client archive: no release."""
+        requirements = {'c1': requirement('httpx==0.28.1')}
+        gen = Repo(
+            make_repo(requirements, entry=entry_source()), make_config(),
+            client=mirror.client)
+        assert gen.base.deps == {}
+        with pytest.raises(ReleaseExportError, match='carry no app.asar'):
+            gen.run()
+        # the packs of the tree are on the disk, the barrier of the version is
+        # not: a run that cannot export a release publishes nothing
+        assert repo_file(run_dir, 'c1', 'full.pack').isfile()
+        assert not repo_file(run_dir, 'latest.pack').exists()
+        assert gen.dep.published == {}
+
+    def test_full_pack_is_the_install_tree(self, fs, run_dir, mirror):
+        """The full pack of a version unpacks to the install tree of its wheel."""
+        register_wheels(mirror)
+        Repo(make_repo(), make_config(), client=mirror.client).run()
+
+        site = site_packages(fs)
+        with logger.mock_capture_writer():
+            assert trio.run(UnpackJob(
+                file_read_bytes(pack_file(run_dir, '0.28.1', 'full.pack')),
+                root=site, name='httpx'
+            ).run)
+        job = None
+        new = pack_wheel.PackWheel(cache_file(run_dir, '0.28.1'))
+        for path, file in new.tree.items():
+            assert file_read_bytes(f'{site}/{path}') == file.content, path
+        assert file_read_bytes(f'{site}/.pack/httpx/index.pack') == new.index_pack
+
+    def test_missing_target_wheel_fails(self, fs, run_dir, mirror):
+        """A target without a usable wheel fails the run, no latest.pack is written."""
+        register_wheel(mirror, '0.27.8', CORE_V1)
+        register_wheel(mirror, '0.27.7', CORE_V1)
+        gen = Repo(make_repo(), make_config(), client=mirror.client)
+        with pytest.raises(WheelNotFoundError, match='No usable wheel of the target dependency'):
+            gen.run()
+        assert not repo_file(run_dir, 'latest.pack').exists()
+
+    def test_missing_historical_wheel_fails(self, fs, run_dir, mirror):
+        """A historical version without a usable wheel fails the complete build."""
+        register_wheel(mirror, '0.28.1', CORE_V2)
+        register_wheel(mirror, '0.27.7', CORE_V1)
+        gen = Repo(make_repo(), make_config(), client=mirror.client)
+        with pytest.raises(WheelNotFoundError, match='No usable wheel of the historical dependency'):
+            gen.run()
+        assert not repo_file(run_dir, 'latest.pack').exists()
+
+    def test_commit_requires_run(self, fs, run_dir, mirror):
+        """commit() before run() cannot publish a version whose packs are missing."""
+        gen = Repo(make_repo(), make_config())
+        with pytest.raises(RuntimeError, match='run\\(\\) must be called'):
+            gen.commit()
+
+
+class TestProvidedIndex:
+    """The pip index of the provided pins."""
+
+    def test_provided_wheels_published(self, fs, run_dir, mirror):
+        """Every wheel of a provided pin is copied from the cache to the pip index."""
+        mirror.alias(PROVIDED_URL)
+        register_wheels(mirror)
+        mirror.register('msgspec', '0.22.0', tags='cp38-cp38-win_amd64')
+        mirror.register('msgspec', '0.22.0', tags='cp38-cp38-manylinux_2_17_x86_64')
+        requirements = {
+            'c1': requirement('httpx==0.27.7') + LIBRARY_REQUIREMENT,
+            'c2': requirement('httpx==0.27.8') + LIBRARY_REQUIREMENT,
+            'c3': (
+                requirement('httpx==0.28.1')
+                + requirement('msgspec==0.22.0', f'{PROVIDED_URL}/')
+                + LIBRARY_REQUIREMENT
+            ),
+        }
+        entry = entry_source('httpx', 'alasio', provide=(PROVIDED_URL,))
+        run_commit(make_repo(requirements, entry=entry), make_config(), mirror.client)
+
+        # the provided pin is in the cache and in the pip index, one file per
+        # platform, the version folder of the index
+        folder = join_path(run_dir, WORKSPACE, 'wheel', 'msgspec', '0.22.0')
+        assert sorted(folder.iter_filenames()) == [
+            'msgspec-0.22.0-cp38-cp38-manylinux_2_17_x86_64.whl',
+            'msgspec-0.22.0-cp38-cp38-win_amd64.whl',
+        ]
+        # the declared dependency is not provided: its wheel stays private
+        assert not join_path(run_dir, WORKSPACE, 'wheel', 'httpx').exists()
+        # the fetch of the provided pin used its own index
+        assert f'{PROVIDED_URL}/msgspec/' in mirror.requests
+
+    def test_pack_channel_pin_is_not_published(self, fs, run_dir, mirror):
+        """A provided pin of a pack channel is fetched as pack input, never published."""
+        mirror.alias(PROVIDED_URL)
+        register_wheels(mirror)
+        requirements = {
+            'c1': requirement('httpx==0.27.7') + LIBRARY_REQUIREMENT,
+            'c2': requirement('httpx==0.27.8') + LIBRARY_REQUIREMENT,
+            'c3': requirement('httpx==0.28.1', f'{PROVIDED_URL}/') + LIBRARY_REQUIREMENT,
+        }
+        entry = entry_source('httpx', 'alasio', provide=(PROVIDED_URL,))
+        run_commit(make_repo(requirements, entry=entry), make_config(), mirror.client)
+
+        assert f'{PROVIDED_URL}/httpx/' in mirror.requests
+        assert 'http://mirror/httpx/' in mirror.requests
+        # the pin is the target of a pack channel: its wheel is the pack input,
+        # and the same version is not published to the pip index a second time
+        assert cache_file(run_dir, '0.28.1').isfile()
+        assert not wheel_file(run_dir, '0.28.1').isfile()
+
+    def test_unprovided_pin_not_published(self, fs, run_dir, mirror):
+        """A pin of an index the repo does not provide is fetched, not published."""
+        mirror.alias(OTHER_URL)
+        register_wheels(mirror)
+        requirements = {'c1': requirement('httpx==0.28.1', f'{OTHER_URL}/') + LIBRARY_REQUIREMENT}
+        entry = entry_source('httpx', 'alasio', provide=(PROVIDED_URL,))
+        run_commit(make_repo(requirements, entry=entry), make_config(), mirror.client)
+
+        assert cache_file(run_dir, '0.28.1').isfile()
+        assert not join_path(run_dir, WORKSPACE, 'wheel').exists()
+
+
+class TestExistingPacks:
+    """The packs and wheels of an earlier run are kept."""
+
+    def test_existing_packs_are_kept(self, fs, run_dir, mirror, monkeypatch):
+        """A complete workspace is kept as it is: nothing is fetched or built again."""
+        register_wheels(mirror)
+        repo = make_repo()
+        Repo(repo, make_config(), client=mirror.client).run()
+        tree = read_tree(join_path(run_dir, WORKSPACE))
+        requests = list(mirror.requests)
+
+        # no pack of a version may be built again: the encoders of the second
+        # run fail the test when they are constructed, the writes are collected
+        class NoBuild:
+            PACK_VERSION = pack_wheel.PackWheel.PACK_VERSION
+
+            def __init__(self, *args, **kwargs):
+                raise AssertionError('the pack must not be built again')
+
+        written = []
+        monkeypatch.setattr(repo_dep, 'PackWheel', NoBuild)
+        monkeypatch.setattr(repo_dep, 'PackWheelUpdate', NoBuild)
+        monkeypatch.setattr(
+            repo_dep, 'atomic_write_stream', lambda file, data: written.append(str(file)))
+        Repo(repo, make_config(), client=mirror.client).run()
+
+        assert written == []
+        # the second run is answered by the local files alone: the snapshot of
+        # the index page of every version and the wheels are in the cache, no
+        # request is made at all
+        assert mirror.requests == requests
+        assert read_tree(join_path(run_dir, WORKSPACE)) == tree
+
+
+class TestCleanup:
+    """The files the run did not touch are removed, the ones it used are kept."""
+
+    def test_stale_files_removed(self, fs, run_dir, mirror):
+        """Every file of the workspace the run did not touch goes, the used ones stay."""
+        register_wheels(mirror)
+        # the files of earlier runs: a version out of the window in both
+        # folders, a name the entry does not declare, the packs of a replaced
+        # version, and a file of another tool
+        stale = [
+            join_path(run_dir, WORKSPACE, '.wheel_cache', 'httpx', '0.26.0', 'index.html'),
+            join_path(run_dir, WORKSPACE, '.wheel_cache', 'demo', '1.0',
+                      'demo-1.0-py3-none-any.whl'),
+            pack_file(run_dir, '0.26.0', 'full.pack'),
+            join_path(run_dir, DEP_FOLDER, '0.28.1', 'update_0.26.0.pack'),
+            repo_file(run_dir, 'c2', 'full.pack'),
+            join_path(run_dir, WORKSPACE, 'notes.txt'),
+        ]
+        for file in stale:
+            fs.create_file(file, contents=b'stale')
+
+        with logger.mock_capture_writer() as capture:
+            run_commit(make_repo(), make_config(), mirror.client)
+
+        log = capture.concat()
+        # a folder with no file of the run is removed as a whole, the files of
+        # a version that slid out of the window are not walked one by one
+        folders = (
+            join_path(run_dir, WORKSPACE, '.wheel_cache', 'httpx', '0.26.0'),
+            join_path(run_dir, WORKSPACE, '.wheel_cache', 'demo'),
+            join_path(run_dir, DEP_FOLDER, '0.26.0'),
+            repo_file(run_dir, 'c2'),
+        )
+        for folder in folders:
+            assert f'INFO | Removing stale folder: "{folder}"\n' in log
+        assert (f'INFO | Removing stale file: '
+                f'"{join_path(run_dir, DEP_FOLDER, "0.28.1", "update_0.26.0.pack")}"\n' in log)
+        assert stale[-1].name == 'notes.txt'
+        assert f'INFO | Removing stale file: "{stale[-1]}"\n' in log
+        for file in stale:
+            assert not file.exists()
+        # the files of the run are the manifest
+        for version in ('0.27.7', '0.27.8', '0.28.1'):
+            assert cache_file(run_dir, version).isfile()
+        assert cache_file(run_dir, '0.28.1').joinpath('..').joinpath('index.html').isfile()
+        assert pack_file(run_dir, '0.28.1', 'full.pack').isfile()
+        assert pack_file(run_dir, '0.28.1', 'update_0.27.7.pack').isfile()
+        assert repo_file(run_dir, 'c3', 'full.pack').isfile()
+        assert repo_file(run_dir, 'latest.pack').isfile()
+        # the folders the removal left empty are gone
+        assert not join_path(run_dir, WORKSPACE, '.wheel_cache', 'demo').exists()
+        assert not join_path(run_dir, WORKSPACE, 'packdep', 'httpx', '0.26.0').exists()
+        assert f'INFO | Cleaned up "Author_Repo_master":' in log
+
+    def test_stale_file_in_the_cache_folder_removed(self, fs, run_dir, mirror):
+        """A file an earlier run left in a cache folder goes, the files of the run stay."""
+        register_wheels(mirror)
+        # a wheel of the same version that the run does not download: the folder
+        # is used by this run, the file is not
+        stale = join_path(
+            run_dir, WORKSPACE, '.wheel_cache', 'httpx', '0.28.1',
+            'httpx-0.28.1-cp38-cp38-win_amd64.whl')
+        fs.create_file(stale, contents=b'stale')
+
+        run_commit(make_repo(), make_config(), mirror.client)
+
+        assert not stale.exists()
+        assert cache_file(run_dir, '0.28.1').isfile()
+        assert join_path(
+            run_dir, WORKSPACE, '.wheel_cache', 'httpx', '0.28.1', 'index.html').isfile()
+
+    def test_nothing_provided_leaves_no_wheel(self, fs, run_dir, mirror):
+        """A repo that provides no pin keeps no file of the pip index."""
+        register_wheels(mirror)
+        stale = join_path(run_dir, WORKSPACE, 'wheel', 'demo', '1.0', 'demo-1.0-py3-none-any.whl')
+        fs.create_file(stale, contents=b'stale')
+
+        run_commit(make_repo(), make_config(), mirror.client)
+
+        assert not stale.exists()
+        assert not join_path(run_dir, WORKSPACE, 'wheel', 'demo').exists()
+
+    def test_removal_is_best_effort(self, fs, run_dir, mirror, monkeypatch):
+        """A file the filesystem refuses to remove is logged and left, the flow goes on."""
+        register_wheels(mirror)
+        stale = pack_file(run_dir, '0.26.0', 'full.pack')
+        fs.create_file(stale, contents=b'stale')
+
+        def fail(file):
+            # the answer of file_remove() for a path it did not remove: the
+            # caller looks the path up to tell a refused removal from an entry
+            # another process removed
+            return False
+
+        monkeypatch.setattr(repo_base, 'file_remove', fail)
+        with logger.mock_capture_writer() as capture:
+            run_commit(make_repo(), make_config(), mirror.client)
+
+        log = capture.concat()
+        assert f'WARNING | Failed to remove stale file "{stale}"\n' in log
+        assert 'left to the next run' in log
+        assert stale.isfile()
+        # the version is published all the same: the cleanup runs after the
+        # barrier and never fails the run
+        assert repo_file(run_dir, 'latest.pack').isfile()
+        assert join_path(run_dir, WORKSPACE, 'manifest.json').isfile()
+
+    def test_locked_file_does_not_fail_the_run(self, fs, run_dir, mirror, monkeypatch):
+        """A file a process still holds open is left to the next run, the run succeeds.
+
+        On Windows os.unlink() of a file another process opened raises
+        PermissionError (WinError 32), which file_remove() does not catch. The
+        cleanup runs after latest.pack is written, so the failure must not
+        undo the publication: the entry is logged and the next run retries it.
+        """
+        register_wheels(mirror)
+        stale = pack_file(run_dir, '0.26.0', 'full.pack')
+        fs.create_file(stale, contents=b'stale')
+        original = repo_base.file_remove
+
+        def locked(file):
+            if str(file) == str(stale):
+                raise PermissionError(13, 'The process cannot access the file', str(file))
+            return original(file)
+
+        monkeypatch.setattr(repo_base, 'file_remove', locked)
+        with logger.mock_capture_writer() as capture:
+            gen = Repo(make_repo(), make_config(), client=mirror.client)
+            gen.run()
+            # no PermissionError escapes the commit
+            gen.commit()
+
+        log = capture.concat()
+        assert (f'WARNING | Failed to remove stale file "{stale}": '
+                f"[Errno 13] The process cannot access the file: '{stale}'\n") in log
+        assert stale.isfile()
+        # the publication is complete: the barrier and the manifest name the
+        # version of this run
+        assert repo_file(run_dir, 'latest.pack').isfile()
+        assert join_path(run_dir, WORKSPACE, 'manifest.json').isfile()
+        assert Manifest.from_file(
+            join_path(run_dir, WORKSPACE, 'manifest.json')).version == 'c3'
+
+    def test_locked_folder_does_not_fail_the_run(self, fs, run_dir, mirror, monkeypatch):
+        """A folder the filesystem refuses to remove is left to the next run."""
+        register_wheels(mirror)
+        stale = repo_file(run_dir, 'c2')
+        fs.create_file(join_path(stale, 'full.pack'), contents=b'stale')
+        original = repo_base.folder_rmtree_empty
+
+        def locked(folder):
+            if str(folder) == str(stale):
+                raise PermissionError(13, 'The process cannot access the file', str(folder))
+            return original(folder)
+
+        monkeypatch.setattr(repo_base, 'folder_rmtree_empty', locked)
+        with logger.mock_capture_writer() as capture:
+            run_commit(make_repo(), make_config(), mirror.client)
+
+        assert f'WARNING | Failed to remove stale folder "{stale}": ' in capture.concat()
+        assert stale.isdir()
+        assert repo_file(run_dir, 'latest.pack').isfile()
+
+    def test_entry_gone_before_the_removal_is_not_a_failure(self, fs, run_dir, mirror, monkeypatch):
+        """An entry another process removed first is gone, not a failed removal.
+
+        folder_rmtree_empty() and file_remove() answer False both for "nothing
+        was removed" and for "the path is still there": the cleanup looks the
+        entry up once after a False, so a removal another process already did
+        is not reported as a failure.
+        """
+        register_wheels(mirror)
+        stale = pack_file(run_dir, '0.26.0', 'full.pack')
+        fs.create_file(stale, contents=b'stale')
+        original = repo_base.file_remove
+
+        def raced(file):
+            if str(file) == str(stale):
+                # another process removes the entry between the scan and the
+                # removal, the answer of the helper is False all the same
+                original(file)
+                return False
+            return original(file)
+
+        monkeypatch.setattr(repo_base, 'file_remove', raced)
+        with logger.mock_capture_writer() as capture:
+            run_commit(make_repo(), make_config(), mirror.client)
+
+        log = capture.concat()
+        assert 'Failed to remove stale' not in log
+        assert 'left to the next run' not in log
+        assert not stale.exists()
+
+    def test_unlistable_folder_is_kept_whole(self, fs, run_dir, mirror, monkeypatch):
+        """A folder the walk cannot list is kept with its content, the run goes on.
+
+        The walk of the workspace runs after latest.pack is written: a folder an
+        access control list (or a scanner) denies must not fail the publication,
+        and the cleanup knows nothing about what it holds, so it keeps it. The
+        entries of the other folders are removed as usual in the same run.
+        """
+        register_wheels(mirror)
+        blocked = repo_file(run_dir, 'c2')
+        fs.create_file(join_path(blocked, 'full.pack'), contents=b'stale')
+        fs.create_file(join_path(blocked, 'notes.bin'), contents=b'stale')
+        stale_file = pack_file(run_dir, '0.26.0', 'full.pack')
+        fs.create_file(stale_file, contents=b'stale')
+        original = repo_base.os.scandir
+
+        def denied(folder):
+            if str(folder).replace('\\', '/') == str(blocked):
+                raise PermissionError(13, 'Access is denied', str(folder))
+            return original(folder)
+
+        monkeypatch.setattr(repo_base.os, 'scandir', denied)
+        with logger.mock_capture_writer() as capture:
+            run_commit(make_repo(), make_config(), mirror.client)
+
+        log = capture.concat()
+        assert f'WARNING | Failed to list the folder of the workspace "{blocked}"' in log
+        # the unknown folder keeps its content, and nothing of it is planned
+        assert join_path(blocked, 'full.pack').isfile()
+        assert join_path(blocked, 'notes.bin').isfile()
+        assert f'Removing stale folder: "{blocked}"' not in log
+        # the walk went on: the stale file of another folder is removed
+        assert not stale_file.exists()
+        # and the publication is complete
+        assert repo_file(run_dir, 'latest.pack').isfile()
+        assert join_path(run_dir, WORKSPACE, 'manifest.json').isfile()
+
+    def test_clean_workspace_removes_nothing(self, fs, run_dir, mirror):
+        """A second commit over the workspace of the first one removes no entry."""
+        register_wheels(mirror)
+        repo = make_repo()
+        config = make_config()
+        run_commit(repo, config, mirror.client)
+
+        with logger.mock_capture_writer() as capture:
+            run_commit(repo, config, mirror.client)
+
+        log = capture.concat()
+        assert 'INFO | Cleaned up "Author_Repo_master": ' in log
+        assert ', 0 removed' in log
+        assert 'Failed to remove stale' not in log
+        assert 'left to the next run' not in log
+
+    def test_cache_survives_a_new_commit(self, fs, run_dir, mirror):
+        """The cache of the window is kept across commits, the wheels are not fetched again."""
+        register_wheels(mirror)
+        repo = make_repo()
+        run_commit(repo, make_config(), mirror.client)
+        requests = list(mirror.requests)
+
+        # a new commit of the repo without a dependency change, published over
+        # the workspace of the previous one
+        repo.register_file('c4', 'requirements.txt', REQUIREMENTS['c3'].encode('utf-8'))
+        repo.register_file('c4', MOD_ENTRY_PATH, DEFAULT_ENTRY.encode('utf-8'))
+        repo.register_file('c4', DEPLOY_TEMPLATE, DEPLOY_TEMPLATE_TEXT.encode('utf-8'))
+        repo.register_commit(
+            'c4', parents=['c3'], author_name='Author', author_time=3, message='commit c4')
+        repo.register_branch('master', 'c4')
+        repo.register_head('c4')
+
+        run_commit(repo, make_config(), mirror.client)
+
+        # nothing is downloaded again: every version of the window was in the
+        # cache and the cleanup of the previous commit kept it
+        assert mirror.requests == requests
+        for version in ('0.27.7', '0.27.8', '0.28.1'):
+            assert cache_file(run_dir, version).isfile()
+        # the new version is published
+        assert Manifest.from_file(
+            join_path(run_dir, WORKSPACE, 'manifest.json')).version == 'c4'
+
+
+class TestWheelCache:
+    """The private cache of the wheels."""
+
+    def test_cache_layout(self, fs, run_dir, mirror):
+        """The wheel of a version is fetched to the cache folder of the version."""
+        register_wheels(mirror)
+        Repo(make_repo(), make_config(), client=mirror.client).run()
+        file = cache_file(run_dir, '0.28.1')
+        assert file.isfile()
+        assert not join_path(run_dir, WORKSPACE, 'wheel').exists()
+
+    def test_cache_is_not_published(self, fs, run_dir, mirror):
+        """The cache and the release trees are private: the name starts with '.'."""
+        register_wheels(mirror)
+        Repo(make_repo(), make_config(), client=mirror.client).run()
+        folders = list(join_path(run_dir, WORKSPACE).iter_foldernames())
+        assert sorted(folders) == ['.dep', '.repo', '.wheel_cache', 'packdep', 'packrepo']
+
+    def test_wheel_sync_is_idempotent(self, fs, run_dir, mirror):
+        """A second run keeps the published wheels, the copies are not rewritten."""
+        mirror.alias(PROVIDED_URL)
+        register_wheels(mirror)
+        requirements = {
+            'c1': f'httpx==0.28.1\n    # from {PROVIDED_URL}/\n' + LIBRARY_REQUIREMENT,
+        }
+        entry = entry_source('alasio', provide=(PROVIDED_URL,))
+        repo = make_repo(requirements, entry=entry)
+        run_commit(repo, make_config(), mirror.client)
+        file = wheel_file(run_dir, '0.28.1')
+        stat = file.stat()
+
+        with logger.mock_capture_writer() as capture:
+            run_commit(repo, make_config(), mirror.client)
+        assert 'Wheel exists, skipped' in capture.concat()
+        assert file.stat().st_mtime_ns == stat.st_mtime_ns
+
+    def test_published_wheel_verified(self, fs, run_dir, mirror):
+        """A published wheel that is not the cached file is copied again."""
+        mirror.alias(PROVIDED_URL)
+        register_wheels(mirror)
+        requirements = {
+            'c1': f'httpx==0.28.1\n    # from {PROVIDED_URL}/\n' + LIBRARY_REQUIREMENT,
+        }
+        entry = entry_source('alasio', provide=(PROVIDED_URL,))
+        repo = make_repo(requirements, entry=entry)
+        run_commit(repo, make_config(), mirror.client)
+        file = wheel_file(run_dir, '0.28.1')
+        content = file.atomic_read_bytes()
+        # a published file of the right size whose bytes were replaced: the
+        # copy of an interrupted upload, not the wheel of the cache
+        file.atomic_write(bytes(len(content)))
+
+        with logger.mock_capture_writer() as capture:
+            run_commit(repo, make_config(), mirror.client)
+
+        assert f'Copy wheel: "{cache_file(run_dir, "0.28.1")}"' in capture.concat()
+        assert file.atomic_read_bytes() == content
+
+
+class TestManifest:
+    """The record of the generation: what it publishes and what it keeps."""
+
+    def manifest_file(self, run_dir):
+        """
+        Path of the published contract of the workspace.
+
+        Returns:
+            PathStr: {run}/pack/Author_Repo_master/manifest.json
+        """
+        return join_path(run_dir, WORKSPACE, 'manifest.json')
+
+    def local_manifest_file(self, run_dir):
+        """
+        Path of the local record of the workspace.
+
+        Returns:
+            PathStr: {run}/pack/Author_Repo_master/.manifest.json
+        """
+        return join_path(run_dir, WORKSPACE, '.manifest.json')
+
+    def test_manifest_records_the_generation(self, fs, run_dir, mirror):
+        """The two files name the barrier, one list each."""
+        register_wheels(mirror)
+        run_commit(make_repo(), make_config(), mirror.client)
+
+        manifest = Manifest.from_file(self.manifest_file(run_dir))
+        local = LocalManifest.from_file(self.local_manifest_file(run_dir))
+        barrier = LatestInfo.parse(repo_file(run_dir, 'latest.pack').atomic_read_bytes())
+
+        assert manifest.schema == 1
+        assert manifest.channel == 'Author_Repo_master'
+        assert manifest.version == barrier.version
+        assert manifest.checksum == barrier.checksum
+        # the local record names the same generation, so the pair of the two
+        # files is read without discarding a field of either
+        assert local.schema == 1
+        assert (local.channel, local.version, local.checksum) == (
+            manifest.channel, manifest.version, manifest.checksum)
+        # the barrier, the packs of the version and the packs of the
+        # dependencies are published
+        assert 'packrepo/latest.pack' in manifest.files
+        assert f'packrepo/{barrier.version}/full.pack' in manifest.files
+        assert f'packrepo/{barrier.version}/update_c2.pack' in manifest.files
+        assert 'packdep/httpx/0.28.1/full.pack' in manifest.files
+        # the wheel cache is private, one entry for every version of the
+        # lookback window: the cache is not kept beyond the window
+        for version in ('0.27.7', '0.27.8', '0.28.1'):
+            assert f'.wheel_cache/httpx/{version}/index.html' in local.private
+            assert f'.wheel_cache/httpx/{version}/httpx-{version}-py3-none-any.whl' in local.private
+        # the published contract carries the published half only: a mirror
+        # serves the file as it is, there is no field to filter
+        content = self.manifest_file(run_dir).atomic_read_bytes()
+        assert b'"private"' not in content
+        assert b'.wheel_cache' not in content
+        assert not [path for path in manifest.files if is_private_path(path)]
+        # neither file of the record nor a tmp file of an interrupted write is
+        # an entry of a list
+        paths = manifest.files + local.private
+        for name in ('manifest.json', '.manifest.json'):
+            assert name not in paths
+        assert not [path for path in paths if path.endswith('.tmp')]
+        # every entry is a file of the workspace
+        for path in paths:
+            assert join_path(run_dir, WORKSPACE, *path.split('/')).isfile()
+        # every published entry is in one of the three folders a client
+        # derives an url from
+        assert {path.split('/')[0] for path in manifest.files} <= {
+            'packdep', 'packrepo', 'wheel'}
+
+    def test_run_without_commit_writes_no_manifest(self, fs, run_dir, mirror):
+        """A run that was not committed publishes nothing, the record included."""
+        register_wheels(mirror)
+        Repo(make_repo(), make_config(), client=mirror.client).run()
+        assert not self.manifest_file(run_dir).exists()
+        assert not self.local_manifest_file(run_dir).exists()
+
+    def test_manifest_is_kept_by_the_cleanup(self, fs, run_dir, mirror):
+        """The two files are files of the run, the cleanup of the version keeps them."""
+        register_wheels(mirror)
+        with logger.mock_capture_writer() as capture:
+            run_commit(make_repo(), make_config(), mirror.client)
+        log = capture.concat()
+        assert 'INFO | Manifest of "Author_Repo_master": version=' in log
+        assert 'INFO | Write local manifest: ' in log
+        assert 'INFO | Write manifest: ' in log
+        assert f'INFO | Cleaned up "Author_Repo_master":' in log
+        assert self.manifest_file(run_dir).isfile()
+        assert self.local_manifest_file(run_dir).isfile()
+
+    def test_second_run_writes_nothing(self, fs, run_dir, mirror):
+        """A run over the same repo writes neither file and keeps their bytes."""
+        register_wheels(mirror)
+        repo = make_repo()
+        config = make_config()
+        run_commit(repo, config, mirror.client)
+        files = [self.manifest_file(run_dir), self.local_manifest_file(run_dir)]
+        first = [file.atomic_read_bytes() for file in files]
+        generated_at = Manifest.from_file(files[0]).generated_at
+
+        with logger.mock_capture_writer() as capture:
+            run_commit(repo, config, mirror.client)
+
+        log = capture.concat()
+        assert 'INFO | Local manifest exists, skipped' in log
+        assert 'INFO | Manifest exists, skipped' in log
+        assert [file.atomic_read_bytes() for file in files] == first
+        assert Manifest.from_file(files[0]).generated_at == generated_at
+
+    def test_stale_cache_entry_is_removed_and_not_listed(self, fs, run_dir, mirror):
+        """A cache entry outside the window leaves the disk and the local record."""
+        register_wheels(mirror)
+        stale = join_path(
+            run_dir, WORKSPACE, '.wheel_cache', 'httpx', '0.26.0', 'index.html')
+        fs.create_file(stale, contents=b'stale')
+
+        run_commit(make_repo(), make_config(), mirror.client)
+
+        local = LocalManifest.from_file(self.local_manifest_file(run_dir))
+        assert not stale.exists()
+        assert not [path for path in local.private if '/0.26.0/' in path]
+        # the cache of the version of the window stays
+        assert cache_file(run_dir, '0.28.1').isfile()

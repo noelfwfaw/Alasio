@@ -14,12 +14,16 @@
 
   type Props = {
     group: ConfigGroupData;
+    // The number shown in the header, i.e. the position of the group. It is
+    // passed by the page because the gid of an optimistically created group is
+    // only a placeholder until the server snapshot arrives.
+    number?: number;
     dropIndicator?: DropIndicatorState | null;
     onCopy?: (config: Config) => void;
     onRename?: (config: Config) => void;
     onDelete?: (config: Config) => void;
   };
-  let { group, dropIndicator = null, onCopy, onRename, onDelete }: Props = $props();
+  let { group, number = group.gid, dropIndicator = null, onCopy, onRename, onDelete }: Props = $props();
 
   const dndData = $derived({
     id: group.id,
@@ -38,26 +42,26 @@
   <div class="group-container relative rounded-lg p-3 pt-4">
     <div class="absolute -top-2 left-6 z-2 flex items-center">
       <!-- icon and text cover the border -->
-      <span class="text-muted-foreground bg-background pl-2 text-xs">
-        {t.ConfigScan.SchedulerGroup({ n: group.gid })}
+      <span class="bg-background pl-2 text-xs text-muted-foreground">
+        {t.ConfigScan.SchedulerGroup({ n: number })}
       </span>
       <div
         {...listeners.current}
         {...attributes.current}
-        class="text-muted-foreground bg-background cursor-grab px-2 py-1 active:cursor-grabbing"
+        class="cursor-grab bg-background px-2 py-1 text-muted-foreground active:cursor-grabbing"
       >
         <GripVertical class="h-3 w-3" />
       </div>
     </div>
 
-    <div class={cn("space-y-1 transition-colors", { "bg-accent/30 rounded-md": isOver.current })}>
+    <div class={cn("space-y-1 transition-colors", { "rounded-md bg-accent/30": isOver.current })}>
       {#if group.items.length > 0}
         {#each group.items as item (item.id)}
           <ConfigItem config={item} {dropIndicator} {onCopy} {onRename} {onDelete} />
         {/each}
       {:else}
         <div
-          class="text-muted-foreground flex h-20 items-center justify-center rounded-md border border-dashed text-sm"
+          class="flex h-20 items-center justify-center rounded-md border border-dashed text-sm text-muted-foreground"
         >
           Drop items here
         </div>

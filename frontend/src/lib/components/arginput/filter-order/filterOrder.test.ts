@@ -12,7 +12,23 @@
  * same component is "FilterOrder.svelte.test.ts".
  */
 import { describe, expect, it } from "vitest";
-import { type PillBox, appendItem, applyDrop, cutPills, moveItem, removeItem, sameList } from "./filterOrder";
+import {
+  type PillBox,
+  appendItem,
+  composeOption,
+  cutPills,
+  defaultItem,
+  duplicateIndexes,
+  insertRow,
+  moveItem,
+  moveRow,
+  primaryOf,
+  removeAt,
+  removeItem,
+  sameList,
+  splitOption,
+  validItems,
+} from "./filterOrder";
 
 describe("TestSameList", () => {
   it("compares the items and the order", () => {
@@ -22,6 +38,37 @@ describe("TestSameList", () => {
     expect(sameList(["a"], ["a", "b"])).toBe(false);
     // The order is part of the value
     expect(sameList(["a", "b"], ["b", "a"])).toBe(false);
+  });
+});
+
+describe("TestDuplicateIndexes", () => {
+  it("marks the later occurrences of an item, not the first one", () => {
+    // The first occurrence is where the item belongs, every later one is the
+    // leftover that has to be dropped
+    expect([...duplicateIndexes(["a", "b", "a", "c", "b"])]).toEqual([2, 4]);
+  });
+
+  it("clears the mark of an item whose first occurrence is removed", () => {
+    // Deleting the first row must leave the later one legal, not keep it marked
+    const rest = removeAt(["a", "b", "a"], 0);
+
+    expect(rest).toEqual(["b", "a"]);
+    expect(duplicateIndexes(rest).size).toBe(0);
+  });
+
+  it.each([{ list: [] as string[] }, { list: ["a"] }, { list: ["a", "b", "c"] }])(
+    "finds no duplicate in $list",
+    ({ list }) => {
+      expect(duplicateIndexes(list).size).toBe(0);
+    },
+  );
+
+  it("marks every occurrence after the first", () => {
+    expect([...duplicateIndexes(["a", "a", "a"])]).toEqual([1, 2]);
+  });
+
+  it("marks a later occurrence that is not adjacent to the first one", () => {
+    expect([...duplicateIndexes(["a", "b", "c", "a"])]).toEqual([3]);
   });
 });
 
@@ -60,6 +107,18 @@ describe("TestAppendItem", () => {
   });
 });
 
+describe("TestRemoveAt", () => {
+  it("removes the row at the index, not every row of that value", () => {
+    // A repeated item has one valid occurrence, a delete must keep it
+    expect(removeAt(["a", "b", "a"], 2)).toEqual(["a", "b"]);
+    expect(removeAt(["a", "b", "a"], 0)).toEqual(["b", "a"]);
+  });
+
+  it.each([{ index: -1 }, { index: 3 }])("is a no-op for the out of range index $index", ({ index }) => {
+    expect(removeAt(["a", "b"], index)).toEqual(["a", "b"]);
+  });
+});
+
 describe("TestRemoveItem", () => {
   it("removes the item", () => {
     expect(removeItem(["a", "b", "c"], "b")).toEqual(["a", "c"]);
@@ -71,48 +130,62 @@ describe("TestRemoveItem", () => {
   });
 });
 
-describe("TestApplyDrop", () => {
-  it("inserts an unused item before / after a selected row", () => {
-    expect(applyDrop(["a", "b"], "c", { kind: "selected", itemId: "a", position: "top" })).toEqual(["c", "a", "b"]);
-    expect(applyDrop(["a", "b"], "c", { kind: "selected", itemId: "a", position: "bottom" })).toEqual(["a", "c", "b"]);
-    expect(applyDrop(["a", "b"], "c", { kind: "selected", itemId: "b", position: "bottom" })).toEqual(["a", "b", "c"]);
-  });
-
-  it("reorders a selected item around another row", () => {
-    // Moving down over a later row inserts after it
-    expect(applyDrop(["a", "b", "c"], "a", { kind: "selected", itemId: "c", position: "bottom" })).toEqual([
-      "b",
-      "c",
-      "a",
-    ]);
-    // Moving up over an earlier row inserts before it
-    expect(applyDrop(["a", "b", "c"], "c", { kind: "selected", itemId: "a", position: "top" })).toEqual([
-      "c",
-      "a",
-      "b",
-    ]);
+describe("TestInsertRow", () => {
+  it("inserts an item before / after a selected row", () => {
+    expect(insertRow(["a", "b"], "c", { kind: "selected", index: 0, position: "top" })).toEqual(["c", "a", "b"]);
+    expect(insertRow(["a", "b"], "c", { kind: "selected", index: 0, position: "bottom" })).toEqual(["a", "c", "b"]);
+    expect(insertRow(["a", "b"], "c", { kind: "selected", index: 1, position: "bottom" })).toEqual(["a", "b", "c"]);
   });
 
   it("drops on the column: the top area inserts first, the rest appends last", () => {
-    expect(applyDrop(["a", "b"], "c", { kind: "selected", position: "top" })).toEqual(["c", "a", "b"]);
-    expect(applyDrop(["a", "b"], "c", { kind: "selected", position: "bottom" })).toEqual(["a", "b", "c"]);
-    // Dropping a selected item on the column bottom moves it to the end
-    expect(applyDrop(["a", "b", "c"], "a", { kind: "selected", position: "bottom" })).toEqual(["b", "c", "a"]);
+    expect(insertRow(["a", "b"], "c", { kind: "selected", position: "top" })).toEqual(["c", "a", "b"]);
+    expect(insertRow(["a", "b"], "c", { kind: "selected", position: "bottom" })).toEqual(["a", "b", "c"]);
+    expect(insertRow([], "c", { kind: "selected", position: "bottom" })).toEqual(["c"]);
   });
 
-  it("drops on the unused column: the item only leaves the order", () => {
-    expect(applyDrop(["a", "b"], "a", { kind: "unused" })).toEqual(["b"]);
-    // An item that is not in the order stays out of it
-    expect(applyDrop(["a"], "b", { kind: "unused" })).toEqual(["a"]);
+  it("leaves the order alone when the row is dropped on the unused column", () => {
+    expect(insertRow(["a"], "c", { kind: "unused" })).toEqual(["a"]);
   });
 
-  it("drops an item on its own row without moving it", () => {
-    expect(applyDrop(["a", "b"], "a", { kind: "selected", itemId: "a", position: "top" })).toEqual(["a", "b"]);
-    expect(applyDrop(["a", "b"], "a", { kind: "selected", itemId: "a", position: "bottom" })).toEqual(["a", "b"]);
+  it("clamps an index outside the list", () => {
+    expect(insertRow(["a"], "c", { kind: "selected", index: 9, position: "bottom" })).toEqual(["a", "c"]);
+    expect(insertRow(["a"], "c", { kind: "selected", index: -3, position: "top" })).toEqual(["c", "a"]);
+  });
+});
+
+describe("TestMoveRow", () => {
+  it("reorders a row around another row", () => {
+    // Moving down over a later row inserts after it
+    expect(moveRow(["a", "b", "c"], 0, { kind: "selected", index: 2, position: "bottom" })).toEqual(["b", "c", "a"]);
+    // Moving up over an earlier row inserts before it
+    expect(moveRow(["a", "b", "c"], 2, { kind: "selected", index: 0, position: "top" })).toEqual(["c", "a", "b"]);
   });
 
-  it("appends when the target row is not in the order", () => {
-    expect(applyDrop(["a"], "b", { kind: "selected", itemId: "gone", position: "top" })).toEqual(["a", "b"]);
+  it("drops on the column: the top area inserts first, the rest appends last", () => {
+    expect(moveRow(["a", "b", "c"], 0, { kind: "selected", position: "bottom" })).toEqual(["b", "c", "a"]);
+    expect(moveRow(["a", "b", "c"], 2, { kind: "selected", position: "top" })).toEqual(["c", "a", "b"]);
+  });
+
+  it("drops on the unused column: the row only leaves the order", () => {
+    expect(moveRow(["a", "b"], 0, { kind: "unused" })).toEqual(["b"]);
+  });
+
+  it("drops a row on its own position without moving it", () => {
+    expect(moveRow(["a", "b"], 0, { kind: "selected", index: 0, position: "top" })).toEqual(["a", "b"]);
+    expect(moveRow(["a", "b"], 0, { kind: "selected", index: 0, position: "bottom" })).toEqual(["a", "b"]);
+  });
+
+  it("is a no-op for an index outside the list", () => {
+    expect(moveRow(["a"], 3, { kind: "selected", position: "top" })).toEqual(["a"]);
+    expect(moveRow(["a"], -1, { kind: "unused" })).toEqual(["a"]);
+  });
+
+  it("moves only the dragged row of a repeated value", () => {
+    // Two rows hold "a"; dragging the second one to the front must not take the
+    // first one along, they are different rows of the same value
+    expect(moveRow(["a", "b", "a"], 2, { kind: "selected", index: 0, position: "top" })).toEqual(["a", "a", "b"]);
+    // ... and dragging the first one to the end keeps the other one in place
+    expect(moveRow(["a", "b", "a"], 0, { kind: "selected", index: 2, position: "bottom" })).toEqual(["b", "a", "a"]);
   });
 });
 
@@ -169,5 +242,111 @@ describe("TestCutPills", () => {
   it("never cuts away the last pill, the marker wraps below it instead", () => {
     // The marker fits next to no pill at all (100 + 4 + 40 > 120)
     expect(cutPills(boxes(6, 1), 40, 4, 120, 5)).toBe(1);
+  });
+});
+
+describe("TestSplitOption", () => {
+  it.each([
+    ["PlateT4-gun", ["PlateT4", "gun"]],
+    ["Chip", ["Chip", null]],
+    // split on the first separator only
+    ["PlateT4-gun-x", ["PlateT4", "gun-x"]],
+    ["Chip-", ["Chip", ""]],
+  ])("splits %s", (item, expected) => {
+    expect(splitOption(item)).toEqual(expected);
+  });
+
+  it("reads the primary item of both kinds of item", () => {
+    expect(primaryOf("PlateT4-gun")).toBe("PlateT4");
+    expect(primaryOf("Chip")).toBe("Chip");
+  });
+});
+
+describe("TestComposeOption", () => {
+  it("joins a primary item with its secondary option", () => {
+    expect(composeOption("PlateT4", "gun")).toBe("PlateT4-gun");
+  });
+
+  it.each([null, undefined, ""])("keeps the bare item for %s", (secondary) => {
+    expect(composeOption("Chip", secondary)).toBe("Chip");
+  });
+
+  it("round-trips an item", () => {
+    const [primary, secondary] = splitOption("PlateT4-gun");
+    expect(composeOption(primary, secondary)).toBe("PlateT4-gun");
+  });
+});
+
+describe("TestValidItems", () => {
+  it("lists the options themselves without secondary options", () => {
+    expect([...validItems(["Fleet-1", "Fleet-2"], null, "filter-order", null)]).toEqual(["Fleet-1", "Fleet-2"]);
+  });
+
+  it("ignores the option dictionary of a one level datatype", () => {
+    // The dt alone decides the shape, a leftover option_dict changes nothing
+    expect([...validItems(["Fleet-1"], { "Fleet-1": ["a"] }, "filter-order", null)]).toEqual(["Fleet-1"]);
+  });
+
+  it("expands a primary item into its own secondary options only", () => {
+    const valid = validItems(
+      ["PlateT4", "BookT3", "Chip"],
+      {
+        PlateT4: ["gun", "general"],
+        BookT3: ["red"],
+      },
+      "filter-order-item",
+      null,
+    );
+
+    expect([...valid]).toEqual(["PlateT4-gun", "PlateT4-general", "BookT3-red", "Chip"]);
+    // a secondary option of another item is not a legal item of this one
+    expect(valid.has("PlateT4-red")).toBe(false);
+    expect(valid.has("Chip-gun")).toBe(false);
+  });
+
+  it("expands the pairs of a filter-order-pair the same way", () => {
+    const valid = validItems(["BookT3"], { BookT3: ["red", "blue"] }, "filter-order-pair", null);
+
+    expect([...valid]).toEqual(["BookT3-red", "BookT3-blue"]);
+  });
+
+  it("includes the optionCommand of a filter-order-pair", () => {
+    // A command is stored as itself, so a value holding it is not invalid
+    const valid = validItems(["Major"], null, "filter-order-pair", ["shortest"]);
+
+    expect([...valid]).toEqual(["Major", "shortest"]);
+  });
+
+  it("leaves an undeclared command out", () => {
+    const valid = validItems(["Major"], null, "filter-order-pair", []);
+
+    expect(valid.has("shortest")).toBe(false);
+  });
+
+  it("ignores optionCommand of a datatype that has none", () => {
+    const valid = validItems(["Fleet-1"], null, "filter-order", ["shortest"]);
+
+    expect([...valid]).toEqual(["Fleet-1"]);
+  });
+
+  it("requires the secondary option of a primary that declares one", () => {
+    const valid = validItems(["PlateT4"], { PlateT4: ["gun"] }, "filter-order-item", null);
+
+    expect(valid.has("PlateT4")).toBe(false);
+  });
+
+  it("accepts the items of the legacy filter-order as str", () => {
+    expect([...validItems([1, 2], null, "filter-order", null)]).toEqual(["1", "2"]);
+  });
+});
+
+describe("TestDefaultItem", () => {
+  it("starts an unused primary at its first secondary option", () => {
+    expect(defaultItem("PlateT4", { PlateT4: ["gun", "general"] })).toBe("PlateT4-gun");
+  });
+
+  it("adds a primary without secondary options as itself", () => {
+    expect(defaultItem("Chip", { PlateT4: ["gun"] })).toBe("Chip");
+    expect(defaultItem("Chip")).toBe("Chip");
   });
 });

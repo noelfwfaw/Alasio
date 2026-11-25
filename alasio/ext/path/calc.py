@@ -5,7 +5,11 @@ WINDOWS_SEP = os.sep == '\\'
 
 def normpath(path: str) -> str:
     """
-    Normalize whatever to seperator "/"
+    Normalize whatever to separator "/"
+
+    Roots keep their trailing separator so they stay absolute: "/" on
+    POSIX and "C:/" on Windows. A bare drive is treated as the drive
+    root, "C:" -> "C:/", because "C:" is drive-relative in the OS.
     """
     if WINDOWS_SEP:
         # In most cases just normpath('xxx.png') check '/' first to be faster
@@ -13,6 +17,8 @@ def normpath(path: str) -> str:
             normalized = path.rstrip('\\/').replace('\\', '/')
         else:
             normalized = path.rstrip('\\/')
+        if len(normalized) == 2 and normalized[1] == ':' and normalized[0].isalpha():
+            return normalized + '/'
     else:
         normalized = path.rstrip('/')
     # A bare root ("/" / "\\") is kept as "/" instead of becoming an empty
@@ -34,9 +40,9 @@ def joinpath(root: str, path: str) -> str:
     """
     if root:
         if path:
-            if root == '/':
-                # linux root, don't create '//path'
-                return f'/{path}'
+            if root[-1] == '/':
+                # Root already ends with a separator, don't create '//path'
+                return root + path
             else:
                 return f'{root}/{path}'
         else:
@@ -63,14 +69,16 @@ def joinnormpath(root: str, path: str) -> str:
             path = path.rstrip('\\/').replace('\\', '/')
         else:
             path = path.rstrip('\\/')
+        if len(path) == 2 and path[1] == ':' and path[0].isalpha():
+            path += '/'
     else:
         path = path.rstrip('/')
 
     if root:
         if path:
-            if root == '/':
-                # linux root, don't create '//path'
-                return f'/{path}'
+            if root[-1] == '/':
+                # Root already ends with a separator, don't create '//path'
+                return root + path
             else:
                 return f'{root}/{path}'
         else:
@@ -83,6 +91,11 @@ def uppath(root: str, up: int = 1) -> str:
     """
     Equivalent to os.path.join(self, '../')
 
+    The walk stops where the path model of this module ends: at the empty
+    string for a relative path, at "/" for a rooted path, and at the drive
+    root "C:/" for a path of a drive. A bare drive "C:" is the drive root,
+    the same way normpath() reads it.
+
     Args:
         root: Base path, needs to be normalized first
         up: Directory upward level
@@ -91,14 +104,22 @@ def uppath(root: str, up: int = 1) -> str:
         str:
     """
     if WINDOWS_SEP:
+        if len(root) == 2 and root[0].isalpha() and root[1] == ':':
+            # A bare drive is the drive root, the same way normpath() reads
+            # it: "C:" -> "C:/", and the root is its own parent
+            return root + '/' if up else root
+        # A rooted path stops at "/", a drive path at its drive root, and a
+        # relative path at the empty string. Input is normalized, so the
+        # rooted paths start with "/"
+        rooted = root.startswith('/')
         for _ in range(up):
             root, _, _ = root.rpartition('/')
-            # Relative path can only up to empty string
             if not root:
-                return ''
-            # Absolute path can only up to "C:"
-            elif root.endswith(':'):
-                break
+                # Absolute path can only up to "/"
+                return '/' if rooted else ''
+            # Absolute path can only up to the drive root "C:/"
+            elif root[-1] == ':':
+                return root + '/'
         return root
     else:
         is_absolute = root.startswith('/')
@@ -114,17 +135,71 @@ def uppath(root: str, up: int = 1) -> str:
         return root
 
 
+def is_root(path: str) -> bool:
+    """
+    Check whether a path is a root, the folder a walk up must stop at.
+
+    The roots are the ones uppath() stops at: "/" for a rooted path, the drive
+    root "C:/" and the bare drive "C:" for a path of a drive. The answer does
+    not depend on the platform that runs it: the paths of a pack carry their
+    own model, a "C:/env" read on Linux is still a path of a drive, so the
+    walk of its parent folders has to stop at "C:/" there too.
+
+    Args:
+        path (str): Path to check, normalized or not
+
+    Returns:
+        bool: True when the path is the filesystem root or a drive root
+    """
+    # A root is 1 to 3 characters, so the length settles most of the paths of
+    # a tree with one comparison: they are folders, not roots. The length is
+    # known below, an index is safe on the strings that get that far
+    length = len(path)
+    if length > 3:
+        return False
+    # A drive: "C:" is the drive root, "C:/" is the same root with its
+    # separator, and "C:/a" is a folder of it. A colon is only a drive when a
+    # letter comes before it
+    if length >= 2 and path[1] == ':' and path[0].isalpha():
+        return length == 2 or path[2] == '/'
+    # "/" is the root, "/a" is a folder of it, and an empty path is no root
+    return path == '/'
+
+
 def is_abspath(path: str) -> bool:
     """
-    A simplified os.path.isabs()
+    Check whether a path is absolute, with an answer that does not depend on
+    the python version.
+
+    os.path.isabs() is not used: on Windows a rooted path without a drive
+    ('/assets') counted as absolute up to python 3.12 and became relative in
+    python 3.13, so the same path was accepted or rejected depending on the
+    interpreter that runs it. The rule here is the one normpath() and uppath()
+    work with:
+
+    - POSIX: the path starts at the root, '/'
+    - Windows: a rooted path, which is the root of the current drive ('/a')
+      or a UNC share ('\\\\server\\share'), or a drive with a root after it
+      ('C:/', 'C:/a'). A bare drive ('C:') is the drive root, the same way
+      normpath() reads it, because 'C:' is drive relative in the OS. A drive
+      relative path ('C:a') is not absolute, and a colon that is not a drive
+      letter ('a:b') does not make one.
+
+    Args:
+        path (str): Path to check, normalized or not
+
+    Returns:
+        bool: True when the path is absolute
     """
-    if WINDOWS_SEP:
-        try:
-            return path[1] == ':'
-        except IndexError:
-            return False
-    else:
+    if not WINDOWS_SEP:
         return path.startswith('/')
+    # A drive is tested first, 'C:/folder/file' is the shape of most of the
+    # paths the project checks: 'C:' is the drive root, 'C:/' and 'C:/a' are
+    # absolute, and 'C:a' is drive relative and stays relative.
+    if path[1:2] == ':' and path[0].isalpha():
+        return path[2:3] in ('/', '\\', '')
+    # a rooted path: '/a' of the current drive, or '\\server\share'
+    return path.startswith(('/', '\\'))
 
 
 def abspath(path: str) -> str:

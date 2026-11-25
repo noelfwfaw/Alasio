@@ -1,11 +1,20 @@
 <script lang="ts">
+  import Copy from "@lucide/svelte/icons/copy";
   import TriangleAlert from "@lucide/svelte/icons/triangle-alert";
   import { type InputProps, useArgValue } from "$lib/components/arg/utils.svelte";
   import { Badge } from "$lib/components/ui/badge";
   import { t } from "$lib/i18n";
   import { elementSize } from "$lib/use/size.svelte";
   import { cn } from "$lib/utils";
-  import { type PillBox, cutPills } from "./filterOrder";
+  import {
+    type PillBox,
+    SECONDARY_SEPARATOR,
+    cutPills,
+    duplicateIndexes,
+    isTwoLevel,
+    splitOption,
+    validItems,
+  } from "./filterOrder";
 
   /** Max lines of pills shown in the settings page, the rest becomes "> ..." */
   const MAX_PILL_LINES = 5;
@@ -20,16 +29,43 @@
   // `useArgValue` is used for the option_i18n label lookup only, the same as
   // dt=static does.
   const arg = $derived(useArgValue<any[]>(data));
+  const dt = $derived(data.dt);
   const items = $derived(Array.isArray(data.value) ? data.value : []);
   const options = $derived(Array.isArray(data.option) ? data.option : []);
+  // A two level filter-order writes every item of the value as "item-option",
+  // see filterOrder.ts
+  const optionDict = $derived(data.option_dict ?? {});
+  const optionCommand = $derived(Array.isArray(data.option_command) ? data.option_command : []);
+  const twoLevel = $derived(isTwoLevel(dt));
+  const valid = $derived(validItems(options, optionDict, dt, optionCommand));
+  // A stored value may repeat an item: only the later occurrences are marked,
+  // the first one is where the item belongs
+  const duplicated = $derived(duplicateIndexes(items.map(String)));
 
   /**
-   * True for an item that is in the value but not in "option" anymore, e.g. an
-   * option that was removed from the yaml after the value was set (the backend
+   * True for an item that is in the value but not in the legal items anymore,
+   * e.g. an option that was removed from the yaml after the value was set, or
+   * a secondary option that was removed from "option_dict" (the backend
    * repairs such a value on load, the demo shows the editor handling it)
    */
   function isInvalid(item: any): boolean {
+    if (twoLevel) return !valid.has(String(item));
     return options.length > 0 && !options.includes(item);
+  }
+
+  /**
+   * Label of an item: its translated name, and after the level separator the
+   * translated name of its secondary option, the same form the value is stored
+   * in ("PlateT4-gun"). The parts are joined into one text instead of a second
+   * element, so the pill reads as the stored item, not as two fields.
+   */
+  function labelOf(item: any): string {
+    // A command carries no level, and it is shown as it is stored
+    if (optionCommand.includes(item)) return String(item);
+    if (!twoLevel) return arg.getLabel(item);
+    const [primary, secondary] = splitOption(String(item));
+    if (secondary === null) return arg.getLabel(primary);
+    return `${arg.getLabel(primary)}${SECONDARY_SEPARATOR}${arg.getLabel(secondary)}`;
   }
 
   // --- Cut of the pill lines ---
@@ -50,7 +86,7 @@
   const truncated = $derived(shown !== null && shown < items.length);
 
   /** Everything a pill renders from: a change re-measures (the labels set the widths) */
-  const layoutKey = $derived(JSON.stringify([items, options, data.option_i18n ?? {}]));
+  const layoutKey = $derived(JSON.stringify([items, options, optionDict, data.option_i18n ?? {}]));
 
   /**
    * Cut the order to the first MAX_PILL_LINES lines. Only reads the geometry of
@@ -92,17 +128,26 @@
        start with ">", a line never ends with one -->
   <span class="inline-flex items-center gap-x-1">
     {#if index > 0}
-      <span class="text-muted-foreground text-xs">&gt;</span>
+      <span class="text-xs text-muted-foreground">&gt;</span>
     {/if}
-    <Badge variant="secondary" class="rounded-full">
+    <Badge variant="secondary" class="max-w-full rounded-full">
       {#if isInvalid(item)}
         <!-- The settings page only marks the item, the tooltip of the invalid
              item lives in the editor (see FilterOrderItem.svelte) -->
-        <span role="img" class="inline-flex" aria-label={t.Input.FilterOrderInvalid()}>
-          <TriangleAlert class="text-destructive size-3 shrink-0" />
+        <span role="img" class="inline-flex shrink-0" aria-label={t.Input.FilterOrderInvalid()}>
+          <TriangleAlert class="size-3 shrink-0 text-destructive" />
         </span>
       {/if}
-      {arg.getLabel(item)}
+      {#if duplicated.has(index)}
+        <!-- A different shape from the invalid mark: the item itself is legal,
+             it is its position that can not be read -->
+        <span role="img" class="inline-flex shrink-0" aria-label={t.Input.FilterOrderDuplicate()}>
+          <Copy class="size-3 shrink-0 text-amber-600 dark:text-amber-400" />
+        </span>
+      {/if}
+      <!-- A long item truncates inside the pill instead of widening it past
+           the card, the pill itself is capped to the line width -->
+      <span class="min-w-0 truncate">{labelOf(item)}</span>
     </Badge>
   </span>
 {/snippet}
@@ -111,13 +156,16 @@
   <!-- The visible list: the pills up to the cut, then the marker -->
   <div data-slot="filter-order-pills" class={PILL_LINE}>
     {#if items.length === 0}
-      <span class="text-muted-foreground text-xs">{t.Input.FilterOrderEmpty()}</span>
+      <span class="text-xs text-muted-foreground">{t.Input.FilterOrderEmpty()}</span>
     {:else}
-      {#each visible as item, index (item)}
+      <!-- The key carries the index: a stored value may repeat an item, and the
+           item alone would then be a duplicate key (the pill line would not
+           render at all, hiding the very value the mark is about) -->
+      {#each visible as item, index (`${index}\u0000${item}`)}
         {@render pill(item, index)}
       {/each}
       {#if truncated}
-        <span class="text-muted-foreground text-xs">&gt; ...</span>
+        <span class="text-xs text-muted-foreground">&gt; ...</span>
       {/if}
     {/if}
   </div>
@@ -134,10 +182,10 @@
       inert
       class={cn(PILL_LINE, "pointer-events-none invisible absolute inset-x-0 top-0")}
     >
-      {#each items as item, index (item)}
+      {#each items as item, index (`${index}\u0000${item}`)}
         {@render pill(item, index)}
       {/each}
-      <span class="text-muted-foreground text-xs">&gt; ...</span>
+      <span class="text-xs text-muted-foreground">&gt; ...</span>
     </div>
   {/if}
 </div>

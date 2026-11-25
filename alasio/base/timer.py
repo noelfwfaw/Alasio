@@ -5,6 +5,8 @@ from typing import Tuple, Union
 
 from typing_extensions import Self
 
+from alasio.backport.sleep import sleep
+
 
 def timer(function):
     """
@@ -44,6 +46,11 @@ def getnow(tz=True, ms=False):
 
 # timeout `limit` in seconds or (limit, count), limit can be int or float
 T_TIMER_LIMIT = Union[int, float, Tuple[int, int], Tuple[float, int], 'Timer']
+
+# Measure durations with perf_counter(): it is monotonic and has the highest
+# resolution available (QueryPerformanceCounter on Windows, clock_gettime on
+# POSIX). On the Python 3.8 runtime used for Windows 7, time.monotonic() is
+# backed by GetTickCount64() and only ticks every 15.6ms.
 
 
 class Timer:
@@ -97,7 +104,7 @@ class Timer:
                 pass
         """
         if self._start <= 0:
-            self._start = time.monotonic()
+            self._start = time.perf_counter()
             self._access = 0
 
         return self
@@ -115,7 +122,7 @@ class Timer:
             float:
         """
         if self._start > 0:
-            diff = time.monotonic() - self._start
+            diff = time.perf_counter() - self._start
             if diff < 0:
                 diff = 0.
             return diff
@@ -141,12 +148,12 @@ class Timer:
         if current is not None:
             if count is not None:
                 # set both
-                self._start = time.monotonic() - current
+                self._start = time.perf_counter() - current
                 self._access = count
             else:
                 # set current only, calculate count
                 count = int(current / speed)
-                self._start = time.monotonic() - current
+                self._start = time.perf_counter() - current
                 self._access = count
         else:
             if count is not None:
@@ -169,7 +176,7 @@ class Timer:
         # each reached() call is consider as an access
         self._access += 1
         if self._start > 0:
-            return self._access > self.count and time.monotonic() - self._start > self.limit
+            return self._access > self.count and time.perf_counter() - self._start > self.limit
         else:
             # not started, return True for fast first try
             return True
@@ -178,7 +185,7 @@ class Timer:
         """
         Reset the timer as if it just started
         """
-        self._start = time.monotonic()
+        self._start = time.perf_counter()
         self._access = 0
         return self
 
@@ -204,10 +211,20 @@ class Timer:
     def wait(self) -> Self:
         """
         Wait until timer reached.
+
+        The wait sleeps on the precise sleep of this package, so a timer that
+        is short by a fraction of a millisecond does not sleep for a whole
+        coarse tick. It never returns before the limit is reached.
+
+        A timer that was never started is already reached, the same as
+        `reached()` reports, so it returns at once instead of sleeping for the
+        whole limit.
         """
-        diff = self._start + self.limit - time.monotonic()
+        if self._start <= 0:
+            return self
+        diff = self._start + self.limit - time.perf_counter()
         if diff > 0:
-            time.sleep(diff)
+            sleep(diff)
         return self
 
     def show(self):

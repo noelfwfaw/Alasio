@@ -3,7 +3,9 @@ import inspect
 from collections import defaultdict
 
 from alasio.codegen.python import CodeGen
+from alasio.config.entry.mod_entry import MOD_ENTRY_NAME
 from alasio.config_dev.gen.gen_nav_index import GenNavIndex
+from alasio.config_dev.parse.base import DefinitionError
 from alasio.logger import logger
 
 
@@ -40,6 +42,34 @@ class GenConfigGenerated(GenNavIndex):
         if config is not None:
             yield nav_name, config
 
+    def _is_related_model(self, models, model):
+        """
+        Whether a model bound to an already declared group name still fits it.
+
+        Models of one variant family share an ancestor in their MRO chain: the
+        base group they are all variants of. A subclass, a base class and a
+        sibling variant of the declared model all validate the same group, so
+        the declared one still gives the IDE a usable type.
+
+        Args:
+            models (dict[str, str]): Models already bound to the group name,
+                key: class name, value: reference in the generated file
+            model (str): Class name of the model of the binding to check
+
+        Returns:
+            bool: True if the model shares an ancestor with every model already bound
+        """
+
+        def mro_of(name):
+            group = self.groups_data.get(name, None)
+            if group is None or not group.mro:
+                # unknown group, or a chain that is not built: it stands alone
+                return {name}
+            return set(group.mro)
+
+        mro = mro_of(model)
+        return all(mro & mro_of(other) for other in models)
+
     def generate_config_generated_file(self, gitadd=None):
         """
         Generate config_generated.py file with type hints for IDE auto-completion
@@ -60,12 +90,15 @@ class GenConfigGenerated(GenNavIndex):
         gen.Import('typing').as_('t')
         if self.alasio:
             gen.FromImport('alasio.config.base').Import('AlasioConfigBase')
-            gen.FromImport('..const').Import('entry')
+            gen.FromImport('.mod_entry').Import(MOD_ENTRY_NAME)
         # TYPE_CHECKING block - imports only used for type hints
         with gen.If('t.TYPE_CHECKING'):
             gen.Import('alasio.config.alasio.group_export').as_('alasio').lazy()
-            # Sort nav names for stable output
-            for nav_name, config in self.dict_nav_config.items():
+            # Sort nav names for stable output: the order of dict_nav_config comes
+            # from the nav folders, sorting keeps the file stable when a folder is
+            # added or removed
+            for nav_name in sorted(self.dict_nav_config):
+                config = self.dict_nav_config[nav_name]
                 # from .{nav} import {nav}_model as {nav}
                 gen.FromImport(f'..{config.folder}').Import(f'{nav_name}_model').as_(nav_name).lazy()
 
@@ -80,12 +113,14 @@ class GenConfigGenerated(GenNavIndex):
         with cls:
             gen.MultilineComment('A generated config struct to fool IDE\'s type-predict and auto-complete')
             if self.alasio:
-                gen.Raw('entry = entry')
+                # The entry of the mod is created in mod_entry.py, next to this
+                # file: the mod states its layout once, see GenModEntry
+                gen.Raw(f'entry = {MOD_ENTRY_NAME}')
             gen.Empty()
 
             # Generate group attributes organized by nav
             # Sort nav names for stable output, but keep group order as defined
-            collected_groups = defaultdict(set)
+            collected_groups = defaultdict(dict)
             for nav_name, config in self._iter_nav_config_by_order():
                 # Nav comment
                 gen.MultilineComment(f'========== nav: {nav_name} ==========')
@@ -107,8 +142,15 @@ class GenConfigGenerated(GenNavIndex):
                         if not group.args:
                             continue
                         cls_name = group.name
-                        ancestor_config = self.dict_group_to_ancestor_nav[group.name]
-                        model_nav = ancestor_config.nav_name
+                        # the class of a group is generated in the model file
+                        # of the nav declaring the group
+                        parser = group.parser
+                        if parser is None:
+                            # this shouldn't happen, groups are parsed from a nav
+                            raise DefinitionError(
+                                f'Group "{group_name}" does not have a parser',
+                                file=config.tasks_file, keys=[task_name, 'groups'], value=group_name)
+                        model_nav = parser.nav_name
                         anno = f'{model_nav}.{cls_name}'
                         # special match that convert any Scheduler child group to Scheduler
                         # because we maintain the consistency between them
@@ -118,17 +160,26 @@ class GenConfigGenerated(GenNavIndex):
                             gen.Comment(f'{group_name}: "{anno}"')
                             continue
                         # generate group_name: anno
-                        if group_name in collected_groups:
-                            gen.Comment(f'{group_name}: "{anno}"')
-                        else:
+                        # A group name may be bound by several tasks: the first
+                        # binding declares the attribute, the later ones only add
+                        # a comment. Binding it to a model of another variant
+                        # family is reported: the same input would be validated
+                        # by two unrelated models, and the IDE reads a wrong type.
+                        # A variant of the declared model, a base class or a
+                        # sibling variant is what variant groups are for, so it
+                        # is not reported.
+                        models = collected_groups[group_name]
+                        if not models:
                             gen.use_import(model_nav)
                             gen.Anno(group_name, anno=f'"{anno}"')
-                            # validate if Multiple validation model bound on the same group
-                            collected_groups[group_name].add(anno)
-                            if len(collected_groups[group_name]) > 1:
+                        else:
+                            gen.Comment(f'{group_name}: "{anno}"')
+                            if cls_name not in models and not self._is_related_model(models, cls_name):
                                 logger.warning(
                                     f'Multiple validation model bound on group {task_name}.{group_name}, '
-                                    f'might cause unexpected behaviour, models: {collected_groups[group_name]}')
+                                    f'might cause unexpected behaviour, '
+                                    f'models: {sorted(list(models.values()) + [anno])}')
+                        models[cls_name] = anno
 
                 gen.Empty()
 
@@ -146,6 +197,10 @@ class GenConfigGenerated(GenNavIndex):
 
     def generate_group_export(self, gitadd=None):
         gen = CodeGen()
+        # This module only re-exports group classes, every import is part of the
+        # public API. Without the file-level noqa, ruff F401 would delete them
+        # all when the generated file is formatted.
+        gen.Comment('ruff: noqa: F401')
         for module_name in [
             'alasio.config.alasio.group_base',
             'alasio.config.alasio.store_model',

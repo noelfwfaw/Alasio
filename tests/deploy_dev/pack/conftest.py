@@ -41,6 +41,12 @@ from alasio.git.mock.mock_repo import MockGitRepo
 from alasio.testing.static_file import MockStaticFile
 
 COMMIT = 'c1'
+# The app folder of a test is a directory of the fake root, never the root
+# itself: the expected log texts of the deploy tests are built from
+# env.PROJECT_ROOT with f-strings, and the root "/" of POSIX would turn every
+# "{root}/.pack" into "//.pack". A project is a directory of the filesystem
+# anyway.
+APP_FOLDER = 'app'
 
 
 class MemoryLock:
@@ -50,8 +56,8 @@ class MemoryLock:
     The job lock is a SQLite file lock, SQLite opens its file in the C
     layer where the in-memory fake filesystem cannot intercept it (the
     real lock is covered by test_deploy_lock.py on a real directory).
-    The interface used by DeployJob is implemented, re-entrant by
-    counter like SQLiteFileLock.
+    The interface used by DeployJob is implemented, not reentrant like
+    SQLiteFileLock: a second acquire() of the holding thread raises.
     """
 
     def __init__(self, lock_file, timeout=-1):
@@ -63,7 +69,7 @@ class MemoryLock:
         """
         self.lock_file = str(lock_file)
         self.timeout = timeout
-        self._count = 0
+        self._held = False
 
     @property
     def is_locked(self):
@@ -71,17 +77,27 @@ class MemoryLock:
         Returns:
             bool: True if the lock is held
         """
-        return self._count > 0
+        return self._held
 
-    def acquire(self, timeout=None):
+    def acquire(self, timeout=None, owner=None):
         """
         Args:
             timeout (float, optional): Ignored, the lock is in memory.
+            owner (int, optional): Ignored, kept for the SQLiteFileLock
+                interface
 
         Returns:
             MemoryLock: self
+
+        Raises:
+            RuntimeError: If this thread already holds the lock
         """
-        self._count += 1
+        if self._held:
+            raise RuntimeError(
+                f'The lock "{self.lock_file}" is already held by this thread, '
+                f'a reentrant acquire would wait for itself'
+            )
+        self._held = True
         return self
 
     def release(self, force=False):
@@ -89,13 +105,16 @@ class MemoryLock:
         Args:
             force (bool): Ignored, kept for the SQLiteFileLock interface
         """
-        if self._count:
-            self._count -= 1
+        self._held = False
 
 
 @pytest.fixture
 def app_folder(fs, monkeypatch):
     """Set PROJECT_ROOT to a fresh folder in the fake filesystem.
+
+    The folder is a directory of the fake root (APP_FOLDER), not the root
+    itself, so the paths built from env.PROJECT_ROOT in the expected log
+    texts are the ones the job logs on every platform.
 
     The fs fixture is imported explicitly in the test modules, see
     the usage notes in alasio/testing/filesystem/__init__.py. The lock
@@ -104,7 +123,8 @@ def app_folder(fs, monkeypatch):
     cannot serve, see test_deploy_lock.py for the real lock on a real
     directory.
     """
-    monkeypatch.setattr(env, 'PROJECT_ROOT', PathStr.new(fs.root_dir.path))
+    monkeypatch.setattr(env, 'PROJECT_ROOT', PathStr.new(fs.root_dir.path).joinpath(APP_FOLDER))
+    fs.create_dir(env.PROJECT_ROOT)
     monkeypatch.setattr(job_module, 'SQLiteFileLock', MemoryLock)
 
 

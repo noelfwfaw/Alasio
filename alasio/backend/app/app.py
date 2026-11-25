@@ -10,10 +10,13 @@ from alasio.backend.app.restart.daily import DAILY
 from alasio.backend.app.restart.restart_manager import RESTART_MANAGER
 from alasio.backend.app.restart.update_check import UPDATE_CHECK
 from alasio.backend.auth import auth
+from alasio.backend.dev import golden_test
 from alasio.backend.dev.assets import ImageStaticFiles
 from alasio.backend.middleware.gate import DeploymentGateMiddleware
+from alasio.backend.pyc_warm.manager import PYC_WARM_MANAGER
 from alasio.backend.reactive.source import BaseSource
 from alasio.backend.topic._worker import BACKEND_WORKER_MANAGER
+from alasio.backend.topic.golden_test import watch_loop as golden_test_watch_loop
 from alasio.backend.topic.que import TASK_QUEUE_UPDATE_MANAGER
 from alasio.backend.topic.scan import ConfigScanSource
 from alasio.backend.ws import renew as ws_renew
@@ -170,11 +173,27 @@ async def task_gc(wait=8):
             logger.exception(e)
 
 
+def set_backend_role():
+    """
+    Mark this process as the backend of the GUI.
+
+    The role decides how a model file is loaded (see env.PROCESS_ROLE): the
+    backend serves every mod and never runs a game script, so it loads the
+    models without touching sys.modules.
+    """
+    from alasio.ext import env
+    env.PROCESS_ROLE = 'backend'
+
+
 @contextlib.asynccontextmanager
 async def lifespan(app):
     """
     A global starlette lifespan
     """
+    # Set here rather than in the process entry: any ASGI server that runs
+    # this app, a manual one included, gets the right role.
+    set_backend_role()
+
     restore_context_cls()
     logger.info('Lifespan start')
     async with trio.open_nursery() as nursery:
@@ -189,12 +208,36 @@ async def lifespan(app):
         # becomes pending at its NextRun with no worker event involved
         # (alasio.backend.topic.que.TaskQueueUpdateManager)
         nursery.start_soon(TASK_QUEUE_UPDATE_MANAGER.run)
+        # the golden test review page: its two sources share one PathWatcher,
+        # this loop turns outside writes into pushes of their topics
+        nursery.start_soon(golden_test_watch_loop)
         # warmups
         nursery.start_soon(ConfigScanSource.create_default_config)
         # the frontend: one worker thread reads the manifest and every file in
         # the background, the 5s startup window of the supervisor must not be
         # spent on the whole tree (requests prepare their file on demand)
         nursery.start_soon(SITE.warm_up)
+        # the models and the json of every mod: two threads per mod in the
+        # background, and a request that arrives before its mod is warm waits
+        # for it (see BaseTopic.wait_mod_ready) instead of paying the same
+        # work a second time in its own thread. The loader is imported here
+        # for the reason given above build_app: it is bound to the project
+        # root resolved by create_config.
+        from alasio.config.entry.loader import MOD_LOADER
+        from alasio.config.entry.preload import MOD_PRELOAD
+
+        # building the mod list reads the entry file of the project: keep it
+        # off the loop. The warmup reads that cached dict to build its jobs,
+        # so a request never scans the project in the loop thread either.
+        _ = await trio.to_thread.run_sync(lambda: MOD_LOADER.dict_mod)
+        nursery.start_soon(MOD_PRELOAD.run)
+        # the bytecode cache of the release: without it the first start after
+        # an update compiles thousands of pyc files while the worker waits for
+        # its first device. A child of this backend, so the compilation never
+        # runs on this loop and never outlives the process that does (see
+        # alasio.backend.pyc_warm). Best effort: the spawn costs tens of
+        # milliseconds and a failure is a warning, the backend starts either way
+        PYC_WARM_MANAGER.start()
         # daily maintenance (Deploy.Update.AutoRestartTime): the bookkeeping owns
         # the schedule task, a no-op when the config disables it or the backend
         # runs without a supervisor. The task only decides WHEN the daily action
@@ -227,6 +270,9 @@ async def lifespan(app):
         nursery.cancel_scope.cancel()
 
     # cleanup before exit
+    # Stop the warmup first: it is an optimization, the workers get the rest
+    # of the shutdown budget
+    PYC_WARM_MANAGER.close()
     # Terminate all workers
     BACKEND_WORKER_MANAGER.close()
     # release db connections
@@ -284,6 +330,11 @@ def create_app():
         ImageStaticFiles.mount(
             assets_router, path, directory=joinnormpath(mod.entry.root, mod.entry.path_assets), check_dir=False)
     app.add_router('/api', assets_router)
+
+    # Screenshots of the golden test review page: GET /api/golden_test/image
+    # streams the collection folder of a mod (the topics of the page are in
+    # topic/golden_test.py, the route requires the electron token)
+    app.add_router('/api', golden_test.router)
 
     # Mount mod APIs
     pass

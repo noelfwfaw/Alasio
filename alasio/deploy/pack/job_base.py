@@ -1,11 +1,15 @@
 import os
+import stat
 from hashlib import sha1
+from itertools import chain
 from typing import Optional
 
 import trio
 from msgspec import Struct
 
 from alasio.deploy.pack.decode_base import PackDecodeBase, PackDecodeError
+from alasio.deploy.pack.local_index import LocalIndex
+from alasio.deploy.pack.local_side import LocalSide, LocalSideRepo
 from alasio.deploy.pack.pack_model import IdxInfo
 from alasio.deploy.pack.tmp_manager import TmpManager
 from alasio.deploy.simple_pip.cleanup_folder import CleanupFolder
@@ -13,9 +17,9 @@ from alasio.ext import env
 from alasio.ext.cache import InstanceCacheOperation, cached_property
 from alasio.ext.path import PathStr
 from alasio.ext.path.atomic import (
-    atomic_open, atomic_read_bytes, atomic_remove, atomic_replace, atomic_rmtree, folder_rmtree_empty
+    atomic_open, atomic_read_bytes, atomic_remove, atomic_replace, atomic_rmtree, file_remove, folder_rmtree_empty
 )
-from alasio.ext.path.makedir import batch_makedirs
+from alasio.ext.path.makedir import BatchMakedirs
 from alasio.logger import logger
 
 
@@ -133,6 +137,111 @@ class DeployTarget:
         # a lock on it would not survive the flow), see
         # DeployJob.locked()
         self.lock_file = self.ledger.joinpath('lock')
+        # the files of the target that are not the working tree file of the
+        # same path, by the scene of the caller (see DeployJob): an empty
+        # side for a repository target, the files of a python distribution
+        # for one a mod took over from pip. The jobs ask it for every fact
+        # they would otherwise read from the disk, so nothing of this layer
+        # knows what a RECORD or a wheel is
+        self.local_side: LocalSide = LocalSideRepo()
+
+    @cached_property
+    def local_index(self):
+        """
+        The local index pack of the target, the record of its own files.
+
+        Read on first use, or seeded by the caller that already read it
+        (DeployJob.update() reads it once and hands the same object to the
+        job of the flow).
+
+        Returns:
+            LocalIndex: The index pack, or the reason the target has none
+        """
+        return LocalIndex.read(self)
+
+    def local_path(self, path):
+        """
+        Map a path of the pack format to the local path of the target.
+
+        The canonical pack area .pack/... of the packs is mapped into
+        the ledger folder of the target: .pack/index.pack becomes
+        .pack/{name}/index.pack, .pack/history.pack becomes
+        .pack/{name}/history.pack, and so on. Every other path is
+        returned unchanged. The mapping is the identity when name is
+        empty: the ledger folder is .pack itself then.
+
+        The pack area folder itself is never a file of a pack, the pack
+        builder rejects it (it must be a folder): a path equal to it is
+        rejected here too, instead of being mapped to the ledger folder.
+
+        Args:
+            path (str): Path of the pack format, relative to the root
+
+        Returns:
+            str: Local path of the target
+
+        Raises:
+            ValueError: If the path is the pack area folder itself
+        """
+        if path == self.PACK_AREA_DIR:
+            raise ValueError(
+                f'Pack path is the pack area itself, it must be a folder: {path!r}'
+            )
+        if not self.name or not path.startswith(self.PACK_AREA):
+            return path
+        # replace the pack area prefix with the ledger folder
+        return self.ledger_rel + path[len(self.PACK_AREA_DIR):]
+
+    def localize(self, decoder):
+        """
+        Rewrite the pack area paths of a decoded pack to the local
+        namespace of the target, see local_path().
+
+        The rewrite covers the three views of the decoder: idx_info
+        (the record list, rewritten in place), fileinfo and refinfo
+        (cached dicts of the same records, keyed by the path at build
+        time and rebuilt here so the keys follow the rewritten paths).
+        It must run right after decoding and before any comparison or
+        file operation: the paths of the pack (e.g. the index pack
+        record .pack/index.pack) and the local paths of the target
+        must never be mixed. Nothing to do when name is empty, the
+        mapping is the identity then.
+
+        It is not idempotent: a second pass turns .pack/{name}/x into
+        .pack/{name}/{name}/x. Every decode of a pack is rewritten once,
+        by the owner of the decoder, before any other reader sees it (the
+        jobs localize the pack they decode, the ledger side localizes the
+        index pack it reads, see alasio.deploy.pack.source).
+
+        The bytes of the index pack itself always stay canonical (it
+        is written to the ledger folder from the pack bytes): the
+        rewrite only affects the decoded views, so every reader of the
+        ledger gets the same canonical records and localizes them the
+        same way.
+
+        Args:
+            decoder (PackDecodeBase): Decoder of the pack to rewrite
+
+        Returns:
+            PackDecodeBase: The decoder, for call chaining
+        """
+        if not self.name:
+            return decoder
+        for info in decoder.idx_info:
+            info.path = self.local_path(info.path)
+            if info.source_path:
+                info.source_path = self.local_path(info.source_path)
+        # fileinfo / refinfo share the records with idx_info: rebuild
+        # the cached dicts so their keys follow the rewritten paths.
+        # The access builds the cache first when it was not built yet,
+        # then the set() replaces it with the re-keyed dict.
+        InstanceCacheOperation.set(decoder, 'refinfo', {
+            info.path: info for info in decoder.refinfo.values()
+        })
+        InstanceCacheOperation.set(decoder, 'fileinfo', {
+            info.path: info for info in decoder.fileinfo.values()
+        })
+        return decoder
 
     @cached_property
     def described_target(self):
@@ -315,84 +424,6 @@ class JobBase(DeployTarget):
                                'tmp_manager_init() was not awaited')
         manager.register(info.size, info.sha1, tmp)
 
-    def local_path(self, path):
-        """
-        Map a path of the pack format to the local path of the target.
-
-        The canonical pack area .pack/... of the packs is mapped into
-        the ledger folder of the target: .pack/index.pack becomes
-        .pack/{name}/index.pack, .pack/history.pack becomes
-        .pack/{name}/history.pack, and so on. Every other path is
-        returned unchanged. The mapping is the identity when name is
-        empty: the ledger folder is .pack itself then.
-
-        The pack area folder itself is never a file of a pack, the pack
-        builder rejects it (it must be a folder): a path equal to it is
-        rejected here too, instead of being mapped to the ledger folder.
-
-        Args:
-            path (str): Path of the pack format, relative to the root
-
-        Returns:
-            str: Local path of the target
-
-        Raises:
-            ValueError: If the path is the pack area folder itself
-        """
-        if path == self.PACK_AREA_DIR:
-            raise ValueError(
-                f'Pack path is the pack area itself, it must be a folder: {path!r}'
-            )
-        if not self.name or not path.startswith(self.PACK_AREA):
-            return path
-        # replace the pack area prefix with the ledger folder
-        return self.ledger_rel + path[len(self.PACK_AREA_DIR):]
-
-    def localize(self, decoder):
-        """
-        Rewrite the pack area paths of a decoded pack to the local
-        namespace of the target, see local_path().
-
-        The rewrite covers the three views of the decoder: idx_info
-        (the record list, rewritten in place), fileinfo and refinfo
-        (cached dicts of the same records, keyed by the path at build
-        time and rebuilt here so the keys follow the rewritten paths).
-        It must run right after decoding and before any comparison or
-        file operation: the paths of the pack (e.g. the index pack
-        record .pack/index.pack) and the local paths of the target
-        must never be mixed. Nothing to do when name is empty, the
-        mapping is the identity then.
-
-        The bytes of the index pack itself always stay canonical (it
-        is written to the ledger folder from the pack bytes): the
-        rewrite only affects the decoded views, so every reader of the
-        ledger gets the same canonical records and localizes them the
-        same way.
-
-        Args:
-            decoder (PackDecodeBase): Decoder of the pack to rewrite
-
-        Returns:
-            PackDecodeBase: The decoder, for call chaining
-        """
-        if not self.name:
-            return decoder
-        for info in decoder.idx_info:
-            info.path = self.local_path(info.path)
-            if info.source_path:
-                info.source_path = self.local_path(info.source_path)
-        # fileinfo / refinfo share the records with idx_info: rebuild
-        # the cached dicts so their keys follow the rewritten paths.
-        # The access builds the cache first when it was not built yet,
-        # then the set() replaces it with the re-keyed dict.
-        InstanceCacheOperation.set(decoder, 'refinfo', {
-            info.path: info for info in decoder.refinfo.values()
-        })
-        InstanceCacheOperation.set(decoder, 'fileinfo', {
-            info.path: info for info in decoder.fileinfo.values()
-        })
-        return decoder
-
     async def run(self):
         """
         Execute the job, each subclass implements its own run().
@@ -434,12 +465,18 @@ class JobBase(DeployTarget):
         first, the deletions after every write.
 
         Every tmp file is moved to the target path atomically and the
-        deleted markers are removed. The two groups of paths are
-        disjoint (a deletion removes a file the new version does not
-        have, a write targets a file it has), so applying every write
-        before every deletion is safe, whatever the order of the
-        pending list is: an interruption leaves the old files in place
-        instead of half-deleted. The target is chmod-ed when
+        deleted markers are removed. The sources of the R / RM records in the
+        batch are removed with them, after every write: they are the files the
+        writes move, so they are deleted only when their target was really
+        written (a record left in error is not in the batch). A deleted path
+        that is a folder by now (the new version replaced the file with a
+        folder of the same name) is kept when the new version records a file
+        inside it, and removed with its content otherwise, see
+        _remove_deleted(). The two groups of paths are disjoint (a deletion
+        removes a file the new version does not have, a write targets a file it
+        has), so applying every write before every deletion is safe, whatever
+        the order of the pending list is: an interruption leaves the old files
+        in place instead of half-deleted. The target is chmod-ed when
         pending.mode is set, the mode decision is made by the job that
         prepared the pending list. The folders left empty by the
         deletions are removed, see cleanup_empty_folders(). The
@@ -449,12 +486,23 @@ class JobBase(DeployTarget):
         """
         applies = [pending for pending in self.pending if pending.info.edit != 2]
         deletes = [pending for pending in self.pending if pending.info.edit == 2]
+        # The source of an R / RM record is a file of the old version the write
+        # moves: it is deleted after its target is written, whatever prepared
+        # the record (the unpack of the pack, or the download of a record whose
+        # source was unusable). Deriving it here from the writes keeps the two
+        # in one place: a record that stayed in error is not in applies, so its
+        # source is never deleted, and no caller has to remember the rule.
+        moved = [
+            PendingFile(info=IdxInfo(path=pending.info.source_path, edit=2), tmp='')
+            for pending in applies
+            if pending.info.edit == 3 and pending.info.source_path
+        ]
 
         # create the parent folders of all targets in one batch
-        batch_makedirs([
+        BatchMakedirs(
             self.root.joinpath(pending.info.path)
             for pending in applies
-        ])
+        ).run()
 
         for pending in applies:
             target = self.root.joinpath(pending.info.path)
@@ -463,11 +511,125 @@ class JobBase(DeployTarget):
             if pending.mode is not None:
                 os.chmod(target, pending.mode)
 
-        for pending in deletes:
+        # the folders the new version occupies, built in one pass over each
+        # source: a deleted path is answered by a lookup instead of a scan of
+        # every record. new_fileinfo is the record set of the version (a record
+        # whose target already matches is not written, so it is not in
+        # applies), the applies of the run cover the jobs whose record set is
+        # the update pack only
+        occupied = self.occupied_folders(chain(
+            (path for path, info in self.new_fileinfo.items() if info.edit != 2),
+            (pending.info.path for pending in applies),
+        ))
+        for pending in deletes + moved:
             # deleted marker, the file should not exist
-            self.changed |= atomic_remove(self.root.joinpath(pending.info.path))
+            self.changed |= self._remove_deleted(pending.info.path, occupied)
 
         self.cleanup_empty_folders()
+
+    @staticmethod
+    def occupied_folders(paths):
+        """
+        The folders the files of a version occupy.
+
+        A pack records files only: a folder is the prefix of the paths below
+        it. The prefixes come from BatchMakedirs.parent_folders_of(), the rule
+        the parent folders of the writes are read with: the set can never
+        disagree with the folders that were created, and a folder is answered
+        by a lookup instead of a scan of every record.
+
+        Args:
+            paths (Iterable[str]): Paths of the files, '/'-separated and
+                relative to the root of the target
+
+        Returns:
+            set[str]: Every folder that holds a file, relative to the root of
+                the target, the root itself excluded
+        """
+        return set(BatchMakedirs.parent_folders_of(paths))
+
+    def _remove_deleted(self, path, occupied):
+        """
+        Apply one deleted marker to the working tree.
+
+        The path of a deleted record is a file of the old version, and the new
+        version does not have it. The path is treated as the file it was
+        (unlink, no lookup of its kind first: one file operation in the common
+        case), and only a failure that does not name the kind of the path opens
+        the question of what is at the path now.
+
+        The path may be a folder, because the new version replaced the file
+        with a folder of the same name (e.g. "pkg/mod.py" became
+        "pkg/mod/__init__.py"): the writes of replace_data() run before the
+        deletions and BatchMakedirs removes a file in the way of a folder,
+        so the folder exists when this record is applied. A folder is never
+        unlinked as a file (an error on every platform, an 8 attempt retry on
+        Windows), it is decided by its role in the new version:
+
+        - the ledger folder of the target, and a folder that holds it, is
+          never removed: the index pack and the workspace of the job are
+          there, whatever the record says;
+        - a folder that holds a file of the new version is kept: it is the
+          folder the new version wants, and the deletion of the record is
+          already satisfied (no file of the old version is left at the path);
+        - every other folder is a leftover of an interrupted run, or something
+          the user placed on the path a file of the old version had: the path
+          must not exist any more, so the folder goes with its content.
+
+        A path that is a file the file system refuses to remove (a file held
+        open by another process on Windows) keeps the retrying removal of
+        atomic_remove(): the failure is not about the kind of the path.
+
+        Args:
+            path (str): Path of the deleted record, relative to the root of
+                the target
+            occupied (set[str]): Folders the writes of this run occupy, see
+                occupied_folders(): a folder in the set is a folder of the new
+                version, a folder outside of it is a leftover
+
+        Returns:
+            bool: True when a file or a folder was removed
+
+        Raises:
+            OSError: If a file of the path cannot be removed
+        """
+        ledger = self.ledger_rel
+        # the empty path is the root of the target, the prefix of every ledger
+        prefix = f'{path}/' if path else ''
+        if path == ledger or ledger.startswith(prefix):
+            logger.warning(
+                f'Skipped the deletion of "{path}": the ledger folder of the target is inside it')
+            return False
+        target = self.root.joinpath(path)
+        try:
+            return file_remove(target)
+        except NotADirectoryError:
+            # a parent of the path is a file, there is no entry to remove (a
+            # job that does not create the parent folders is a caller of its
+            # own)
+            return False
+        except IsADirectoryError:
+            # POSIX names the kind in the failure itself: the path is a folder,
+            # no lookup needed
+            pass
+        except PermissionError:
+            # Windows refuses the unlink of a folder with the same error as a
+            # file held open by another process: the kind of the path is what
+            # tells the two apart
+            try:
+                st = os.lstat(target)
+            except (FileNotFoundError, NotADirectoryError):
+                # the entry vanished under the removal
+                return False
+            if not stat.S_ISDIR(st.st_mode):
+                # a file after all: the removal has to retry on the lock of
+                # the file, and it raises when it gives up
+                return atomic_remove(target)
+        if path in occupied:
+            logger.info(f'Skipped the deletion of "{path}": the new version has a folder there')
+            return False
+        logger.info(f'Removing the folder of a deleted path: "{target}"')
+        return atomic_rmtree(target)
 
     def replace_index(self):
         """
@@ -487,7 +649,7 @@ class JobBase(DeployTarget):
         # job, it exists by now; the batch keeps the replace below
         # working when it does not (a target updated without a
         # workspace, e.g. a direct job call)
-        batch_makedirs([target])
+        BatchMakedirs([target]).run()
         atomic_replace(pending.tmp, target)
         if pending.mode is not None:
             os.chmod(target, pending.mode)
@@ -542,34 +704,73 @@ class JobBase(DeployTarget):
         """
         atomic_rmtree(self.workspace)
 
-    def _old_fileinfo_from_index(self):
+    @cached_property
+    def old_fileinfo(self):
         """
-        Read the fileinfo of the local index pack, the leftover
-        deletion base of a rebuild.
+        The records of the old version, the deletion base of the flow.
 
-        The index is read from the ledger folder of the target and
-        rewritten to the local namespace like every decoded pack, see
-        localize(). Deleted markers (edit == 2) are excluded: they
-        describe files that should not exist, not files that exist. A
-        missing, malformed or checksum-failed index pack degrades to
-        {}: the leftover cleanup is skipped, the rebuild still
-        converges for every file of the new index.
+        The records of the local index pack when the target has one, the
+        extra records of the local side otherwise (a python distribution the
+        caller declared), {} when neither. It sits next to residue_fileinfo()
+        and is merged with it the same way, both being the records the flow
+        must read before the run replaces what they describe.
+
+        Reading it is blocking IO when the target has no ledger (the first
+        access of the local side), so it is warmed in a worker thread before
+        the flow uses it, see _warm_old_fileinfo() and _warm_residue(). The
+        members that already run in a worker thread use it directly, see
+        UnpackJob.unpack().
 
         Returns:
-            dict[str, IdxInfo]: Fileinfo of the old local index pack,
-                {} when it is missing or malformed
+            dict[str, IdxInfo]: Records keyed by the path relative to the
+                root of the target
         """
-        try:
-            decoder = PackDecodeBase(atomic_read_bytes(self.index_file))
-            decoder.validate_index()
-        except (FileNotFoundError, PackDecodeError) as e:
-            logger.warning(f'Failed to read the old index pack: {e}')
-            return {}
-        self.localize(decoder)
-        return {
-            path: info for path, info in decoder.fileinfo.items()
-            if info.edit != 2
-        }
+        index = self.local_index
+        if index.exists:
+            return index.fileinfo()
+        side = self.local_side
+        if side.fileinfo:
+            logger.info(
+                f'Using the local files of the target as the old version: '
+                f'{self.described_target}, {side.version or "no version"}')
+            return side.fileinfo
+        # nothing names the files of the target: the flow runs without a
+        # deletion base, and this is the only report of why
+        logger.warning(f'Failed to read the old index pack: {index.reason}')
+        return {}
+
+    def _warm_old_fileinfo(self):
+        """
+        Read the old fileinfo in the worker thread that calls this.
+
+        The property opens the records of the target on its first access,
+        which is blocking IO for a target whose files come from a local side:
+        the flows hand this method to trio.to_thread.run_sync instead of
+        touching the attribute on the event loop thread, the same way
+        _warm_residue() warms the records of a previous run.
+
+        Returns:
+            dict[str, IdxInfo]: Records of the old version, see old_fileinfo
+        """
+        return self.old_fileinfo
+
+    def _local_side_data(self, path):
+        """
+        The content of a file of the target that is not the working tree file
+        of the same path.
+
+        Only the files a local side supplies answer: a repository target
+        supplies none, so the working tree is its old side.
+
+        Args:
+            path (str): Path relative to the root, in the local namespace of
+                the target
+
+        Returns:
+            bytes | None: Content to use as the old file, None to read the
+                working tree
+        """
+        return self.local_side.filedata.get(path)
 
     @staticmethod
     def _leftover_deletions(old_fileinfo, new_fileinfo):
@@ -652,6 +853,12 @@ class JobBase(DeployTarget):
         """
         Read a current file in the project, data and mode in one open.
 
+        A path that holds no file answers as missing instead of raising: the
+        zip of a path below a file (ENOTDIR), or a path the new version turned
+        from a folder into a file (EISDIR). Both are handled by the write that
+        follows: the parent folders are created, and an entry in the way is
+        removed.
+
         Args:
             file (str): File path to read
 
@@ -663,7 +870,9 @@ class JobBase(DeployTarget):
             with atomic_open(file, 'rb') as f:
                 data = f.read()
                 mode = os.fstat(f.fileno()).st_mode
-        except FileNotFoundError:
+        except (FileNotFoundError, NotADirectoryError, IsADirectoryError):
+            # no file of its own at the path: it is missing, a parent of it is
+            # a file, or the path is a folder the new version replaced
             return CurrentFile(exist=False, data=b'', mode=0)
         return CurrentFile(exist=True, data=data, mode=mode)
 

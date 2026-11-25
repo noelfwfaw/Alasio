@@ -1,6 +1,6 @@
 from copy import deepcopy
 
-from ExampleMod.module.config.const import entry
+from alasio.config.entry.mod_entry import ModEntry
 from alasio.config_dev.gen_index import IndexGenerator
 from alasio.config_dev.parse.base import args_yaml_postprocess
 from alasio.ext.deep import deep_set
@@ -44,7 +44,11 @@ class Generator(IndexGenerator):
 if __name__ == '__main__':
     set_project_root(__file__, up=4)
     logger.mute(fd=True)
+    # The entry of the mod, for the generation itself: module/config/_index/
+    # mod_entry.py, which every other module of the mod imports, is written by
+    # the generation, so the generator creates its entry of its own
+    entry = ModEntry.create(__file__, uppath=3)
     # generate
-    logger.info(f'ModEntry: {entry}')
+    logger.info(f'ModEntry: {entry.data}')
     self = Generator(entry)
     self.generate()

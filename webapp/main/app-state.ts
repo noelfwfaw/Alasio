@@ -2,6 +2,7 @@ import { app, nativeTheme } from "electron";
 import { sendStdinCommand } from "./backend";
 import type { ConfigError } from "./config";
 import { DEFAULT_LANG, SUPPORTED_LANGS } from "./i18ngen";
+import { matchSystemLanguage } from "./system-language";
 
 // Host-level language values: 'system' or one of the supported languages.
 // The webapp main process is the single source of truth; the backend only
@@ -20,20 +21,6 @@ export function isConfigLang(value: string): value is ConfigLang {
 
 export function isConfigTheme(value: string): value is ConfigTheme {
   return (CONFIG_THEMES as readonly string[]).includes(value);
-}
-
-/**
- * Match the OS locale against the supported languages: exact match first,
- * then base-language prefix match, then the default language.
- */
-function matchSystemLanguage(): string {
-  const locale = app.getLocale();
-  if ((SUPPORTED_LANGS as readonly string[]).includes(locale)) {
-    return locale;
-  }
-  const base = locale.split("-")[0];
-  const match = (SUPPORTED_LANGS as readonly string[]).find((l) => l.split("-")[0] === base);
-  return match || DEFAULT_LANG;
 }
 
 class AppState {
@@ -145,8 +132,33 @@ class AppState {
     this.notify();
   }
 
+  /**
+   * Derive the concrete display values from the config values.
+   *
+   * The display language comes from the application locale, which is the
+   * OS display language; see matchSystemLanguage() for why the regional
+   * locale is not used as the primary source.
+   */
   private deriveDisplay(): void {
-    this.displayLang = this.configLang === "system" ? matchSystemLanguage() : this.configLang;
+    this.displayLang =
+      this.configLang === "system"
+        ? matchSystemLanguage(app.getLocale(), app.getPreferredSystemLanguages())
+        : this.configLang;
+
+    // Drive Chromium's own light/dark state as well. The renderer paints
+    // itself from the display theme (the `.dark` class + colorScheme), but the
+    // native parts Chromium renders (devtools, context menus on Linux/Windows)
+    // and `prefers-color-scheme` inside the renderer follow `themeSource`.
+    // Without this the app could be dark while the embedded page still reports
+    // the OS preference. Assigning 'system' restores the OS default, so a
+    // config value of 'system' needs no special case.
+    //
+    // Order matters when the config is 'system': themeSource must be settled
+    // first, otherwise shouldUseDarkColors below would answer for the previous
+    // override. The 'updated' listener is filtered on configTheme, so this
+    // assignment cannot feed back into deriveDisplay while the override is a
+    // concrete value.
+    nativeTheme.themeSource = this.configTheme;
     this.displayTheme =
       this.configTheme === "system" ? (nativeTheme.shouldUseDarkColors ? "dark" : "light") : this.configTheme;
   }

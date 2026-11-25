@@ -1,3 +1,4 @@
+# ruff: noqa: F401
 from alasio.base.timer import getnow
 from alasio.config.alasio.alasio_model import (
     Scheduler,
@@ -29,7 +30,10 @@ from alasio.config.alasio.store_model import (
     DashboardAmount,
     DashboardBase,
     DashboardDynamicTotal,
+    DashboardPlanner,
+    DashboardProgress,
     DashboardRemain,
+    DashboardSoftTotal,
     DashboardTotal,
 )
 

@@ -1,7 +1,7 @@
 from typing import Iterator
 
 from alasio.config_dev.format.format_yaml import yaml_formatter
-from alasio.config_dev.gen.gen_config import ConfigGenerator
+from alasio.config_dev.gen.gen_config import ConfigGenerator, remove_stale_file
 from alasio.config_dev.gen.gen_cross import CrossNavGenerator
 from alasio.config_dev.parse.base import DefinitionError
 from alasio.ext.cache import cached_property
@@ -22,9 +22,9 @@ class GenNavIndex(CrossNavGenerator):
     def dict_group_name_i18n(self):
         """
         Returns:
-            dict[str, dict[str, str]]:
+            dict[str, dict[str, str | list[str]]]:
                 key: {group_name}.{lang}
-                value: translation
+                value: translation, a list of lines if the name has multiple lines
         """
         out = {}
 
@@ -113,11 +113,8 @@ class GenNavIndex(CrossNavGenerator):
                 if gitadd:
                     gitadd.stage_add(file)
         else:
-            if file.exists():
-                logger.info(f'Delete file {file}')
-                file.atomic_remove()
-                if gitadd:
-                    gitadd.stage_add(file)
+            # no nav to order, the order of the previous generation is stale
+            remove_stale_file(file, gitadd)
 
     @cached_property
     def nav_index_data(self):

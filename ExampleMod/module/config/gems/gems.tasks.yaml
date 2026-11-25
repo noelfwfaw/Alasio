@@ -9,8 +9,7 @@ GemsFarming:
     Emotion1: GemsEmotionRecord
     EquipmentCode:
   displays:
-    - info: GemsFarming
-      groups: [ Scheduler, Campaign, GemsFarming ]
+    - [{ info: GemsFarming }, Scheduler, Campaign, GemsFarming]
     - StopCondition
     - [ Fleet1, Submarine ]
     - EquipmentCode

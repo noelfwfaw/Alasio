@@ -15,7 +15,7 @@ import os
 
 import pytest
 from module.base.base import ModuleBase
-from module.config.const import entry
+from module.config._index.mod_entry import MOD_ENTRY
 from module.map.assets import FLEET_1_CLEAR
 
 from alasio.ext.path import PathStr
@@ -50,7 +50,7 @@ class TestScreenshotEnvironment:
         file = PathStr.new(FLEET_1_CLEAR.file)
 
         assert file.is_abspath()
-        assert file.subpath_to(entry.root) is not None
+        assert file.subpath_to(MOD_ENTRY.root) is not None
         assert file.isfile()
 
 

@@ -49,10 +49,10 @@ EmulatorInfo:
       ]
     Name:
       value: ""
-      dt: textarea
+      dt: input
     Path:
       value: ""
-      dt: textarea
+      dt: input-line
 
 Error:
   args:
@@ -60,7 +60,6 @@ Error:
     SaveError: true
     OnePushConfig:
       dt: textarea
-      mode: yaml
       value: 'provider: null'
     ScreenshotLength: 1
 

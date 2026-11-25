@@ -4,40 +4,40 @@
     <meta charset="utf-8" />
     <link rel="icon" href="%sveltekit.assets%/favicon.png" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <!-- Content-Security-Policy. The inline scripts below are allowed
-         through sha256 hashes (no 'unsafe-inline'); the build-time
-         csp-inline-hash plugin rewrites the script-src hashes on every
-         dev/build so they always cover the current inline scripts
-         (including the sveltekit bootstrap script, which changes per
-         build). The hard-coded hash below only serves as a fallback
-         when the plugin does not run. frame-ancestors is NOT set here:
-         the meta tag ignores it, the backend response header carries the
-         full policy including frame-ancestors 'self' app://bundle so
-         the electron host can embed this page. -->
-    <meta
-      http-equiv="Content-Security-Policy"
-      content="default-src 'self'; script-src 'self' 'sha256-/c574zxOUzzzs52yM/ATmZ7eBGoJ3nHgHTc8O5t7jRw='; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' ws: wss:; font-src 'self' data:; object-src 'none'; base-uri 'self'; form-action 'self'; frame-src 'self'"
-    />
+    <!-- The Content-Security-Policy is owned by SvelteKit (`csp` in
+         kit.config.ts, hash mode): it writes the meta tag below with the hashes
+         of the inline scripts it renders itself, and kit.config.ts supplies the
+         hashes of the template script further down. The backend mirrors that
+         meta into the response header. Do not add a CSP meta here: a second
+         policy would be enforced on top of the generated one. The hashes are
+         checked against this file by `scripts/csp/verify.js` after every build. -->
     %sveltekit.head%
     <script>
       // Embedded sessions: the host (webapp) passes its display theme in the
-      // iframe URL (?theme=dark|light). Apply it before the first paint so
-      // the embedded app opens already themed. This is needed because
-      // mode-watcher's FOUC script is not present in this SPA build
-      // (ssr/prerender disabled), and even when present it only knows
-      // localStorage/system preference, which can differ from the host
-      // config on first run. Persist the value to mode-watcher's storage key
-      // (its default modeStorageKey) so ModeWatcher's onMount initialization
-      // keeps the same mode. Remote sessions without the theme param are
-      // unaffected (per-client behavior preserved).
+      // iframe URL (?theme=dark|light) together with the config value it
+      // resolves to (?themeConfig=system|light|dark). Apply the display value
+      // before the first paint so the embedded app opens already themed, and
+      // persist the config value to mode-watcher's storage key (its default
+      // modeStorageKey) so ModeWatcher's onMount initialization keeps the same
+      // mode. Persisting the resolved value instead would pin the page to one
+      // mode: a 'system' preference has to keep following the os.
+      //
+      // The display value is needed because mode-watcher's FOUC script is not
+      // present in this SPA build (ssr/prerender disabled), and even when
+      // present it only knows localStorage/system preference, which can differ
+      // from the host config on first run. Remote sessions without the theme
+      // param are unaffected (per-client behavior preserved).
       (() => {
         try {
-          const theme = new URLSearchParams(window.location.search).get("theme");
+          const params = new URLSearchParams(window.location.search);
+          const theme = params.get("theme");
           if (theme === "light" || theme === "dark") {
             const root = document.documentElement;
             root.classList.toggle("dark", theme === "dark");
             root.style.colorScheme = theme;
-            localStorage.setItem("mode-watcher-mode", theme);
+            const config = params.get("themeConfig");
+            const stored = config === "system" || config === "light" || config === "dark" ? config : theme;
+            localStorage.setItem("mode-watcher-mode", stored);
           }
         } catch {}
       })();

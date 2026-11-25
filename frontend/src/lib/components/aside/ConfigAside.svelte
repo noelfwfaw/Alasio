@@ -7,11 +7,16 @@
   import { cn } from "$lib/utils.js";
   import { useTopic } from "$lib/ws";
   import ConfigItem from "./ConfigItem.svelte";
-  import type { ConfigLike, ConfigTopicLike, WORKER_STATE } from "./types";
+  import type { ConfigLike, ConfigTopicLike, RestartTopicLike, WORKER_STATE } from "./types";
 
   // Subscribe to ConfigScan topic
   const topicClient = useTopic<ConfigTopicLike | undefined>("ConfigScan");
   const workerClient = useTopic<Record<string, WORKER_STATE> | undefined>("Worker");
+  // Restart topic: while the startup flow runs, the backend is applying its
+  // first full update and every config marks that update in its top right
+  // corner (see ConfigItem)
+  const restartClient = useTopic<RestartTopicLike>("Restart");
+  const restartFlow = $derived(restartClient.data?.flow);
 
   // props
   type $props = {
@@ -95,21 +100,21 @@
           {@const active = activeConfigName === item.name}
           {@const state = workerClient.data?.[item.name] ?? "idle"}
           <div role="listitem" class="px-1">
-            <ConfigItem config={item} {active} {state} {afspin} onclick={handleConfigClick} />
+            <ConfigItem config={item} {active} {state} flow={restartFlow} {afspin} onclick={handleConfigClick} />
           </div>
         {:else if group.items.length > 1}
           <!-- Multiple items in group - display with border -->
           <div
             role="group"
             aria-label="Configuration group {group.gid}"
-            class="border-foreground/20 relative rounded-lg border border-dashed p-1"
+            class="relative rounded-lg border border-dashed border-foreground/20 p-1"
           >
             {#each group.items as item (item.id)}
               <!-- Items in vertical layout -->
               {@const active = activeConfigName === item.name}
               {@const state = workerClient.data?.[item.name] ?? "idle"}
               <div role="listitem">
-                <ConfigItem config={item} {active} {state} {afspin} onclick={handleConfigClick} />
+                <ConfigItem config={item} {active} {state} flow={restartFlow} {afspin} onclick={handleConfigClick} />
               </div>
             {/each}
           </div>
@@ -120,11 +125,11 @@
 
   <!-- Settings button at the bottom -->
   <!-- Style needs to be the same as ConfigItem -->
-  <div class="border-border flex flex-col items-center border-t p-2">
+  <div class="flex flex-col items-center border-t border-border p-2">
     <button
       class={cn(
-        "hover:bg-accent relative flex w-16 cursor-pointer flex-col items-center rounded-md py-1.5 transition-colors",
-        isSettingsActive ? "text-primary" : "hover:text-primary text-foreground/85",
+        "relative flex w-16 cursor-pointer flex-col items-center rounded-md py-1.5 transition-colors hover:bg-accent",
+        isSettingsActive ? "text-primary" : "text-foreground/85 hover:text-primary",
       )}
       onclick={handleSettings}
       aria-label="Open configuration settings"
@@ -132,7 +137,7 @@
     >
       {#if isSettingsActive}
         <!-- Same indicator as ConfigItem: in the gutter left of the item box -->
-        <div class="bg-primary absolute top-2 bottom-2 -left-1 w-1 rounded-full"></div>
+        <div class="absolute top-2 bottom-2 -left-1 w-1 rounded-full bg-primary"></div>
       {/if}
       <div class="relative flex h-8 items-center justify-center">
         <Settings class="h-6 w-6" strokeWidth="1.5" aria-hidden="true" />

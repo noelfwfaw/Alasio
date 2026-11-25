@@ -54,6 +54,7 @@ from alasio.ext import env
 from alasio.ext.cache.resource import ResourceCacheTTL
 from alasio.ext.path import PathStr
 from alasio.ext.path.atomic import atomic_read_bytes
+from alasio.ext.path.calc import get_suffix
 from alasio.logger import logger
 
 # The frontend files and their manifest, as recorded in the wheel, relative to
@@ -66,18 +67,32 @@ MANIFEST_FILE = f'{DEPLOY_DATA}/frontend-manifest.pack'
 # The SPA entry of the frontend build, the page served for every route
 INDEX_HTML = 'index.html'
 
+# Content types that mimetypes does not answer the same way on every host:
+# ".js" is application/javascript up to python 3.11 and text/javascript from
+# python 3.12 on (RFC 9239), and on Windows mimetypes reads the registry, whose
+# Content Type of the extension is whatever the installed software wrote. The
+# type of these files is fixed so that a browser gets the same header, and a
+# module script the type it is required to have, on every host
+MEDIA_TYPES = {
+    '.js': 'text/javascript',
+    '.mjs': 'text/javascript',
+}
+
 # frame-ancestors can only be set through a response header (the meta tag
 # ignores it): it allows the electron host (app://bundle, production) and the
 # local loopback dev hosts (the vite dev server, any port) to embed the page.
 FRAME_ANCESTORS = "frame-ancestors 'self' app://bundle http://127.0.0.1:* http://localhost:*"
 
-# Fallback Content-Security-Policy for a page without a CSP meta (the served
-# page normally carries its own meta, kept in sync with the inline scripts by
-# the build-time csp-inline-hash plugin; the response header then mirrors that
-# meta so the browser enforces their intersection).
+# Fallback Content-Security-Policy for a page without a CSP meta. The build
+# writes the meta of the page with the hashes of its own inline scripts, and
+# the response header mirrors that meta, so this constant is only reached by a
+# page that lost its meta. It allows no inline script: a hash frozen here would
+# be stale for the next build (it cannot name the scripts of an arbitrary
+# page), and the build gates are what keep the meta in place. Such a page does
+# not boot, which is why the server reports it at warm-up.
 CSP = (
     "default-src 'self'; "
-    "script-src 'self' 'sha256-/c574zxOUzzzs52yM/ATmZ7eBGoJ3nHgHTc8O5t7jRw='; "
+    "script-src 'self'; "
     "style-src 'self' 'unsafe-inline'; "
     "img-src 'self' data: blob:; "
     "connect-src 'self' ws: wss:; "
@@ -372,9 +387,25 @@ class FrontendSite:
                 f'expected {record.size} bytes with sha1 {record.sha1.hex()}'
             )
 
-        media_type = guess_type(path)[0] or 'application/octet-stream'
+        # the map covers the extensions mimetypes answers differently on
+        # another host, see MEDIA_TYPES
+        media_type = MEDIA_TYPES.get(get_suffix(path))
+        if media_type is None:
+            media_type = guess_type(path)[0] or 'application/octet-stream'
         # only a page carries a CSP meta, non-html files need no policy
-        csp = _html_csp(content) if media_type == 'text/html' else ''
+        csp = ''
+        if media_type == 'text/html':
+            meta = _csp_meta(content.decode('utf-8', errors='replace'))
+            if not meta:
+                # The build always writes the meta: a page without one is a
+                # broken build, and the fallback policy allows no inline
+                # script, so the page cannot boot. Report it instead of
+                # serving a blank window silently.
+                logger.warning(
+                    f'Frontend page "{path}" carries no CSP meta, it is served with the '
+                    f'fallback policy and its inline scripts will not run'
+                )
+            csp = _csp_header(meta)
         compressed = gzip.compress(content, compresslevel=9)
         if len(compressed) < len(content):
             return FrontendBody(body=compressed, encoding='gzip',
@@ -642,33 +673,49 @@ def _frontend_records(manifest):
     return out
 
 
-def _html_csp(content):
+def _csp_meta(html):
     """
-    Content-Security-Policy of an html page.
+    Content of the CSP meta of a page.
 
-    The build-time csp-inline-hash plugin keeps the meta of the page in sync
-    with the inline scripts, so the meta is mirrored into the response header
-    and the browser enforces their intersection. The policy is extended with
-    frame-ancestors, which the meta tag ignores. A page without a meta falls
-    back to the constant policy.
+    The attribute order and the case are not fixed: SvelteKit writes
+    http-equiv before content, both in lower case, and the tag is not self
+    closing.
 
     Args:
-        content (bytes): Content of the html page
+        html (str): The page
+
+    Returns:
+        str: Content of the meta tag, '' when the page has none
+    """
+    match = re.search(
+        r'<meta[^>]*http-equiv="Content-Security-Policy"[^>]*content="([^"]*)"',
+        html,
+        re.IGNORECASE,
+    )
+    return match.group(1).strip() if match else ''
+
+
+def _csp_header(meta):
+    """
+    Content-Security-Policy header of a page from its meta.
+
+    The build writes the meta of the page with the hashes of its inline
+    scripts, so the meta is mirrored into the response header and the browser
+    enforces their intersection. The policy is extended with frame-ancestors,
+    which the meta tag ignores. A page without a meta falls back to the
+    constant policy.
+
+    Args:
+        meta (str): Content of the CSP meta of the page, '' when it has none
 
     Returns:
         str: CSP value of the response header
     """
-    match = re.search(
-        r'<meta[^>]*http-equiv="Content-Security-Policy"[^>]*content="([^"]*)"',
-        content.decode('utf-8', errors='replace'),
-        re.IGNORECASE,
-    )
-    csp = match.group(1).strip() if match else ''
-    if not csp:
+    if not meta:
         return CSP
-    if 'frame-ancestors' not in csp:
-        return f'{csp}; {FRAME_ANCESTORS}'
-    return csp
+    if 'frame-ancestors' not in meta:
+        return f'{meta}; {FRAME_ANCESTORS}'
+    return meta
 
 
 def _not_modified(response_headers, scope):

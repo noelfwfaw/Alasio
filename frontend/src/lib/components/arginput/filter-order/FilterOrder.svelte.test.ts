@@ -24,6 +24,7 @@ import Arg from "$lib/components/arg/Arg.svelte";
 import type { ArgData } from "$lib/components/arg/utils.svelte";
 import { t } from "$lib/i18n";
 import { flushEffects } from "$lib/test-utils/flush-effects";
+import { dragRegionState } from "$lib/window/dragRegion.svelte";
 
 // The "edits discarded" toast is the only svelte-sonner usage of these
 // components, keep the real toast library out of the jsdom tests.
@@ -115,6 +116,26 @@ function pills(target: HTMLElement): HTMLElement {
   return target.querySelector<HTMLElement>('[data-slot="filter-order-pills"]')!;
 }
 
+/**
+ * Which pills carry the given mark, in the order of the pill line. jsdom keeps
+ * the DOM order, so the flag of a pill is the flag of its index in the value.
+ */
+function pillMarks(target: HTMLElement, mark: string): boolean[] {
+  return [...pills(target).children].map((child) => child.querySelector(mark) !== null);
+}
+
+/** The rows of the selected column, in the order of the value */
+function selectedRows(): HTMLElement[] {
+  return [...column("selected").querySelectorAll<HTMLElement>('[data-slot="filter-order-item"]')];
+}
+
+/** The remove button of one specific row, the label alone is not unique */
+function deleteOf(row: HTMLElement, label: string): HTMLButtonElement {
+  const button = row.querySelector<HTMLButtonElement>(`[aria-label="${t.Input.FilterOrderRemove()} ${label}"]`);
+  expect(button, `no remove button for "${label}" in the row`).not.toBeNull();
+  return button!;
+}
+
 /** The hidden probe of the whole order, the measuring source of the cut */
 function probe(target: HTMLElement): HTMLElement {
   return target.querySelector<HTMLElement>('[data-slot="filter-order-probe"]')!;
@@ -169,6 +190,13 @@ function columnLabels(name: "selected" | "unused"): string[] {
   );
 }
 
+/** The group headers of the unused column, label and selected/total count. */
+function groupHeaders(): string[] {
+  return [...column("unused").querySelectorAll<HTMLElement>('[data-slot="filter-order-group"]')].map(
+    (el) => el.textContent?.replace(/\s+/g, " ").trim() ?? "",
+  );
+}
+
 /** The up / down / remove / add button of a row, found through its aria-label. */
 function rowButton(columnName: "selected" | "unused", action: string, item: string): HTMLButtonElement {
   const button = column(columnName).querySelector<HTMLButtonElement>(`[aria-label="${action} ${item}"]`);
@@ -200,6 +228,7 @@ afterEach(() => {
   }
   mounted = [];
   document.body.innerHTML = "";
+  dragRegionState.current = null;
   vi.unstubAllGlobals();
 });
 
@@ -372,6 +401,33 @@ describe("TestFilterOrderDialog", () => {
     rowButton("selected", t.Input.FilterOrderMoveUp(), "Submarine").click();
     await settle();
     expect(columnLabels("selected")).toEqual(["Fleet-2", "Submarine", "Fleet-1"]);
+  });
+
+  it("draws the up / down buttons as two filled triangles", async () => {
+    const { target } = await mountArg(makeArg());
+    await openDialog(target);
+
+    const up = rowButton("selected", t.Input.FilterOrderMoveUp(), "Fleet-2");
+    const down = rowButton("selected", t.Input.FilterOrderMoveDown(), "Fleet-2");
+
+    // The halves sit in one column, the waist is the only gap between them
+    expect(up.parentElement).toBe(down.parentElement);
+    expect(up.parentElement!.classList.contains("flex-col")).toBe(true);
+    for (const [half, tip] of [
+      [up, "M6 1 11 5H1z"],
+      [down, "M1 1h10L6 5z"],
+    ] as const) {
+      expect(half.classList.contains("h-2")).toBe(true);
+      expect(half.classList.contains("w-4")).toBe(true);
+      // The shape is filled with the current color, it is not an outline
+      const svg = half.querySelector("svg")!;
+      expect(svg.getAttribute("class")).toContain("h-1.5");
+      expect(svg.getAttribute("class")).toContain("w-3");
+      const path = svg.querySelector("path")!;
+      expect(path.getAttribute("d")).toBe(tip);
+      expect(path.getAttribute("fill")).toBe("currentColor");
+      expect(path.getAttribute("stroke")).toBe("none");
+    }
   });
 
   it("shows the empty states of both columns", async () => {
@@ -549,5 +605,388 @@ describe("TestFilterOrderMultiInstance", () => {
     expect(dataB.value).toEqual([]);
     expect(handleEditA).not.toHaveBeenCalled();
     expect(dataA.value).toEqual(["Fleet-1"]);
+  });
+});
+
+describe("TestFilterOrderPair", () => {
+  it("shows a pair in the stored form, the option after the level separator", async () => {
+    const { target } = await mountArg(makePairArg());
+
+    expect(pillText(target)).toEqual(["UrgentCube-1:30", "UrgentCube-3", "Major", "shortest"]);
+  });
+
+  it("edits no secondary option in a selected row", async () => {
+    // A pair is the entry itself: changing the option means adding another one
+    const { target } = await mountArg(makePairArg());
+    await openDialog(target);
+
+    expect(column("selected").querySelectorAll('[data-slot="select-trigger"]')).toHaveLength(0);
+  });
+
+  it("groups the unused pairs under their item and counts the unused ones", async () => {
+    const { target } = await mountArg(makePairArg({ value: ["UrgentCube-1:30", "ExtraCube-1:30"] }));
+    await openDialog(target);
+
+    // The count is what is left to pick, not what is already picked: the column
+    // lists the unused entries
+    expect(groupHeaders()).toEqual(["UrgentCube 2/3", "ExtraCube 1/2", `${t.Input.FilterOrderCommands()} 1/1`]);
+    // The selected pair is not offered again, the bare item comes before the
+    // optionCommand; a row of a group reads as the whole entry, the same as the row it
+    // becomes in the selected column
+    expect(columnLabels("unused")).toEqual(["UrgentCube-1:45", "UrgentCube-3", "ExtraCube-0:30", "Major", "shortest"]);
+  });
+
+  it("shows the translated name of both levels in an unused row", async () => {
+    // A row is the identity of the value: the drag has to look like the row it
+    // becomes, so both levels are translated and joined by the separator
+    const { target } = await mountArg(
+      makePairArg({
+        value: [],
+        option: ["RetrofitT1"],
+        option_dict: { RetrofitT1: ["dd", "cl"] },
+        option_command: [],
+        option_i18n: { RetrofitT1: "T1 retrofit blueprint", dd: "Destroyer", cl: "Light cruiser" },
+      }),
+    );
+    await openDialog(target);
+
+    expect(columnLabels("unused")).toEqual(["T1 retrofit blueprint-Destroyer", "T1 retrofit blueprint-Light cruiser"]);
+  });
+
+  it("falls back to the whole entry when a level has no translation", async () => {
+    // The demo of the dev page declares no option_i18n, so both levels resolve
+    // to themselves and the row still reads as the whole entry
+    const { target } = await mountArg(
+      makePairArg({
+        value: ["UrgentCube-1:30"],
+        option: ["UrgentCube"],
+        option_dict: { UrgentCube: ["1:30", "1:45"] },
+        option_command: [],
+        option_i18n: undefined,
+      }),
+    );
+    await openDialog(target);
+
+    expect(columnLabels("unused")).toEqual(["UrgentCube-1:45"]);
+  });
+
+  it("marks only the later occurrence of a repeated item on the settings page", async () => {
+    // The first occurrence is where the item belongs, so only the row that
+    // claims the position again is marked
+    const { target } = await mountArg(makeArg({ value: ["Fleet-1", "Fleet-2", "Fleet-1"] }));
+
+    const mark = `[aria-label="${t.Input.FilterOrderDuplicate()}"]`;
+    expect(pillMarks(target, mark)).toEqual([false, false, true]);
+  });
+
+  it("marks only the later occurrence of a repeated row in the editor and blocks saving", async () => {
+    const { target, arg } = await mountArg(makeArg({ value: ["Fleet-1", "Fleet-2", "Fleet-1"] }));
+    await openDialog(target);
+
+    expect(columnLabels("selected")).toEqual(["Fleet-1", "Fleet-2", "Fleet-1"]);
+    const mark = `[aria-label="${t.Input.FilterOrderDuplicate()}"]`;
+    const rows = selectedRows();
+    expect(rows.map((row) => row.querySelector(mark) !== null)).toEqual([false, false, true]);
+    expect(footerButton(t.Input.Save()).disabled).toBe(true);
+
+    // Delete the FIRST row on purpose: the later occurrence takes its place as
+    // the only one, so it becomes a legal row and the mark disappears
+    deleteOf(rows[0], "Fleet-1").click();
+    await settle();
+
+    expect(columnLabels("selected")).toEqual(["Fleet-2", "Fleet-1"]);
+    expect(column("selected").querySelector(mark)).toBeNull();
+    expect(footerButton(t.Input.Save()).disabled).toBe(false);
+
+    // The surviving row is the one that used to be the repeat, and it is saved
+    // as the only occurrence of the item
+    footerButton(t.Input.Save()).click();
+    await settle();
+    expect(arg.value).toEqual(["Fleet-2", "Fleet-1"]);
+  });
+
+  it("removes only the marked row, not the valid first occurrence", async () => {
+    const { target, arg, handleEdit } = await mountArg(makeArg({ value: ["Fleet-1", "Fleet-2", "Fleet-1"] }));
+    await openDialog(target);
+
+    // Delete the third row (the repeat), the first one has to stay
+    deleteOf(selectedRows()[2], "Fleet-1").click();
+    await settle();
+
+    expect(columnLabels("selected")).toEqual(["Fleet-1", "Fleet-2"]);
+    footerButton(t.Input.Save()).click();
+    await settle();
+    expect(arg.value).toEqual(["Fleet-1", "Fleet-2"]);
+    expect(handleEdit).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the header of a group whose pairs are all selected", async () => {
+    const { target } = await mountArg(makePairArg({ value: ["UrgentCube-1:30", "UrgentCube-1:45", "UrgentCube-3"] }));
+    await openDialog(target);
+
+    // The count reads 0/3 and the group offers no row any more, but the header
+    // stays so the item does not vanish from the column
+    expect(groupHeaders()).toEqual(["UrgentCube 0/3", "ExtraCube 2/2", `${t.Input.FilterOrderCommands()} 1/1`]);
+    expect(columnLabels("unused")).toEqual(["ExtraCube-0:30", "ExtraCube-1:30", "Major", "shortest"]);
+  });
+
+  it("keeps the header of a command group whose commands are all selected", async () => {
+    const { target } = await mountArg(makePairArg({ value: ["shortest"] }));
+    await openDialog(target);
+
+    expect(groupHeaders()).toEqual(["UrgentCube 3/3", "ExtraCube 2/2", `${t.Input.FilterOrderCommands()} 0/1`]);
+    expect(columnLabels("unused")).toEqual([
+      "UrgentCube-1:30",
+      "UrgentCube-1:45",
+      "UrgentCube-3",
+      "ExtraCube-0:30",
+      "ExtraCube-1:30",
+      "Major",
+    ]);
+  });
+
+  it("adds a pair of a group at the end of the order", async () => {
+    const { target, arg } = await mountArg(makePairArg({ value: [] }));
+    await openDialog(target);
+
+    rowButton("unused", t.Input.FilterOrderAdd(), "UrgentCube-1:45").click();
+    await settle();
+    footerButton(t.Input.Save()).click();
+    await settle();
+
+    expect(arg.value).toEqual(["UrgentCube-1:45"]);
+  });
+
+  it("adds a command as it is", async () => {
+    const { target, arg } = await mountArg(makePairArg({ value: [] }));
+    await openDialog(target);
+
+    rowButton("unused", t.Input.FilterOrderAdd(), "shortest").click();
+    await settle();
+    footerButton(t.Input.Save()).click();
+    await settle();
+
+    expect(arg.value).toEqual(["shortest"]);
+  });
+
+  it("keeps an unknown pair and blocks saving", async () => {
+    const { target } = await mountArg(makePairArg({ value: ["UrgentCube-9:00"] }));
+    await openDialog(target);
+
+    expect(columnLabels("selected")).toEqual(["UrgentCube-9:00"]);
+    expect(footerButton(t.Input.Save()).disabled).toBe(true);
+  });
+
+  it("accepts the optionCommand of the arg as legal items", async () => {
+    const { target } = await mountArg(makePairArg({ value: ["shortest"] }));
+    await openDialog(target);
+
+    // A command is a legal entry, only the unknown pair blocks saving
+    expect(footerButton(t.Input.Save()).disabled).toBe(false);
+  });
+
+  it("marks an entry outside the definition in both views", async () => {
+    // "shortest" is not declared as a command of this arg, so it is not an item of
+    // the value at all: the pill line and the editor have to agree on it
+    const { target } = await mountArg(makePairArg({ value: ["UrgentCube-1:30", "shortest"], option_command: [] }));
+
+    expect(pills(target).querySelector(`[aria-label="${t.Input.FilterOrderInvalid()}"]`)).not.toBeNull();
+
+    await openDialog(target);
+    expect(columnLabels("selected")).toEqual(["UrgentCube-1:30", "shortest"]);
+    expect(column("selected").querySelector(`[aria-label="${t.Input.FilterOrderInvalid()}"]`)).not.toBeNull();
+    expect(footerButton(t.Input.Save()).disabled).toBe(true);
+  });
+
+  it("marks no command on the settings page", async () => {
+    // The pill line and the dialog must agree on what is legal, otherwise a
+    // stored token looks broken before the editor is opened
+    const { target } = await mountArg(makePairArg({ value: ["shortest"] }));
+
+    expect(pillText(target)).toEqual(["shortest"]);
+    expect(pills(target).querySelector(`[aria-label="${t.Input.FilterOrderInvalid()}"]`)).toBeNull();
+  });
+
+  it("still marks an unknown pair on the settings page", async () => {
+    const { target } = await mountArg(makePairArg({ value: ["UrgentCube-9:00"] }));
+
+    expect(pills(target).querySelector(`[aria-label="${t.Input.FilterOrderInvalid()}"]`)).not.toBeNull();
+  });
+});
+
+/** The arg of dt="filter-order-item", as the backend sends it */
+function makeSecondaryArg(overrides: Partial<ArgData> = {}): ArgData {
+  return makeArg({
+    dt: "filter-order-item",
+    value: ["PlateT4-gun", "Chip"],
+    option: ["PlateT4", "BookT3", "Chip"],
+    option_dict: { PlateT4: ["gun", "general"], BookT3: ["red", "blue"] },
+    ...overrides,
+  });
+}
+
+/** The arg of dt="filter-order-pair", as the backend sends it */
+function makePairArg(overrides: Partial<ArgData> = {}): ArgData {
+  return makeArg({
+    dt: "filter-order-pair",
+    value: ["UrgentCube-1:30", "UrgentCube-3", "Major", "shortest"],
+    option: ["UrgentCube", "ExtraCube", "Major"],
+    option_dict: { UrgentCube: ["1:30", "1:45", "3"], ExtraCube: ["0:30", "1:30"] },
+    option_command: ["shortest"],
+    ...overrides,
+  });
+}
+
+/** The pill labels, the gap between a primary item and its option collapsed */
+function pillText(target: HTMLElement): string[] {
+  return pillLabels(target).map((label) => label.replace(/\s+/g, " ").trim());
+}
+/** Open the secondary select of the selected column (the first row that has one) */
+async function openSecondarySelect() {
+  const trigger = column("selected").querySelector<HTMLElement>('[data-slot="select-trigger"]');
+  expect(trigger).not.toBeNull();
+  trigger!.click();
+  await settle();
+}
+
+/** Pick an option of the opened select popup */
+function selectOption(label: string) {
+  const item = [...document.querySelectorAll<HTMLElement>('[data-slot="select-item"]')].find(
+    (el) => el.textContent?.trim() === label,
+  );
+  expect(item, `no option "${label}" in the popup`).toBeDefined();
+  // bits-ui commits an item on pointerup, a click alone does not select it
+  item!.dispatchEvent(new Event("pointerdown", { bubbles: true, cancelable: true }));
+  item!.dispatchEvent(new Event("pointerup", { bubbles: true }));
+}
+
+describe("TestFilterOrderSecondary", () => {
+  it("shows the item in the stored form, the option after the level separator", async () => {
+    const { target } = await mountArg(makeSecondaryArg());
+
+    expect(pillText(target)).toEqual(["PlateT4-gun", "Chip"]);
+  });
+
+  it("edits the secondary option in place and saves it", async () => {
+    const { target, arg, handleEdit } = await mountArg(makeSecondaryArg());
+    await openDialog(target);
+    expect(columnLabels("selected")).toEqual(["PlateT4", "Chip"]);
+    expect(columnLabels("unused")).toEqual(["BookT3"]);
+
+    await openSecondarySelect();
+    selectOption("general");
+    await settle();
+
+    footerButton(t.Input.Save()).click();
+    await settle();
+
+    expect(arg.value).toEqual(["PlateT4-general", "Chip"]);
+    expect(handleEdit).toHaveBeenCalledTimes(1);
+  });
+
+  it("adds an unused primary with its first secondary option", async () => {
+    const { target, arg } = await mountArg(makeSecondaryArg({ value: ["Chip"] }));
+    await openDialog(target);
+    expect(columnLabels("unused")).toEqual(["PlateT4", "BookT3"]);
+
+    rowButton("unused", t.Input.FilterOrderAdd(), "BookT3").click();
+    await settle();
+    footerButton(t.Input.Save()).click();
+    await settle();
+
+    expect(arg.value).toEqual(["Chip", "BookT3-red"]);
+  });
+
+  it("disables saving a primary that must carry a secondary option", async () => {
+    // A value written before the secondary options were declared: the backend
+    // drops such an item on load, the demo shows the editor handling it
+    const { target } = await mountArg(makeSecondaryArg({ value: ["PlateT4", "Chip"] }));
+    await openDialog(target);
+
+    expect(footerButton(t.Input.Save()).disabled).toBe(true);
+  });
+
+  it("marks an item that is no legal item, in its stored form", async () => {
+    const { target } = await mountArg(makeSecondaryArg({ value: ["Gone-gun", "Chip"] }));
+
+    expect(pillText(target)).toEqual(["Gone-gun", "Chip"]);
+    expect(pills(target).querySelector(`[aria-label="${t.Input.FilterOrderInvalid()}"]`)).not.toBeNull();
+  });
+
+  it("marks a secondary option that is not declared and blocks saving", async () => {
+    // BookT2 declares red / blue / yellow, gold was removed from the yaml
+    const { target } = await mountArg(
+      makeSecondaryArg({
+        value: ["PlateT4-gun", "BookT2-gold"],
+        option: ["PlateT4", "BookT2", "Chip"],
+        option_dict: { PlateT4: ["gun", "general"], BookT2: ["red", "blue"] },
+      }),
+    );
+    await openDialog(target);
+
+    expect(columnLabels("selected")).toEqual(["PlateT4", "BookT2"]);
+    expect(footerButton(t.Input.Save()).disabled).toBe(true);
+  });
+
+  it("gives the secondary selector 2/5 of the name + option box", async () => {
+    // The share is of the box that holds the name and the option, not of the
+    // whole row: the index, the grip and the order buttons are outside it, so
+    // a short option like "cl" does not shrink its row
+    const { target } = await mountArg(
+      makeSecondaryArg({
+        value: ["PlateT4-gun", "Short-cl"],
+        option: ["PlateT4", "Short"],
+        option_dict: { PlateT4: ["gun", "general"], Short: ["cl", "dd"] },
+      }),
+    );
+    await openDialog(target);
+
+    const triggers = column("selected").querySelectorAll<HTMLElement>('[data-slot="select-trigger"]');
+    expect(triggers).toHaveLength(2);
+    for (const trigger of triggers) {
+      expect(trigger.classList.contains("w-2/5")).toBe(true);
+      // the trigger and the label of the row share the same box
+      const box = trigger.parentElement!;
+      expect(box.querySelector('[data-slot="filter-order-label"]')).not.toBeNull();
+    }
+    expect(triggers[1].textContent?.trim()).toBe("cl");
+  });
+
+  it("shows a long primary item and a long secondary option in full", async () => {
+    // jsdom lays nothing out, so the truncation is CSS only here: the label of
+    // the item keeps both long parts, the pill is capped to the line width
+    const { target } = await mountArg(
+      makeSecondaryArg({
+        value: ["GearDesignPlanT3-OrdnanceTestingReportT3"],
+        option: ["GearDesignPlanT3"],
+        option_dict: { GearDesignPlanT3: ["OrdnanceTestingReportT3", "DevelopmentMaterialT3"] },
+      }),
+    );
+
+    expect(pillText(target)).toEqual(["GearDesignPlanT3-OrdnanceTestingReportT3"]);
+  });
+
+  it("centres the dialog below the drag band of the desktop client", async () => {
+    // The band swallows clicks on the window top, so the dialog is centred in
+    // the area below it instead of in the whole viewport
+    dragRegionState.current = { height: 48, left: 0, right: 0 };
+    const { target } = await mountArg(makeArg());
+    await openDialog(target);
+
+    const style = dialog()!.getAttribute("style");
+    // jsdom serializes the calc expression simplified
+    expect(style).toContain("calc(50% + 24px)");
+    expect(style).toContain("calc(100% - 80px)");
+  });
+
+  it("centres the dialog in the viewport without a band", async () => {
+    // A plain browser has no host and therefore no band
+    dragRegionState.current = null;
+    const { target } = await mountArg(makeArg());
+    await openDialog(target);
+
+    const style = dialog()!.getAttribute("style");
+    expect(style).toContain("calc(50% + 0px)");
+    expect(style).toContain("calc(100% - 32px)");
   });
 });

@@ -1,5 +1,6 @@
 import os
 import random
+import stat
 import string
 import time
 
@@ -95,69 +96,127 @@ def windows_attempt_delay(attempt):
     return delay
 
 
-def replace_tmp(tmp, file):
+def atomic_replace_tmp(tmp, file):
     """
-    Replace temp file to file
+    Replace temp file to file, with retry on Windows
+
+    A failed replace removes the tmp file: it was written for this target only,
+    so a failed write leaves no tmp file behind.
 
     Args:
         tmp (str): Temporary file path
         file (str): Target file path
 
+    Returns:
+        bool: True when an entry in the way had to be removed
+
     Raises:
         PermissionError: (Windows only) If another process is still reading the file and all retries failed
         FileNotFoundError: If tmp file gets deleted unexpectedly
     """
-    if IS_WINDOWS:
-        # PermissionError on Windows if another process is reading
-        last_error = None
-        for attempt in range(WINDOWS_MAX_ATTEMPT):
-            try:
-                # Atomic operation
-                os.replace(tmp, file)
-                # success
-                return
-            except PermissionError as e:
-                last_error = e
-                delay = windows_attempt_delay(attempt)
-                time.sleep(delay)
-                continue
-            except FileNotFoundError:
-                # tmp file gets deleted unexpectedly
-                raise
-            except Exception as e:
-                last_error = e
-                break
-    else:
-        # Linux and Mac allow existing reading
-        try:
-            # Atomic operation
-            os.replace(tmp, file)
-            # success
-            return
-        except FileNotFoundError:
-            raise
-        except Exception as e:
-            last_error = e
-
-    # Clean up tmp file on failure
     try:
-        os.unlink(tmp)
+        return atomic_replace(tmp, file)
     except FileNotFoundError:
-        # tmp file already get deleted
-        pass
-    except Exception:
-        pass
-    if last_error is not None:
-        raise last_error from None
+        # tmp file gets deleted unexpectedly
+        raise
+    except BaseException:
+        _remove_tmp_on_failure(tmp)
+        raise
 
 
-def atomic_replace(path_from, path_to):
+def is_folder(file):
+    """
+    Check whether a path is a folder, following a symbolic link.
+
+    Args:
+        file (str): Path to check
+
+    Returns:
+        bool: True for a folder, and for a link to a folder. False for a file,
+            a link to a file and a missing path
+    """
+    try:
+        return stat.S_ISDIR(os.stat(file).st_mode)
+    except OSError:
+        # missing, a parent that is not a folder, a path that cannot be read
+        return False
+
+
+def file_replace(path_from, path_to):
     """
     Replace file or directory
+
+    os.replace() refuses some kind changes, and what it does is not the same on
+    every platform: a folder is never replaced by a file (EISDIR on POSIX,
+    PermissionError on Windows), and a file is replaced by a folder on Windows
+    while POSIX refuses it (ENOTDIR). The entry in the way is removed here
+    first, so every platform ends with the same result:
+
+    - a folder at the target while the source is not a folder: the folder is
+      removed with its content;
+    - a file at the target while the source is a folder: the file is removed;
+    - the same kind on both sides: os.replace() keeps its own rule (a folder
+      replaces an empty folder).
+
+    The removal is what makes a kind change possible, so it is not atomic: an
+    interrupted run leaves the target missing instead of half replaced. The
+    removal is the bare folder_rmtree(), not atomic_rmtree(): the folder is
+    renamed to a tmp name by that one to survive an interruption, and it does
+    so with atomic_replace(), which comes back here. A file_* function never
+    calls an atomic_* one, so the two can not call each other.
 
     Args:
         path_from (str): Source file/directory path
         path_to (str): Target file/directory path
+
+    Returns:
+        bool: True when an entry in the way had to be removed
+
+    Raises:
+        FileNotFoundError: If the source does not exist
+        PermissionError: If the target is a file another process is still
+            using (the caller retries, see atomic_replace)
+        OSError: If the source cannot be moved, the folder in the way included
+    """
+    try:
+        os.replace(path_from, path_to)
+        return False
+    except FileNotFoundError:
+        raise
+    except OSError as e:
+        failure = e
+    # the kinds of the two paths decide whether the entry in the way is the
+    # reason of the failure, or whether it is a lock on a file of the same
+    # kind that a retry may outlast
+    target_folder = is_folder(path_to)
+    if target_folder == is_folder(path_from):
+        raise failure
+    if target_folder:
+        # a folder that still holds an entry cannot be removed, the move below
+        # then reports the failure with the paths of this call
+        folder_rmtree(path_to)
+    else:
+        file_remove(path_to)
+    os.replace(path_from, path_to)
+    return True
+
+
+def atomic_replace(path_from, path_to):
+    """
+    Replace file or directory, with retry on Windows
+
+    The retry handles a target file another process is still reading: Windows
+    refuses the move with PermissionError until the reader lets go. A kind
+    change does not wait, it is decided on the first attempt (see
+    file_replace): a folder at the target is removed at once instead of being
+    retried as if it were a lock.
+
+    Args:
+        path_from (str): Source file/directory path
+        path_to (str): Target file/directory path
+
+    Returns:
+        bool: True when an entry in the way had to be removed
 
     Raises:
         PermissionError: (Windows only) If another process is still reading the file and all retries failed
@@ -168,10 +227,7 @@ def atomic_replace(path_from, path_to):
         last_error = None
         for attempt in range(WINDOWS_MAX_ATTEMPT):
             try:
-                # Atomic operation
-                os.replace(path_from, path_to)
-                # success
-                return
+                return file_replace(path_from, path_to)
             except PermissionError as e:
                 last_error = e
                 delay = windows_attempt_delay(attempt)
@@ -179,14 +235,11 @@ def atomic_replace(path_from, path_to):
                 continue
             except FileNotFoundError:
                 raise
-            except Exception as e:
-                last_error = e
-                break
         if last_error is not None:
             raise last_error from None
     else:
         # Linux and Mac
-        os.replace(path_from, path_to)
+        return file_replace(path_from, path_to)
 
 
 def atomic_rename(path_from, path_to):
@@ -228,6 +281,72 @@ def atomic_rename(path_from, path_to):
         os.rename(path_from, path_to)
 
 
+def _is_write_mode(mode):
+    """
+    Check if an open() mode writes to the file, so the file can be created
+
+    Args:
+        mode (str): Open mode, e.g. 'w', 'a+', 'rb'
+
+    Returns:
+        bool: True if the mode is a write mode
+    """
+    return any(char in mode for char in 'wax')
+
+
+def file_open(file, mode='r', encoding=None, makedir_on_write=True, **kwargs):
+    """
+    Open a file, create the parent directory on write mode if it is missing
+
+    Read modes never create anything, a missing file raises FileNotFoundError
+    like open(). Write modes create the parent directory when the first open()
+    fails, so the caller does not have to prepare the directory.
+
+    Args:
+        file (str): Target file path
+        mode (str): File open mode. Defaults to 'r'.
+        encoding (str): Text encoding. Defaults to None.
+        makedir_on_write (bool): True to create the missing parent directory
+            on write mode. False to behave exactly like open(). Defaults to True.
+        **kwargs: Additional arguments passed to open()
+
+    Returns:
+        file object: Opened file handle
+    """
+    try:
+        return open(file, mode=mode, encoding=encoding, **kwargs)
+    except FileNotFoundError:
+        # Read modes behave like open(), the missing path is the caller's problem
+        if not makedir_on_write or not _is_write_mode(mode):
+            raise
+    # Only a missing parent directory makes a write mode fail on the first open
+    directory = os.path.dirname(file)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    return open(file, mode=mode, encoding=encoding, **kwargs)
+
+
+def stream_open_args(first_chunk):
+    """
+    Detect the open() arguments of a stream from its first chunk
+
+    Args:
+        first_chunk (str | bytes | bytearray | memoryview | Any):
+            First chunk of the stream, b'' for an empty stream
+
+    Returns:
+        tuple[str, str | None, str | None]: mode, encoding and newline, to be
+            passed to open(), encoding and newline are None in binary mode
+    """
+    if isinstance(first_chunk, str):
+        return 'w', 'utf-8', ''
+    elif isinstance(first_chunk, (bytes, bytearray, memoryview)):
+        return 'wb', None, None
+    else:
+        # Default to text mode for other types
+        return 'w', 'utf-8', ''
+
+
 def file_write(file, data):
     """
     Write data into file, auto create directory
@@ -262,22 +381,8 @@ def file_write(file, data):
             encoding = 'utf-8'
             newline = ''
 
-    try:
-        # Write temp file
-        with open(file, mode=mode, encoding=encoding, newline=newline) as f:
-            f.write(data)
-            # Ensure data flush to disk
-            f.flush()
-            os.fsync(f.fileno())
-        return
-    except FileNotFoundError:
-        pass
-    # Create parent directory
-    directory = os.path.dirname(file)
-    if directory:
-        os.makedirs(directory, exist_ok=True)
-    # Write again
-    with open(file, mode=mode, encoding=encoding, newline=newline) as f:
+    # Parent directory is created when it is missing
+    with file_open(file, mode=mode, encoding=encoding, newline=newline) as f:
         f.write(data)
         # Ensure data flush to disk
         f.flush()
@@ -307,100 +412,12 @@ def file_write_stream(file, data_generator):
         first_chunk = b''
 
     # Determine mode, encoding and newline from first chunk
-    if isinstance(first_chunk, str):
-        mode = 'w'
-        encoding = 'utf-8'
-        newline = ''
-    elif isinstance(first_chunk, (bytes, bytearray, memoryview)):
-        mode = 'wb'
-        encoding = None
-        newline = None
-    else:
-        # Default to text mode for other types
-        mode = 'w'
-        encoding = 'utf-8'
-        newline = ''
+    mode, encoding, newline = stream_open_args(first_chunk)
 
-    try:
-        # Write temp file
-        with open(file, mode=mode, encoding=encoding, newline=newline) as f:
-            f.write(first_chunk)
-            for chunk in data_iter:
-                f.write(chunk)
-            # Ensure data flush to disk
-            f.flush()
-            os.fsync(f.fileno())
-        return
-    except FileNotFoundError:
-        pass
-    # Create parent directory
-    directory = os.path.dirname(file)
-    if directory:
-        os.makedirs(directory, exist_ok=True)
-    # Write again
-    with open(file, mode=mode, encoding=encoding, newline=newline) as f:
+    # Parent directory is created when it is missing
+    with file_open(file, mode=mode, encoding=encoding, newline=newline) as f:
         f.write(first_chunk)
         for chunk in data_iter:
-            f.write(chunk)
-        # Ensure data flush to disk
-        f.flush()
-        os.fsync(f.fileno())
-
-
-async def afile_write_stream(file, data_iter):
-    """
-    Creates the file even if the generator yields no data chunk,
-    an empty generator writes an empty file, replacing the content of the target.
-    Auto determines write mode based on the type of first chunk.
-
-    Args:
-        file (str): Target file path
-        data_iter (Iterable): An iterable that yields data chunks (str or bytes)
-    """
-    # Try to get the first chunk
-    try:
-        first_chunk = await data_iter.__anext__()
-    except StopAsyncIteration:
-        # Generator is empty, an empty file is still written:
-        # no chunk to tell text from bytes, and an empty file has no content
-        # to encode, so an empty bytes chunk goes through the binary mode
-        first_chunk = b''
-
-    # Determine mode, encoding and newline from first chunk
-    if isinstance(first_chunk, str):
-        mode = 'w'
-        encoding = 'utf-8'
-        newline = ''
-    elif isinstance(first_chunk, bytes):
-        mode = 'wb'
-        encoding = None
-        newline = None
-    else:
-        # Default to text mode for other types
-        mode = 'w'
-        encoding = 'utf-8'
-        newline = ''
-
-    try:
-        # Write temp file
-        with open(file, mode=mode, encoding=encoding, newline=newline) as f:
-            f.write(first_chunk)
-            async for chunk in data_iter:
-                f.write(chunk)
-            # Ensure data flush to disk
-            f.flush()
-            os.fsync(f.fileno())
-        return
-    except FileNotFoundError:
-        pass
-    # Create parent directory
-    directory = os.path.dirname(file)
-    if directory:
-        os.makedirs(directory, exist_ok=True)
-    # Write again
-    with open(file, mode=mode, encoding=encoding, newline=newline) as f:
-        f.write(first_chunk)
-        async for chunk in data_iter:
             f.write(chunk)
         # Ensure data flush to disk
         f.flush()
@@ -442,7 +459,7 @@ def atomic_write(file, data):
     except BaseException:
         _remove_tmp_on_failure(tmp)
         raise
-    replace_tmp(tmp, file)
+    atomic_replace_tmp(tmp, file)
 
 
 def atomic_write_stream(file, data_generator, mode=None):
@@ -469,7 +486,7 @@ def atomic_write_stream(file, data_generator, mode=None):
     except BaseException:
         _remove_tmp_on_failure(tmp)
         raise
-    replace_tmp(tmp, file)
+    atomic_replace_tmp(tmp, file)
 
 
 def file_read_text(file, encoding='utf-8', errors='strict'):
@@ -720,18 +737,21 @@ def atomic_read_bytes_into(file, buffer):
         return
 
 
-def atomic_open(file, mode='r', encoding=None, **kwargs):
+def atomic_open(file, mode='r', encoding=None, makedir_on_write=True, **kwargs):
     """
     Open a file atomically with retry on PermissionError (Windows only).
 
     Unlike atomic_write, this returns an open file handle rather than
     writing data atomically. The PermissionError retry handles cases
     where the file is temporarily locked by another process.
+    file_open() creates the missing parent directory on write mode.
 
     Args:
         file (str): Target file path
         mode (str): File open mode. Defaults to 'r'.
         encoding (str): Text encoding. Defaults to None.
+        makedir_on_write (bool): True to create the missing parent directory
+            on write mode. False to behave exactly like open(). Defaults to True.
         **kwargs: Additional arguments passed to open()
 
     Returns:
@@ -751,7 +771,9 @@ def atomic_open(file, mode='r', encoding=None, **kwargs):
         last_error = None
         for attempt in range(WINDOWS_MAX_ATTEMPT):
             try:
-                return open(file, mode=mode, encoding=encoding, **kwargs)
+                return file_open(
+                    file, mode=mode, encoding=encoding, makedir_on_write=makedir_on_write, **kwargs
+                )
             except PermissionError as e:
                 last_error = e
                 delay = windows_attempt_delay(attempt)
@@ -760,7 +782,7 @@ def atomic_open(file, mode='r', encoding=None, **kwargs):
         if last_error is not None:
             raise last_error from None
     else:
-        return open(file, mode=mode, encoding=encoding, **kwargs)
+        return file_open(file, mode=mode, encoding=encoding, makedir_on_write=makedir_on_write, **kwargs)
 
 
 def _copy_iter(source, buffer, chunk_size):
@@ -800,24 +822,52 @@ def atomic_copy(source, target, chunk_size=CHUNK_SIZE):
     Atomic file write with minimal IO operation and memory usage
     A failed copy leaves the target untouched and no tmp file behind.
 
+    The tmp file lives next to the target, not next to the source: the write
+    creates the missing folder of the target, and os.replace() stays inside
+    the folder of the target, which is the same filesystem by definition.
+    A tmp file next to the source may be on another device, where os.replace()
+    is not atomic and fails with OSError(EXDEV).
+
     Args:
         source (str):
         target (str):
         chunk_size (int):
     """
-    tmp = to_tmp_file(source)
+    tmp = to_tmp_file(target)
     try:
         file_copy(source, tmp, chunk_size=chunk_size)
     except BaseException:
         _remove_tmp_on_failure(tmp)
         raise
-    replace_tmp(tmp, target)
+    atomic_replace_tmp(tmp, target)
+
+
+def _makedir_of(file):
+    """
+    Create the parent folders of a file, the root of the path excluded.
+
+    Args:
+        file (str): Path of the file
+
+    Returns:
+        bool: True when the folders were created, False when the path has no
+            parent to create
+    """
+    directory = os.path.dirname(file)
+    if not directory:
+        return False
+    os.makedirs(directory, exist_ok=True)
+    return True
 
 
 def file_ensure_exist(file, mode=0o666, default=b''):
     """
     Ensure a file exists with minimal I/O operations using os.open.
     Uses O_EXCL flag to atomically check and create in one operation.
+
+    A missing parent folder is created on the failure of the first attempt, so
+    the common case (the file exists, or its folder does) costs one os.open
+    and nothing else.
 
     Args:
         file (str):
@@ -827,22 +877,34 @@ def file_ensure_exist(file, mode=0o666, default=b''):
     Returns:
         bool: True if file just created
     """
+    # O_CREAT | O_EXCL | O_WRONLY ensures atomic "create if not exists" operation
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
     try:
-        # Try to create file with O_EXCL flag - will fail if file exists
-        # O_CREAT | O_EXCL | O_WRONLY ensures atomic "create if not exists" operation
-        fd = os.open(file, os.O_CREAT | os.O_EXCL | os.O_WRONLY, mode)
-
-        # If we get here, the file was created successfully
-        if default:
-            os.write(fd, default)
-        os.close(fd)
-        return True
+        fd = os.open(file, flags, mode)
     except FileExistsError:
         # File already exists
         return False
+    except FileNotFoundError:
+        # The parent folder is missing, the only reason a create reports this
+        try:
+            if not _makedir_of(file):
+                return False
+            fd = os.open(file, flags, mode)
+        except FileExistsError:
+            # Another process created the file in between
+            return False
+        except OSError:
+            return False
     except OSError:
         # Other errors
         return False
+    # If we get here, the file was created successfully
+    try:
+        if default:
+            os.write(fd, default)
+    finally:
+        os.close(fd)
+    return True
 
 
 def file_touch(file, mode=0o666, exist_ok=True):
@@ -850,6 +912,9 @@ def file_touch(file, mode=0o666, exist_ok=True):
     Touch a file, copied from pathlib
     - If file not exist, create file
     - If file exist, set modify time to now
+
+    A missing parent folder is created, so the caller does not have to prepare
+    the tree of a file it only touches.
 
     Args:
         file (str):
@@ -870,7 +935,13 @@ def file_touch(file, mode=0o666, exist_ok=True):
     flags = os.O_CREAT | os.O_WRONLY
     if not exist_ok:
         flags |= os.O_EXCL
-    fd = os.open(file, flags, mode)
+    try:
+        fd = os.open(file, flags, mode)
+    except FileNotFoundError:
+        # The parent folder is missing, the only reason a create reports this
+        if not _makedir_of(file):
+            raise
+        fd = os.open(file, flags, mode)
     os.close(fd)
 
 
@@ -896,6 +967,10 @@ def atomic_remove(file):
     """
     Atomic file remove
 
+    A folder is never removed: the unlink of one is refused on every platform
+    and no wait makes it removable, so the error is raised on the first
+    attempt instead of being retried as if a lock held it.
+
     Args:
         file (str): File path to remove
 
@@ -910,6 +985,25 @@ def atomic_remove(file):
                 return file_remove(file)
             except PermissionError as e:
                 last_error = e
+                # Windows reports the same error for the unlink of a folder, of
+                # a file another process holds open, and of a file without the
+                # write attribute, so the error alone does not separate a wait
+                # from a hopeless call. One os.lstat() on the failure path
+                # answers it, the success path pays nothing.
+                try:
+                    st = os.lstat(file)
+                except (FileNotFoundError, NotADirectoryError):
+                    # another process removed the entry, or a parent of it
+                    # became a file: no file is left to remove
+                    return False
+                except OSError:
+                    # the kind of the path cannot be read (a parent without the
+                    # search permission, a link loop, a path too long): no wait
+                    # changes that
+                    st = None
+                if st is None or stat.S_ISDIR(st.st_mode):
+                    # unlink() never removes a folder, whatever the wait
+                    raise
                 delay = windows_attempt_delay(attempt)
                 time.sleep(delay)
                 continue

@@ -24,6 +24,10 @@ from alasio.git.repo import GitRepo
 from alasio.logger import logger
 from alasio.testing.filesystem import fs  # noqa: F401
 
+pytestmark = [
+    pytest.mark.parallel,
+]
+
 REMOTE = 'https://github.com/Author/Repo'
 
 CONFIG = PackRepoModel(
@@ -457,7 +461,8 @@ class TestConfigAndFolder:
     def test_run_dir_is_a_mod(self, fs, run_dir, monkeypatch):
         """The class refuses to run in a mod, like the config reader and the generator."""
         fake = patch_git(monkeypatch, fs)
-        fs.create_file(join_path(run_dir, 'module', 'main.py'), contents='')
+        fs.create_file(
+            join_path(run_dir, 'module', 'config', '_index', 'mod_entry.yaml'), contents='name: m\n')
         # check_run_dir runs once per process (init_once), the bare check runs
         # the gate for the run directory of this test
         monkeypatch.setattr(pack_repo, 'check_run_dir', check_run_dir.__wrapped__)
@@ -476,6 +481,8 @@ class TestClone:
         with logger.mock_capture_writer() as capture:
             repo = PackRepo(CONFIG).run()
         assert capture.concat() == f"""\
+--------------------------------------------- GIT REPO ---------------------------------------------
+INFO | GIT REPO
 INFO | Cloning repo: remote="{REMOTE}", branch="master", folder="{folder}"
 INFO | Git command: git clone --no-checkout --origin origin --branch master {REMOTE} {folder}
 INFO | Git command: git -C {folder} rev-parse --verify --quiet refs/remotes/origin/master
@@ -565,6 +572,8 @@ class TestUpdate:
         with logger.mock_capture_writer() as capture:
             PackRepo(CONFIG).run()
         assert capture.concat() == f"""\
+--------------------------------------------- GIT REPO ---------------------------------------------
+INFO | GIT REPO
 INFO | Updating repo: remote="{REMOTE}", folder="{folder}"
 INFO | Git command: git -C {folder} remote set-url origin {REMOTE}
 INFO | Git command: git -C {folder} fetch --prune origin +refs/heads/*:refs/remotes/origin/* +refs/tags/*:refs/tags/*
@@ -619,6 +628,8 @@ INFO | Git command: git -C {folder} update-ref refs/heads/master refs/remotes/or
         with logger.mock_capture_writer() as capture:
             PackRepo(config).run()
         assert capture.concat() == f"""\
+--------------------------------------------- GIT REPO ---------------------------------------------
+INFO | GIT REPO
 INFO | Updating repo: remote="{REMOTE}", folder="{folder}"
 INFO | Git command: git -C {folder} remote set-url origin {REMOTE}
 INFO | Git command: git -C {folder} fetch --prune origin +refs/heads/*:refs/remotes/origin/* +refs/tags/*:refs/tags/*

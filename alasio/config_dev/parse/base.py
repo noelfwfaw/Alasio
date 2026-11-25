@@ -1,8 +1,16 @@
+import yaml
+from msgspec import DecodeError
+from msgspec.json import decode
+
 from alasio.backport import removesuffix
 from alasio.config.entry.utils import validate_nav_name
-from alasio.ext.file.msgspecfile import read_msgspec
-from alasio.ext.file.yamlfile import read_yaml
+from alasio.config_dev.parse.postprocess import PostprocessInfo, run_postprocess
+from alasio.ext import env
+from alasio.ext.file.yamlfile import yaml_loads
 from alasio.ext.path import PathStr
+from alasio.ext.path.atomic import atomic_read_bytes
+from alasio.ext.path.calc import subpath_to, to_posix
+from alasio.logger import logger
 
 _EMPTY = object()
 
@@ -12,12 +20,16 @@ class DefinitionError(Exception):
         """
         Args:
             msg (str | Exception): Error message
-            file (str):
-            keys (list[str] | str):
-            value (Any):
+            file (str): Source file of the definition, empty if unknown
+            keys (list[str] | str): Key path to the broken definition
+            value (Any): Offending value, omitted from the rendered error if not given
         """
         if isinstance(msg, Exception):
             msg = f'{msg.__class__.__name__}({msg})'
+        # Fill Exception.args with the formatted message, not with the original
+        # argument: the traceback, the logger and the third party exception
+        # handlers read args, they must not see the wrapped exception object
+        super().__init__(msg)
         self.msg = msg
         self.file = file
         self.keys = keys
@@ -27,11 +39,14 @@ class DefinitionError(Exception):
         """
         Show error as:
 
-        {self.__class__.__name__},
-            error={self.msg}
-            file={self.file}
-            keys={self.keys}
-            value={self.value}
+        DefinitionError,
+            file={self.file!r},
+            keys={self.keys!r},
+            value={self.value!r},
+            error={self.msg!r}
+
+        The location lines are printed only when they are set, value is printed
+        as long as it is given, even when it is falsy.
         """
         parts = [self.__class__.__name__]
 
@@ -58,13 +73,84 @@ class DefinitionError(Exception):
             return f'{self.__class__.__name__},\n    error={repr(self.msg)}'
 
 
+def read_yaml_mapping(file):
+    """
+    Read a generation input yaml file as a mapping.
+
+    Unlike read_yaml, malformed yaml is an error. A missing or empty document
+    is an empty mapping.
+
+    Args:
+        file (str): Source file path
+
+    Returns:
+        dict: Parsed mapping
+
+    Raises:
+        DefinitionError: Malformed yaml or a non-mapping document root
+    """
+    try:
+        data = atomic_read_bytes(file)
+    except FileNotFoundError:
+        return {}
+    try:
+        data = yaml_loads(data)
+    except yaml.YAMLError as e:
+        raise DefinitionError(f'Invalid yaml: {e}', file=file) from e
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise DefinitionError(
+            f'Expected a mapping at yaml root, got {type(data).__name__}',
+            file=file, value=data)
+    return data
+
+
+def read_json_mapping(file):
+    """
+    Read a generation input json file as a mapping.
+
+    Unlike read_msgspec, malformed json is an error. A missing or empty
+    document is an empty mapping.
+
+    Args:
+        file (str): Source file path
+
+    Returns:
+        dict: Parsed mapping
+
+    Raises:
+        DefinitionError: Malformed json or a non-mapping document root
+    """
+    try:
+        data = atomic_read_bytes(file)
+    except FileNotFoundError:
+        return {}
+    if not data:
+        return {}
+    try:
+        data = decode(data)
+    except DecodeError as e:
+        raise DefinitionError(f'Invalid json: {e}', file=file) from e
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise DefinitionError(
+            f'Expected a mapping at json root, got {type(data).__name__}',
+            file=file, value=data)
+    return data
+
+
 class ParseBase:
-    # a set of protected alasio nav name
-    alasio_nav = {'alasio', 'device'}
-    # key: nav_name, value: list of postprocess functions that receives {nav}.args.yaml data and returns it
-    dict_args_yaml_postprocess: "dict[str, list[callable]]" = {}
-    # key: nav_name, value: list of postprocess functions that receives {nav}.i18n.json data and returns it
-    dict_i18n_json_postprocess: "dict[str, list[callable]]" = {}
+    # Navs reserved for the alasio entry: their generated files are shared by
+    # every mod, so only alasio itself may declare a postprocess on them, see
+    # defined_by_alasio(). Immutable on purpose: it describes the nav layout,
+    # it is not a switch to turn off.
+    alasio_nav = frozenset(('alasio', 'device'))
+    # key: nav_name, value: list of registered PostprocessInfo
+    dict_args_yaml_postprocess: "dict[str, list[PostprocessInfo]]" = {}
+    # key: nav_name, value: list of registered PostprocessInfo
+    dict_i18n_json_postprocess: "dict[str, list[PostprocessInfo]]" = {}
 
     def __init__(self, file):
         """
@@ -97,80 +183,96 @@ class ParseBase:
         Returns:
             dict:
         """
-        data = read_yaml(self.file)
-        if self.nav_name in ParseBase.alasio_nav:
-            return data
+        data = read_yaml_mapping(self.file)
         list_postprocess = ParseBase.dict_args_yaml_postprocess.get(self.nav_name, None)
         if not list_postprocess:
             return data
-        for postprocess in list_postprocess:
-            data = self._run_postprocess(postprocess, data)
+        for info in list_postprocess:
+            try:
+                data = self._run_postprocess(info, data)
+            except DefinitionError as e:
+                if not e.file:
+                    e.file = self.file
+                raise
         return data
 
     @staticmethod
-    def _run_postprocess(postprocess, data):
+    def _run_postprocess(info, data):
         """
-        Run a postprocess function, automatically adapt to (data) or (cls, data)
+        Run a registered postprocess with its cached call plan.
+
+        Args:
+            info (PostprocessInfo): Registered postprocess info
+            data (dict): Data to process
+
+        Returns:
+            Any: Processed data
+
+        Raises:
+            DefinitionError: The info has no call plan, a (cls, data) function
+                can not resolve its class, or the postprocess returned None
         """
-        # 1. Handle bound methods (classmethod or bound instance method)
-        if hasattr(postprocess, '__self__'):
-            return postprocess(data)
-
-        # 2. Determine argument count and resolve class if needed
-        co_argcount = 1
-        cls = None
-        try:
-            # Check positional argument count
-            co_argcount = postprocess.__code__.co_argcount
-        except AttributeError:
-            # Not a function/method or doesn't have __code__
-            pass
-        if co_argcount == 2:
-            # Try to resolve class from qualname and globals for dynamic loading support
-            qualname = getattr(postprocess, '__qualname__', '')
-            parts = qualname.split('.')
-            if len(parts) >= 2:
-                # Resolve class by traversing globals and attributes
-                container = postprocess.__globals__
-                for part in parts[:-1]:
-                    if isinstance(container, dict):
-                        container = container.get(part)
-                    else:
-                        container = getattr(container, part, None)
-                    if container is None:
-                        break
-                if isinstance(container, type):
-                    cls = container
-
-        # 3. Call postprocess outside of try-except to avoid catching its errors
-        if co_argcount == 2:
-            return postprocess(cls, data)
-        else:
-            return postprocess(data)
+        return run_postprocess(info, data)
 
     def read_tasks_yaml(self):
         """
         Returns:
             dict:
         """
-        return read_yaml(self.tasks_file)
+        return read_yaml_mapping(self.tasks_file)
 
     def read_i18n_json(self):
         """
         Returns:
             dict:
         """
-        data = read_msgspec(self.i18n_file)
-        if self.nav_name in ParseBase.alasio_nav:
-            return data
+        data = read_json_mapping(self.i18n_file)
         list_postprocess = ParseBase.dict_i18n_json_postprocess.get(self.nav_name, None)
         if not list_postprocess:
             return data
-        for postprocess in list_postprocess:
-            data = self._run_postprocess(postprocess, data)
-            if data is None:
-                print(f'Warning: postprocess function {postprocess.__name__} returns None')
+        for info in list_postprocess:
+            try:
+                data = self._run_postprocess(info, data)
+            except DefinitionError as e:
+                if not e.file:
+                    e.file = self.i18n_file
+                raise
         return data
+
+
+# Directory of the alasio package: the code that owns the navs shared by every
+# mod. It is {ALASIO_ROOT}/alasio, the project layout, not the folder of a file
+# of the package, so moving a module does not change it.
+ALASIO_PACKAGE = to_posix(env.ALASIO_ROOT.joinpath('alasio'))
+
+
+def defined_by_alasio(func):
+    """
+    Check whether a postprocess is declared by alasio itself.
+
+    The navs of the alasio entry are generated once and shared by every mod, so
+    only the code of alasio may postprocess them. The decorator runs at import
+    time, before any generator or project root exists, so the file a postprocess
+    is written in is the ownership it can check.
+
+    Args:
+        func (callable): Postprocess function or callable object
+
+    Returns:
+        bool: True if the postprocess is declared in the alasio package
+    """
+    func = getattr(func, '__func__', func)
+    code = getattr(func, '__code__', None)
+    if code is not None:
+        file = to_posix(PathStr.new(code.co_filename).abspath())
+        if subpath_to(file, ALASIO_PACKAGE) is not None:
+            return True
+    # A module imported from a zip file or frozen has no usable path, it still
+    # declares the package it belongs to
+    module = getattr(func, '__module__', None)
+    if not isinstance(module, str):
+        module = type(func).__module__
+    return module.partition('.')[0] == 'alasio'
 
 
 def args_yaml_postprocess(nav_name):
@@ -179,6 +281,13 @@ def args_yaml_postprocess(nav_name):
 
     Args:
         nav_name (str): Nav name to register
+
+    The function may accept (data) or (cls, data). A (cls, data) function is
+    resolved from its __qualname__ when it is called; if the class can not be
+    resolved, generation fails with DefinitionError. The data argument may be
+    keyword-only, e.g. ``def process(cls, *, data)``. The signature and the
+    __qualname__ shape are validated when the decorator runs, so an invalid
+    signature or a qualname that can never resolve to a class fails immediately.
 
     Examples:
         # As a global function
@@ -194,24 +303,15 @@ def args_yaml_postprocess(nav_name):
     """
 
     def decorator(func):
-        if nav_name in ParseBase.alasio_nav:
-            print(f'Warning: {nav_name} is a protected nav name, postprocess ignored')
+        if nav_name in ParseBase.alasio_nav and not defined_by_alasio(func):
+            logger.warning(f'{nav_name} is a protected nav name, postprocess ignored')
             return func
 
-        try:
-            co_argcount = func.__code__.co_argcount
-        except AttributeError:
-            co_argcount = 1
-
-        if co_argcount not in (1, 2):
-            print(f'Warning: Postprocess function "{func.__name__}" must have 1 or 2 arguments, '
-                  f'got {co_argcount}. Ignoring.')
-            return func
-
+        info = PostprocessInfo.from_function(func)
         if nav_name in ParseBase.dict_args_yaml_postprocess:
-            ParseBase.dict_args_yaml_postprocess[nav_name].append(func)
+            ParseBase.dict_args_yaml_postprocess[nav_name].append(info)
         else:
-            ParseBase.dict_args_yaml_postprocess[nav_name] = [func]
+            ParseBase.dict_args_yaml_postprocess[nav_name] = [info]
         return func
 
     return decorator
@@ -223,6 +323,13 @@ def i18n_json_postprocess(nav_name):
 
     Args:
         nav_name (str): Nav name to register
+
+    The function may accept (data) or (cls, data). A (cls, data) function is
+    resolved from its __qualname__ when it is called; if the class can not be
+    resolved, generation fails with DefinitionError. The data argument may be
+    keyword-only, e.g. ``def process(cls, *, data)``. The signature and the
+    __qualname__ shape are validated when the decorator runs, so an invalid
+    signature or a qualname that can never resolve to a class fails immediately.
 
     Examples:
         # As a global function
@@ -238,24 +345,15 @@ def i18n_json_postprocess(nav_name):
     """
 
     def decorator(func):
-        if nav_name in ParseBase.alasio_nav:
-            print(f'Warning: {nav_name} is a protected nav name, postprocess ignored')
+        if nav_name in ParseBase.alasio_nav and not defined_by_alasio(func):
+            logger.warning(f'{nav_name} is a protected nav name, postprocess ignored')
             return func
 
-        try:
-            co_argcount = func.__code__.co_argcount
-        except AttributeError:
-            co_argcount = 1
-
-        if co_argcount not in (1, 2):
-            print(f'Warning: Postprocess function "{func.__name__}" must have 1 or 2 arguments, '
-                  f'got {co_argcount}. Ignoring.')
-            return func
-
+        info = PostprocessInfo.from_function(func)
         if nav_name in ParseBase.dict_i18n_json_postprocess:
-            ParseBase.dict_i18n_json_postprocess[nav_name].append(func)
+            ParseBase.dict_i18n_json_postprocess[nav_name].append(info)
         else:
-            ParseBase.dict_i18n_json_postprocess[nav_name] = [func]
+            ParseBase.dict_i18n_json_postprocess[nav_name] = [info]
         return func
 
     return decorator

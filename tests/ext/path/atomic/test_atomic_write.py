@@ -2,11 +2,11 @@
 Tests for the write functions of alasio.ext.path.atomic.
 
 Covered: the file movers (atomic_replace, atomic_rename), the writers
-(file_write, file_write_stream, afile_write_stream, atomic_write,
-atomic_write_stream) and the file creators (file_ensure_exist,
-file_touch). The tmp file helpers (random_id, is_tmp_file, to_tmp_file,
-to_nontmp_file, windows_attempt_delay) and replace_tmp are covered in
-test_atomic_tmp.py.
+(file_write, file_write_stream, atomic_write, atomic_write_stream) and the
+file creators (file_ensure_exist, file_touch). The tmp file helpers
+(random_id, is_tmp_file, to_tmp_file, to_nontmp_file, windows_attempt_delay)
+and atomic_replace_tmp are covered in test_atomic_tmp.py, the trio variants
+file_write_stream_async() / atomic_write_stream_async() in test_atomic_trio.py.
 
 The tests run on the in-memory fake filesystem (the fs fixture), the
 real disk is never touched. The Windows retry loops are tested on every
@@ -22,12 +22,11 @@ import pytest
 
 from alasio.ext.path import atomic
 from alasio.ext.path.atomic import (
-    WINDOWS_MAX_ATTEMPT, afile_write_stream, atomic_rename, atomic_replace, atomic_write, atomic_write_stream,
-    file_ensure_exist, file_read_bytes, file_read_text, file_touch, file_write, file_write_stream, is_tmp_file,
-    windows_attempt_delay
+    WINDOWS_MAX_ATTEMPT, atomic_rename, atomic_replace, atomic_write, atomic_write_stream, file_ensure_exist,
+    file_read_bytes, file_read_text, file_touch, file_write, file_write_stream, is_tmp_file, windows_attempt_delay
 )
 from alasio.testing.filesystem import fs  # noqa: F401
-from alasio.testing.filesystem.base import IS_WINDOWS as FS_IS_WINDOWS
+from alasio.testing.filesystem.base import IS_WINDOWS as FS_IS_WINDOWS  # noqa: F401
 from tests.ext.path.atomic.helpers import break_function, record_sleeps
 
 
@@ -123,18 +122,12 @@ class TestAtomicRename:
         assert not os.path.exists('/data/a.txt')
 
     def test_rename_over_existing(self, fs):
-        """os.rename() refuses an existing target on Windows, replaces it on the other platforms."""
+        """The fake filesystem is Linux: an existing target is replaced."""
         file_write('/data/a.txt', 'new')
         file_write('/data/b.txt', 'old')
-        if FS_IS_WINDOWS:
-            with pytest.raises(FileExistsError):
-                atomic_rename('/data/a.txt', '/data/b.txt')
-            assert file_read_text('/data/a.txt') == 'new'
-            assert file_read_text('/data/b.txt') == 'old'
-        else:
-            atomic_rename('/data/a.txt', '/data/b.txt')
-            assert file_read_text('/data/b.txt') == 'new'
-            assert not os.path.exists('/data/a.txt')
+        atomic_rename('/data/a.txt', '/data/b.txt')
+        assert file_read_text('/data/b.txt') == 'new'
+        assert not os.path.exists('/data/a.txt')
 
     @pytest.mark.parametrize('error', [FileNotFoundError(2, 'No such file or directory'), FileExistsError(17, 'File exists')])
     def test_rename_immediate_errors_on_windows(self, monkeypatch, error):
@@ -299,66 +292,6 @@ class TestFileWriteStream:
         """Other chunk types default to text mode, write() refuses them."""
         with pytest.raises(TypeError):
             file_write_stream('/data/a.txt', iter([123]))
-
-
-class TestAfileWriteStream:
-    """Test cases for afile_write_stream()."""
-
-    @pytest.mark.trio
-    async def test_write_text(self, fs):
-        """Text chunks should be written with no newline translation."""
-        async def chunks():
-            yield 'a\n'
-            yield 'b\n'
-
-        await afile_write_stream('/data/a.txt', chunks())
-        assert file_read_bytes('/data/a.txt') == b'a\nb\n'
-
-    @pytest.mark.trio
-    async def test_write_bytes(self, fs):
-        """Bytes chunks should be written as-is."""
-        async def chunks():
-            yield b'ab'
-            yield b'cd'
-
-        await afile_write_stream('/data/a.bin', chunks())
-        assert file_read_bytes('/data/a.bin') == b'abcd'
-
-    @pytest.mark.trio
-    async def test_write_empty(self, fs):
-        """An iterator that yields nothing should create an empty file."""
-        async def chunks():
-            for chunk in []:
-                yield chunk
-
-        await afile_write_stream('/data/a/b.txt', chunks())
-        assert file_read_bytes('/data/a/b.txt') == b''
-        assert os.listdir('/data/a') == ['b.txt']
-
-    @pytest.mark.trio
-    async def test_write_creates_parents(self, fs, monkeypatch):
-        """All the chunks should be written after the parent folders are created."""
-        calls = break_function(monkeypatch, atomic, 'open', [FileNotFoundError(2, 'No such file or directory')])
-        makedirs = break_function(monkeypatch, os, 'makedirs', [])
-
-        async def chunks():
-            yield 'x'
-            yield 'y'
-            yield 'z'
-
-        await afile_write_stream('/data/a/b/c.txt', chunks())
-        assert len(calls) == 2
-        assert makedirs == [(('/data/a/b',), {'exist_ok': True})]
-        assert file_read_text('/data/a/b/c.txt') == 'xyz'
-
-    @pytest.mark.trio
-    async def test_write_unsupported_type(self, fs):
-        """Other chunk types default to text mode, write() refuses them."""
-        async def chunks():
-            yield 123
-
-        with pytest.raises(TypeError):
-            await afile_write_stream('/data/a.txt', chunks())
 
 
 class TestAtomicWrite:
@@ -557,9 +490,9 @@ class TestFileEnsureExist:
         assert file_read_bytes('/data/a.txt') == b'data'
 
     def test_missing_parent(self, fs):
-        """A missing parent directory should be reported, nothing is created."""
-        assert file_ensure_exist('/data/a.txt') is False
-        assert not os.path.exists('/data')
+        """A missing parent directory is created with the file."""
+        assert file_ensure_exist('/data/a.txt') is True
+        assert file_read_bytes('/data/a.txt') == b''
 
     def test_exists(self, fs):
         """An existing file should be kept untouched."""
@@ -590,10 +523,9 @@ class TestFileTouch:
         assert os.path.getsize('/data/a.txt') == 0
 
     def test_touch_missing_parent(self, fs):
-        """A missing parent directory should raise, like the real os."""
-        with pytest.raises(FileNotFoundError):
-            file_touch('/data/a.txt')
-        assert not os.path.exists('/data')
+        """A missing parent directory is created with the file."""
+        file_touch('/data/a.txt')
+        assert file_read_bytes('/data/a.txt') == b''
 
     def test_touch_update(self, fs):
         """An existing file should keep its content and get a new modify time."""

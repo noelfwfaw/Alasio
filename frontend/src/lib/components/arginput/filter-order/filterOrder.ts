@@ -13,6 +13,135 @@
 export type FilterOrderItem = string;
 
 /**
+ * The datatypes that share the ordered transfer editor, they differ in what an
+ * item is:
+ *
+ * - filter-order:      one level, an item is bought once
+ * - filter-order-item: two levels, the primary item is the identity
+ * - filter-order-pair: two levels, the whole "item-option" is the identity
+ */
+export type FilterOrderDt = "filter-order" | "filter-order-item" | "filter-order-pair";
+
+/** True when the value is written as two levels, "item-option" */
+export function isTwoLevel(dt: string | undefined): boolean {
+  return dt === "filter-order-item" || dt === "filter-order-pair";
+}
+
+/** True when a row carries an editable secondary option, so the identity is its primary item */
+export function hasSecondary(dt: string | undefined): boolean {
+  return dt === "filter-order-item";
+}
+
+/** True when the unused column is grouped by the primary item, the identity is the whole pair */
+export function isGrouped(dt: string | undefined): boolean {
+  return dt === "filter-order-pair";
+}
+
+/** True when the value may hold optionCommand, entries that carry no item at all */
+export function hasTokens(dt: string | undefined): boolean {
+  return dt === "filter-order-pair";
+}
+
+/**
+ * Separator between the levels of an item, e.g. "PlateT4-gun".
+ *
+ * Fixed for every arg, mirroring FILTER_ORDER_SEPARATOR of the backend: the
+ * value is parsed by the regex of the mod, one capture group per level, so the
+ * separator cannot be chosen by the arg. An item of an arg without secondary
+ * options is never split, so it may contain it.
+ */
+export const SECONDARY_SEPARATOR = "-";
+
+/**
+ * Split a filter-order item into its primary item and its secondary option.
+ *
+ * A primary item without a secondary option stays itself, e.g. "Chip". The
+ * item is split on the first separator, so the secondary option keeps any
+ * later one. Mirrors split_option() of the backend.
+ *
+ * @param item The item of the value
+ * @returns The primary item and the secondary option, null when the item has none
+ */
+export function splitOption(item: string): [string, string | null] {
+  const at = item.indexOf(SECONDARY_SEPARATOR);
+  if (at === -1) return [item, null];
+  return [item.slice(0, at), item.slice(at + 1)];
+}
+
+/**
+ * The primary item of an item, the part before the secondary separator.
+ *
+ * @param item The item of the value
+ * @returns The primary item
+ */
+export function primaryOf(item: string): string {
+  return splitOption(item)[0];
+}
+
+/**
+ * Build an item from a primary item and its secondary option.
+ *
+ * @param primary The primary item
+ * @param secondary The secondary option, null or empty for a primary without one
+ * @returns The item of the value
+ */
+export function composeOption(primary: string, secondary: string | null | undefined): string {
+  if (secondary === null || secondary === undefined || secondary === "") return primary;
+  return `${primary}${SECONDARY_SEPARATOR}${secondary}`;
+}
+
+/**
+ * The legal items of a filter-order value: every primary item of "option",
+ * expanded with its own secondary options when the datatype is two level.
+ * Mirrors expand_filter_order_items() of the backend, so a row the dialog
+ * creates is exactly what the generated literal accepts. The optionCommand of a
+ * filter-order-pair are legal items too: they are stored as themselves, so a
+ * value holding "shortest" is not an invalid item.
+ *
+ * @param option Primary items of the arg
+ * @param optionDict Secondary options of each primary item
+ * @param dt Datatype of the arg
+ * @param optionCommand Tokens of the arg, entries that carry no item at all
+ * @returns The legal items
+ */
+export function validItems(
+  option: readonly any[] | null | undefined,
+  optionDict: Record<string, any[]> | null | undefined,
+  dt: string | undefined,
+  optionCommand: readonly any[] | null | undefined,
+): Set<string> {
+  const twoLevel = isTwoLevel(dt);
+  const out = new Set<string>();
+  for (const item of option ?? []) {
+    const primary = String(item);
+    const secondaries = twoLevel ? optionDict?.[primary] : null;
+    if (secondaries && secondaries.length > 0) {
+      for (const secondary of secondaries) out.add(composeOption(primary, String(secondary)));
+    } else {
+      out.add(primary);
+    }
+  }
+  if (hasTokens(dt)) {
+    for (const command of optionCommand ?? []) out.add(String(command));
+  }
+  return out;
+}
+
+/**
+ * The item added to the order when a primary item is picked from the unused
+ * column: its first secondary option, or the bare item when it has none.
+ *
+ * @param primary The primary item
+ * @param optionDict Secondary options of each primary item
+ * @returns The item to add
+ */
+export function defaultItem(primary: string, optionDict?: Record<string, any[]> | null): string {
+  const secondaries = optionDict?.[primary];
+  if (secondaries && secondaries.length > 0) return composeOption(primary, String(secondaries[0]));
+  return primary;
+}
+
+/**
  * Compare two item lists, the order is part of the value.
  *
  * @param a The first list
@@ -22,6 +151,28 @@ export type FilterOrderItem = string;
 export function sameList(a: readonly FilterOrderItem[], b: readonly FilterOrderItem[]): boolean {
   if (a.length !== b.length) return false;
   return a.every((item, index) => item === b[index]);
+}
+
+/**
+ * The positions of the repeated occurrences in the list.
+ *
+ * A stored value may repeat an item when it was written before the datatype was
+ * enforced, or by hand. The backend rejects such a value, so the editor marks
+ * the rows that claim a position already taken: the first occurrence is where
+ * the item belongs, every later one is the leftover. Marking all of them would
+ * blame the row the user most likely wants to keep.
+ *
+ * @param list The list to inspect
+ * @returns The indexes that are their item's second (or later) occurrence
+ */
+export function duplicateIndexes(list: readonly FilterOrderItem[]): Set<number> {
+  const seen = new Set<string>();
+  const out = new Set<number>();
+  list.forEach((item, index) => {
+    if (seen.has(item)) out.add(index);
+    else seen.add(item);
+  });
+  return out;
 }
 
 /**
@@ -58,7 +209,28 @@ export function appendItem(list: readonly FilterOrderItem[], item: FilterOrderIt
 }
 
 /**
+ * Remove the item at `index` from the list.
+ *
+ * Index based, not value based: a stored value may repeat an item, and every
+ * row operation has to touch the row the user picked, not its first occurrence.
+ *
+ * @param list The list to remove from
+ * @param index Index of the item to remove
+ * @returns A new list without that one item
+ */
+export function removeAt(list: readonly FilterOrderItem[], index: number): FilterOrderItem[] {
+  const next = [...list];
+  if (index < 0 || index >= next.length) return next;
+  next.splice(index, 1);
+  return next;
+}
+
+/**
  * Remove every occurrence of an item from the list.
+ *
+ * Only for a caller that really means "this value may not appear at all"; a
+ * row operation must use removeAt(), otherwise a repeated item loses the valid
+ * occurrence together with the one being deleted.
  *
  * @param list The list to remove from
  * @param item The item to remove
@@ -70,52 +242,66 @@ export function removeItem(list: readonly FilterOrderItem[], item: FilterOrderIt
 
 /**
  * The normalized drop target of a drag, built from the dnd callback:
- * - a row of the selected column: `itemId` is the row, insert before / after it
- * - the selected column container: no `itemId`, the top area inserts first,
- *   the rest appends last
- * - the unused column: the item leaves the order, the position is meaningless
+ * - a row of the selected column: `index` is the row, insert before / after it
+ * - the selected column container: no `index`, the top area inserts first, the
+ *   rest appends last
+ * - the unused column: the row leaves the order, the position is meaningless
+ *
+ * Rows are addressed by index, never by value: a stored value may repeat an
+ * item, and two rows with the same value would otherwise move together.
  */
-export type DropTarget =
-  { kind: "selected"; itemId?: FilterOrderItem; position: "top" | "bottom" } | { kind: "unused" };
+export type DropTarget = { kind: "selected"; index?: number; position: "top" | "bottom" } | { kind: "unused" };
 
 /**
- * Apply a drop: move `item` to `target` in a copy of the draft.
+ * Where a drop inserts, as an index of the list after the dragged row is out.
+ *
+ * @param count Length of the list without the dragged row
+ * @param target The normalized drop target
+ * @param from Index the dragged row had, -1 when it comes from the unused column
+ * @returns The index to insert at
+ */
+function insertIndex(count: number, target: { index?: number; position: "top" | "bottom" }, from: number): number {
+  if (target.index === undefined) return target.position === "top" ? 0 : count;
+  let to = target.index;
+  if (from !== -1 && from < to) to -= 1;
+  if (target.position === "bottom") to += 1;
+  return Math.min(Math.max(to, 0), count);
+}
+
+/**
+ * Move the row at `from` to `target` in a copy of the draft.
  *
  * @param draft The current selected order
- * @param item The item being dragged, it may come from either column
+ * @param from Index of the row being dragged
  * @param target The normalized drop target
  * @returns The new selected order
  */
-export function applyDrop(
+export function moveRow(draft: readonly FilterOrderItem[], from: number, target: DropTarget): FilterOrderItem[] {
+  if (from < 0 || from >= draft.length) return [...draft];
+  if (target.kind === "unused") return removeAt(draft, from);
+  // Dropping the row onto itself must not move it
+  if (target.index === from) return [...draft];
+  const next = removeAt(draft, from);
+  next.splice(insertIndex(next.length, target, from), 0, draft[from]);
+  return next;
+}
+
+/**
+ * Insert an item of the unused column into the draft at the drop target.
+ *
+ * @param draft The current selected order
+ * @param item The item being added, already completed by the caller
+ * @param target The normalized drop target
+ * @returns The new selected order
+ */
+export function insertRow(
   draft: readonly FilterOrderItem[],
   item: FilterOrderItem,
   target: DropTarget,
 ): FilterOrderItem[] {
-  // A move is always a removal first: the item may come from either column
-  const from = draft.indexOf(item);
-  const next = draft.filter((value) => value !== item);
-
+  const next = [...draft];
   if (target.kind === "unused") return next;
-
-  // Dropping the row onto itself must not move it
-  if (target.itemId === item) return [...draft];
-
-  let to: number;
-  if (target.itemId === undefined) {
-    // The whole column is the target: the top area inserts first, the rest appends
-    to = target.position === "top" ? 0 : next.length;
-  } else {
-    // A row is the target: insert before / after it
-    to = draft.indexOf(target.itemId);
-    if (to === -1) {
-      // The row vanished (should not happen while dragging): append, never drop the item
-      to = next.length;
-    } else {
-      if (from !== -1 && from < to) to -= 1;
-      if (target.position === "bottom") to += 1;
-    }
-  }
-  next.splice(Math.min(Math.max(to, 0), next.length), 0, item);
+  next.splice(insertIndex(next.length, target, -1), 0, item);
   return next;
 }
 

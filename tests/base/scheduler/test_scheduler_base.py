@@ -5,6 +5,8 @@ Uses mock data to cover all code paths in scheduler.py without
 depending on actual config/database infrastructure.
 """
 
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 from unittest import mock
 
@@ -20,6 +22,10 @@ from alasio.config.entry.model import TaskItem
 from alasio.ext.cache import InstanceCacheOperation
 from alasio.logger import logger
 from alasio.testing.patch_time import PatchTime
+
+pytestmark = [
+    pytest.mark.parallel,
+]
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -107,6 +113,18 @@ def _cache_device(scheduler):
     return device
 
 
+def _wait_until_timeout(timeout=None):
+    """
+    Event.wait() stub for the scheduler_stopping event.
+
+    The scheduler polls the event with wait(timeout) instead of sleeping, so the
+    stub has to advance the PatchTime clock the way time.sleep() does and report
+    a timeout.
+    """
+    time.sleep(timeout)
+    return False
+
+
 def _patch_backend(**attrs):
     """Patch BackendBridge on the scheduler module and return the mock instance."""
     patcher = mock.patch("alasio.base.scheduler.scheduler.BackendBridge")
@@ -115,6 +133,7 @@ def _patch_backend(**attrs):
     mock_instance = mock_cls.return_value
     # Set default attribute values
     mock_instance.scheduler_stopping.is_set.return_value = False
+    mock_instance.scheduler_stopping.wait.side_effect = _wait_until_timeout
     mock_instance.inited = False
     for key, value in attrs.items():
         # Handle dotted attribute paths like 'scheduler_stopping__is_set'
@@ -143,20 +162,47 @@ class TestInterruptableSleep:
             with mock.patch(
                 "alasio.base.scheduler.scheduler.BackendBridge"
             ) as mock_bridge:
-                mock_bridge.return_value.scheduler_stopping.is_set.return_value = False
+                mock_bridge.return_value.scheduler_stopping.wait.side_effect = (
+                    _wait_until_timeout
+                )
                 result = interruptable_sleep(0.01)
                 assert result is True
+                mock_bridge.return_value.scheduler_stopping.wait.assert_called_with(
+                    timeout=0.5
+                )
 
     def test_sleep_raises_scheduler_stop(self):
         """Sleep raises SchedulerStop when backend signals stop."""
         backend = mock.MagicMock()
-        backend.scheduler_stopping.is_set.side_effect = [False, True]
+        backend.scheduler_stopping.wait.side_effect = [False, True]
         with mock.patch(
             "alasio.base.scheduler.scheduler.BackendBridge", return_value=backend
         ):
             with PatchTime():
                 with pytest.raises(SchedulerStop):
                     interruptable_sleep(5)
+
+    def test_stop_wakes_before_the_poll_timeout(self):
+        """A stop request wakes the sleep instead of waiting for the next poll."""
+        event = threading.Event()
+        backend = mock.MagicMock()
+        backend.scheduler_stopping = event
+
+        with mock.patch(
+            "alasio.base.scheduler.scheduler.BackendBridge", return_value=backend
+        ):
+            timer = threading.Timer(0.05, event.set)
+            timer.start()
+            start = time.perf_counter()
+            try:
+                with pytest.raises(SchedulerStop):
+                    interruptable_sleep(5)
+            finally:
+                timer.cancel()
+                timer.join()
+
+        # the 0.5s poll interval is the upper bound of the old implementation
+        assert time.perf_counter() - start < 0.45
 
 
 # ---------------------------------------------------------------------------
@@ -804,7 +850,7 @@ class TestAlasioSchedulerWaitFuture:
         _cache_device(scheduler)
 
         backend = _patch_backend()
-        backend.scheduler_stopping.is_set.side_effect = [False, True]
+        backend.scheduler_stopping.wait.side_effect = [False, True]
 
         with PatchTime():
             future = datetime.now(timezone.utc).replace(microsecond=0) + timedelta(
@@ -1097,7 +1143,8 @@ class TestAlasioSchedulerRun:
         with mock.patch.object(scheduler, "_task_loop", side_effect=calls):
             with mock.patch.object(scheduler, "_on_task_switch") as mock_switch:
                 with mock.patch.object(scheduler, "_on_idle") as mock_idle:
-                    scheduler.run()
+                    with mock.patch.object(scheduler, "_on_scheduler_stop"):
+                        scheduler.run()
 
         # Should call _on_task_switch initially and then once more at the end (both with None)
         assert mock_switch.call_count == 2
@@ -1116,7 +1163,8 @@ class TestAlasioSchedulerRun:
         with mock.patch.object(scheduler, "_task_loop", side_effect=calls):
             with mock.patch.object(scheduler, "_on_task_switch"):
                 with mock.patch.object(scheduler, "_on_idle"):
-                    scheduler.run()
+                    with mock.patch.object(scheduler, "_on_scheduler_stop"):
+                        scheduler.run()
 
     def test_run_calls_on_task_switch_at_start(self, scheduler):
         """run() calls _on_task_switch(None) when starting."""
@@ -1127,7 +1175,8 @@ class TestAlasioSchedulerRun:
         with mock.patch.object(scheduler, "_task_loop", side_effect=SchedulerStop()):
             with mock.patch.object(scheduler, "_on_task_switch") as mock_switch:
                 with mock.patch.object(scheduler, "_on_idle"):
-                    scheduler.run()
+                    with mock.patch.object(scheduler, "_on_scheduler_stop"):
+                        scheduler.run()
 
         # _on_task_switch should be called at least once at start
         mock_switch.assert_any_call(None)
@@ -1143,6 +1192,94 @@ class TestAlasioSchedulerRun:
         ):
             with mock.patch.object(scheduler, "_on_task_switch"):
                 with mock.patch.object(scheduler, "_on_idle"):
-                    scheduler.run()
+                    with mock.patch.object(scheduler, "_on_scheduler_stop"):
+                        scheduler.run()
 
         backend.send_worker_state.assert_any_call("error")
+
+
+# ---------------------------------------------------------------------------
+# _on_scheduler_stop()
+# ---------------------------------------------------------------------------
+
+
+class TestAlasioSchedulerBackground:
+    """Tests for the shutdown of the background manager when the loop ends."""
+
+    def test_waits_and_logs(self, scheduler):
+        """The counts are reported and shutdown(wait=True) is called."""
+        background = mock.MagicMock()
+        background.snapshot.return_value = (2, 1)
+
+        with mock.patch(
+            "alasio.base.scheduler.scheduler.BackgroundManager", return_value=background
+        ):
+            with logger.mock_capture_writer() as capture:
+                scheduler._on_scheduler_stop()
+
+        background.shutdown.assert_called_once_with(wait=True)
+        assert capture.concat() == """\
+INFO | Waiting for 2 unfinished background task(s), dropping 1 pending task(s)
+"""
+
+    def test_no_log_when_idle(self, scheduler):
+        """An idle manager is shut down without a waiting line."""
+        background = mock.MagicMock()
+        background.snapshot.return_value = (0, 0)
+
+        with mock.patch(
+            "alasio.base.scheduler.scheduler.BackgroundManager", return_value=background
+        ):
+            with logger.mock_capture_writer() as capture:
+                scheduler._on_scheduler_stop()
+
+        background.shutdown.assert_called_once_with(wait=True)
+        assert capture.concat() == ""
+
+    def test_shutdown_is_never_skipped(self, scheduler):
+        """A zero count does not short circuit the shutdown, a task may arrive later."""
+        background = mock.MagicMock()
+        background.snapshot.return_value = (0, 0)
+
+        with mock.patch(
+            "alasio.base.scheduler.scheduler.BackgroundManager", return_value=background
+        ):
+            with logger.mock_capture_writer():
+                scheduler._on_scheduler_stop()
+
+        assert background.shutdown.call_count == 1
+
+    def test_run_stops_background_before_idle(self, scheduler):
+        """run() stops the background before reporting idle, once."""
+        _patch_backend()
+        _cache_config(scheduler)
+        _cache_device(scheduler)
+
+        calls = []
+
+        with mock.patch.object(scheduler, "_task_loop", side_effect=SchedulerStop()):
+            with mock.patch.object(scheduler, "_on_task_switch"):
+                with mock.patch.object(
+                    scheduler, "_on_scheduler_stop", side_effect=lambda: calls.append("background")
+                ):
+                    with mock.patch.object(
+                        scheduler, "_on_idle", side_effect=lambda: calls.append("idle")
+                    ):
+                        scheduler.run()
+
+        assert calls == ["background", "idle"]
+
+    def test_closed_manager_refuses_further_submissions(self, scheduler):
+        """The real manager is closed after the hook, the process must not reuse it."""
+        from alasio.base.background import BackgroundClosed, BackgroundManager
+
+        BackgroundManager.singleton_clear()
+        background = BackgroundManager(name="test-bg-stop")
+        try:
+            with logger.mock_capture_writer():
+                scheduler._on_scheduler_stop()
+
+            with pytest.raises(BackgroundClosed):
+                background.submit(lambda: None, name="ch")
+        finally:
+            BackgroundManager.singleton_clear()

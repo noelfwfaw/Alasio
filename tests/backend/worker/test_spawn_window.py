@@ -44,6 +44,10 @@ from tests.backend.worker.const import *
 from tests.backend.worker.spawn_gate import SpawnGate
 from tests.backend.worker.test_worker_lifespan import assert_recv_thread_gone, assert_worker_gone
 
+pytestmark = [
+    pytest.mark.parallel,
+]
+
 
 @pytest.fixture
 def manager():
@@ -379,19 +383,26 @@ class TestSpawnFailure:
 
     def test_spawn_failure_returns_to_error(self, manager, monkeypatch):
         """
-        The interpreter cannot be launched: a parent-side spawn failure, so no
-        process is created at all and process.start() raises in the backend.
-        No process will ever report for the entry, so the spawn drops its pipe
-        and returns the entry to error -- otherwise the config could never be
-        started again and no disconnect would ever finalize it.
+        The spawn fails in the parent: no process is created at all and
+        process.start() raises in the backend. No process will ever report for
+        the entry, so the spawn drops its pipe and returns the entry to error --
+        otherwise the config could never be started again and no disconnect
+        would ever finalize it.
         """
         import multiprocessing.spawn as mp_spawn
 
+        def cannot_prepare(name):
+            raise OSError('cannot prepare the worker process')
+
         with monkeypatch.context() as patch:
-            # only this process is affected: the patch is undone before the
-            # "starts again" check below
-            patch.setattr(mp_spawn, 'get_executable', lambda: 'no/such/python')
-            with pytest.raises(OSError):
+            # The failure is injected into the preparation step: it runs in the parent
+            # on every platform before any process is created. Patching the interpreter
+            # path instead (mp_spawn.get_executable) is not portable: on POSIX the path
+            # goes to _posixsubprocess and raises TypeError on 3.11, while on 3.8-3.10
+            # the worker starts anyway (only its exit code reports the failure).
+            # The patch is undone before the "starts again" check below.
+            patch.setattr(mp_spawn, 'get_preparation_data', cannot_prepare)
+            with pytest.raises(OSError, match='cannot prepare the worker process'):
                 manager.worker_start('WorkerTestScheduler', 'cfg_fail')
 
         state = manager.state.get('cfg_fail', None)

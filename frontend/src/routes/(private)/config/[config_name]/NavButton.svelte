@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { type I18nTextData, i18nTextToLines } from "$lib/components/arg/utils.svelte";
   import SafeBold from "$lib/components/aside/SafeBold.svelte";
   import { SidebarRowIndicator, sidebarRowClass } from "$lib/components/sidebar-accordion";
   import { Button } from "$lib/components/ui/button";
@@ -11,7 +12,8 @@
     class: className,
     ...restprops
   }: {
-    name: string;
+    // The name of the card, one row or one entry per row
+    name: I18nTextData;
     active: boolean;
     // Dot on the right, marking a task that can be enabled in the scheduler:
     // - true: the task is enabled, a gray outline circle with an inner dot in
@@ -33,17 +35,26 @@
     // same metrics, so a card lines up with the entries and the groups above
     // it (see sidebar-accordion/row.ts). No w-full: the row is stretched by
     // the list it sits in, so the margins of the metrics inset it.
-    "hover:text-primary h-auto justify-start text-left",
+    "h-auto justify-start text-left hover:text-primary",
     sidebarRowClass,
     active
-      ? "text-primary hover:bg-card dark:hover:bg-card font-semibold"
-      : "text-foreground/80 hover:bg-card/80 dark:hover:bg-card font-medium",
+      ? "font-semibold text-primary hover:bg-card dark:hover:bg-card"
+      : "font-medium text-foreground/80 hover:bg-card/80 dark:hover:bg-card",
     className,
   )}
   {...restprops}
 >
   <SidebarRowIndicator {active} />
-  <SafeBold {active} text={name}></SafeBold>
+  <!--
+    A name may have several lines: every line goes through SafeBold on its own,
+    so it keeps the word wrapping and the bold/normal swap of a single line,
+    and the lines stack because each call is a block of its own.
+  -->
+  <div class="flex w-full flex-col" data-slot="sidebar-label">
+    {#each i18nTextToLines(name) as line}
+      <SafeBold {active} text={line} />
+    {/each}
+  </div>
   {#if scheduler !== undefined}
     <!--
       The scheduler state of the card, a dot at the right end of the row. This
@@ -60,7 +71,7 @@
     -->
     <span
       class={cn(
-        "border-muted-foreground/60 mr-[3px] h-2.5 w-2.5 shrink-0 rounded-full border",
+        "mr-[3px] h-2.5 w-2.5 shrink-0 rounded-full border border-muted-foreground/60",
         // filled disc of 2px radius, the remaining 1px inside the border is the gap
         scheduler && "border-primary bg-[radial-gradient(circle,var(--primary)_0_2.5px,transparent_2.5px)]",
       )}

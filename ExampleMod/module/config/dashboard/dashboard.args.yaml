@@ -1,6 +1,14 @@
 Oil:
-  parent: DashboardTotal
+  parent: DashboardSoftTotal
   dashboard_color: "#7f7f7f"
+  args:
+    Value:
+      value: 0
+      range: "0~25000"
+
+Coin:
+  parent: DashboardSoftTotal
+  dashboard_color: "#ffb300"
   args:
     Value:
       value: 0
@@ -11,12 +19,10 @@ Gems:
   dashboard_color: "#eb8efe"
 
 Progress:
-  dashboard: progress
-  args:
-    Value: 0
+  parent: DashboardProgress
 
 Planner:
-  dashboard: planner
+  parent: DashboardPlanner
   args:
     GreenValue: 0
     GreenTotal: 0

@@ -32,8 +32,10 @@ requires the channel to publish exactly that version as its latest one
 provides no valid update and the install is refused. Every install runs on
 the caller event loop (trio) and DeployJob.update(version) holds the
 exclusive lock of the distribution ledger for its whole flow, so two
-installs of the same distribution never interleave and an install killed
-in flight is resumed by the next one.
+installs of the same distribution never interleave (the second one waits in
+another thread or process, and raises RuntimeError in the same thread, the
+lock is not reentrant), and an install killed in flight is resumed by the
+next one.
 """
 
 from alasio.deploy.httpclient.probe_mirrors import Mirrors
@@ -102,7 +104,7 @@ class PipPack:
         mirrors = mod.entry.mirrors
         if not mirrors:
             raise ValueError(f'The mod declares no update source: "{mod.name}"')
-        self.mirrors = Mirrors.from_input(mirrors)
+        self.mirrors = mirrors
 
     async def install(self, name, version, latest_info=None):
         """
@@ -173,7 +175,15 @@ class PipPack:
             client=self.client,
         )
         try:
-            job = DeployJob(root=self.site_packages, name=dist_key, server=server)
+            job = DeployJob(
+                root=self.site_packages, name=dist_key, server=server,
+                # The mod took the distribution over from the pip channel: a
+                # target that has no ledger yet may still be the installation
+                # pip wrote, and its RECORD is then the old side of this
+                # install. The caller declares it, the flow never goes
+                # looking for an installation on its own
+                scene='pypi',
+            )
             logger.info(f'Installing "{name}=={version}" to "{self.site_packages}"')
             ok = await job.update(version=version, latest_info=latest_info)
         finally:

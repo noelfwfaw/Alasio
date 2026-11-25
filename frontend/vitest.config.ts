@@ -9,8 +9,8 @@ import { defineConfig } from "vitest/config";
  * (and the i18n / dev-page plugins) are not needed in tests, and their
  * behavior (virtual modules, route scanning) would only add noise.
  * The svelte plugin alone compiles the runes in `.svelte.ts` source
- * files; svelte.config.js is not loaded (configFile: false) so kit
- * preprocessing stays out of the test pipeline.
+ * files; the kit preprocessing of kit.config.ts is not loaded
+ * (configFile: false) so it stays out of the test pipeline.
  *
  * `$app/*` are SvelteKit virtual modules; tests resolve them to small
  * stubs under src/test-utils so product code can be imported without
@@ -20,7 +20,9 @@ export default defineConfig({
   plugins: [svelte({ configFile: false })],
   test: {
     environment: "jsdom",
-    include: ["src/**/*.test.ts"],
+    // scripts/ holds build-time helpers (the CSP hash check) that have their
+    // own unit tests; they are plain TS/JS modules, not part of the app.
+    include: ["src/**/*.test.ts", "scripts/**/*.test.ts"],
   },
   // Expose the shared message fixtures path to the contract test. The
   // fixtures live outside the frontend tree (tests/ws_fixtures/), and
@@ -45,7 +47,7 @@ export default defineConfig({
       $routes: fileURLToPath(new URL("./src/routes", import.meta.url)),
       $public: fileURLToPath(new URL("./src/routes/(public)", import.meta.url)),
       $private: fileURLToPath(new URL("./src/routes/(private)", import.meta.url)),
-      "$app/environment": fileURLToPath(new URL("./src/lib/test-utils/app-environment.ts", import.meta.url)),
+      "$app/env": fileURLToPath(new URL("./src/lib/test-utils/app-env.ts", import.meta.url)),
       "$app/navigation": fileURLToPath(new URL("./src/lib/test-utils/app-navigation.ts", import.meta.url)),
     },
   },

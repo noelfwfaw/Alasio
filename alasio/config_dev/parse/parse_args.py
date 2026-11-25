@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from typing import Any, Dict, Literal, Union
+from typing import Any, Dict, List, Literal, Union
 
 import msgspec
 from msgspec import UNSET, Struct, UnsetType
@@ -7,7 +7,10 @@ from msgspec import UNSET, Struct, UnsetType
 from alasio.backport import to_literal
 from alasio.codegen.python import ReprWrapper
 from alasio.config_dev.parse.base import DefinitionError
-from alasio.config_dev.parse.parse_arg_utils import validate_filter_order, validate_option
+from alasio.config_dev.parse.parse_arg_utils import (
+    TYPE_ARG_FILTER_ORDER, TYPE_ARG_LITERAL, expand_filter_order_items, validate_filter_order,
+    validate_filter_order_item, validate_filter_order_pair, validate_option, validate_range_default
+)
 from alasio.config_dev.parse.parse_range import parse_range
 
 """
@@ -41,6 +44,9 @@ TYPE_DT_TO_PYTHON = {
     # 'static-hide' is an alias of dt='static' and hide=True
     # text input
     'input': 'str',
+    # input-line is a single line text box: it is drawn like a textarea but it is
+    # edited by an <input>, so a newline can not be typed and never breaks the line
+    'input-line': 'str',
     'input-int': 'int',
     'input-float': 'float',
     'textarea': 'str',
@@ -67,17 +73,17 @@ TYPE_DT_TO_PYTHON = {
     # with a transfer-like dialog (see parse_arg_utils.validate_filter_order)
     # the real annotation is Tuple[Literal[option...], ...], see get_python_type()
     'filter-order': 't.Tuple[str, ...]',
+    # filter-order-item is a two level filter-order: the primary item is the
+    # identity, it is used once and carries one of its own secondary options
+    'filter-order-item': 't.Tuple[str, ...]',
+    # filter-order-pair is a two level filter-order: the whole "item-option" is
+    # the identity, several options of one item may coexist
+    'filter-order-pair': 't.Tuple[str, ...]',
 }
-# Define which "dt" is literal type
-# Example:
-#   {'dt': 'select'} is a literal in python: Literal["option-A", "option-B"]
-#   {'dt': 'filter-order'} is a tuple of the literal: Tuple[Literal["option-A", "option-B"], ...]
-#     a "dt" in TYPE_ARG_TUPLE wraps the literal into a tuple
-TYPE_ARG_LITERAL = {
-    'static',
-    'select', 'radio', 'secondary-select',
-    'filter-order',
-}
+# Define which "dt" holds a number, see RANGE_CONSTRAINT in parse_arg_utils.py
+TYPE_ARG_NUMERIC = frozenset(
+    dt for dt, anno in TYPE_DT_TO_PYTHON.items() if anno in ('int', 'float')
+)
 # Define which "dt" is a tuple of value
 # Example:
 #   You define `value: option-A > option-B > option-C`
@@ -155,13 +161,6 @@ def populate_input(dt: str, value):
     return dt, value
 
 
-def validate_literal_item(item: Any) -> None:
-    vtype = type(item)
-    if vtype in (bool, str, int, float, bytes, None):
-        return
-    raise DefinitionError(f'Value of "{item}" must be bool/str/int/float/bytes/None')
-
-
 def preprocess_arg(arg: dict) -> dict:
     """
     Additional pre-process before validating as ArgData
@@ -186,6 +185,9 @@ def preprocess_arg(arg: dict) -> dict:
         except ValueError as e:
             raise DefinitionError(f'Cannot parse range "{range_str}", {e}')
         arg.update(dict_range)
+    # "range" is a yaml-only shorthand, it is expanded into msgspec
+    # constraints above and removed so ArgData can reject unknown fields
+    arg.pop('range', None)
 
     # 'static-hide' is an alias of dt='static' and hide=True
     if dt == 'static-hide':
@@ -245,16 +247,12 @@ def preprocess_arg(arg: dict) -> dict:
                         raise DefinitionError(f'"option_dict" group name "{_group}" cannot be in "option"')
             except (AttributeError, TypeError) as e:
                 raise DefinitionError(f'"option_dict" must be a dict[str, list] if dt="secondary-select", {e}')
-            # options in literal datatype must be valid python literal items
-            for item in option:
-                validate_literal_item(item)
         else:
             raise DefinitionError('dt="secondary-select" must have "option" or "option_dict" defined')
-    elif dt == 'filter-order':
-        arg.pop('option_dict', None)
-        # filter-order: "option" is required (checked above with the other literal
-        # datatypes), it is the universe of items the frontend editor can add,
-        # the value is an ordered subset of it.
+    elif dt in TYPE_ARG_FILTER_ORDER:
+        # every filter-order datatype: "option" is required (checked above with
+        # the other literal datatypes), it is the universe of items the frontend
+        # editor can add, the value is an ordered subset of it.
         # The value is defined as "option-A > option-B" in yaml, or as a list,
         # normalize it to a tuple before validating (filter keeps the old split
         # position, see below)
@@ -263,17 +261,48 @@ def preprocess_arg(arg: dict) -> dict:
         elif type(value) is list:
             value = tuple(value)
         arg['value'] = value
-        validate_filter_order(arg['option'], value)
+
+        if dt == 'filter-order':
+            # one level, an item is the identity. The two level datatypes are
+            # explicit so that the datatype alone tells the editor what to show
+            if 'option_dict' in arg:
+                raise DefinitionError(
+                    'datatype "filter-order" must not have "option_dict" defined, '
+                    'use "filter-order-item" or "filter-order-pair"')
+            if 'option_command' in arg:
+                raise DefinitionError(
+                    'datatype "filter-order" must not have "option_command" defined, '
+                    'use "filter-order-pair"')
+            validate_filter_order(arg['option'], value)
+        elif dt == 'filter-order-item':
+            # two levels: "option_dict" is {item: [secondary option, ...]}, the
+            # primary item is the identity, it is used once
+            option_dict = arg.get('option_dict', None)
+            if not option_dict:
+                raise DefinitionError('datatype "filter-order-item" must have "option_dict" defined')
+            if 'option_command' in arg:
+                raise DefinitionError(
+                    'datatype "filter-order-item" must not have "option_command" defined, '
+                    'use "filter-order-pair"')
+            validate_filter_order_item(arg['option'], value, option_dict)
+        else:
+            # two levels, the whole "item-option" is the identity, and "option_command"
+            # are entries that carry no item at all ("shortest")
+            option_dict = arg.get('option_dict', None)
+            if not option_dict:
+                raise DefinitionError('datatype "filter-order-pair" must have "option_dict" defined')
+            option_command = arg.get('option_command', None)
+            validate_filter_order_pair(arg['option'], value, option_dict, option_command=option_command)
+            if not option_command:
+                arg.pop('option_command', None)
     else:
         arg.pop('option_dict', None)
+        arg.pop('option_command', None)
         # check option
         if dt != 'enable':
             if 'option' in arg:
                 option = arg['option']
                 validate_option(option, value)
-                # options in literal datatype must be valid python literal items
-                for item in option:
-                    validate_literal_item(item)
 
     vtype = type(value)
     # Timezone default to UTC
@@ -282,9 +311,10 @@ def preprocess_arg(arg: dict) -> dict:
     # Split filters
     if dt in TYPE_ARG_TUPLE and vtype is str:
         arg['value'] = value = tuple(s.strip() for s in value.split('>'))
-    # textarea is default to vert layout
+    # textarea-like inputs take the whole width, they are default to vert layout
     if 'layout' not in arg:
-        if dt in ['textarea', 'filter', 'filter-order']:
+        if dt in ['input-line', 'textarea', 'filter', 'filter-order',
+                  'filter-order-item', 'filter-order-pair']:
             arg['layout'] = 'vert'
 
     return arg
@@ -297,14 +327,20 @@ MSGSPEC_CONSTRAINT = [
 ]
 
 
-class ArgData(Struct, omit_defaults=True):
+class ArgData(Struct, omit_defaults=True, forbid_unknown_fields=True):
     # data type
     dt: to_literal(TYPE_DT_TO_PYTHON.keys())
     # default value
     value: Any
     option: Union[list, UnsetType] = UNSET
     # {group: [option1, option2, ...]} in secondary-select
+    # {item: [secondary option, ...]} in filter-order-item and
+    # filter-order-pair, an item of the value then carries its secondary option
+    # as "item-option"
     option_dict: Union[Dict[str, list], UnsetType] = UNSET
+    # Items of a filter-order-pair value that carry no "item-option" pair, e.g.
+    # the "shortest" of a commission filter
+    option_command: Union[List[str], UnsetType] = UNSET
 
     # Data topics events will have `option_i18n` for option translations
     # key is option, value is translation
@@ -373,34 +409,11 @@ class ArgData(Struct, omit_defaults=True):
     # Any additional user-defined metadata.
     # extra: Union[Dict, UnsetType] = UNSET
 
-    def merge(self, other: "ArgData") -> "ArgData":
-        """
-        Merge with another ArgData.
-        The other one's values override this one's.
-
-        Args:
-            other (ArgData): Another ArgData object
-
-        Returns:
-            ArgData: A new ArgData object
-        """
-        kwargs = {}
-        for field in self.__struct_fields__:
-            val = getattr(other, field)
-            if val is UNSET:
-                val = getattr(self, field)
-
-            if isinstance(val, list):
-                val = val[:]
-            elif isinstance(val, dict):
-                val = val.copy()
-
-            kwargs[field] = val
-
-        return msgspec.structs.replace(self, **kwargs)
-
     @classmethod
     def from_arg_data(cls, data) -> "ArgData":
+        # preprocess_arg adds and removes keys, do not mutate the caller's dict
+        if type(data) is dict:
+            data = dict(data)
         try:
             data = populate_arg(data)
             data = preprocess_arg(data)
@@ -412,6 +425,11 @@ class ArgData(Struct, omit_defaults=True):
         except msgspec.ValidationError as e:
             ne = DefinitionError(e, value=data)
             raise ne
+        try:
+            validate_range_default(arg)
+        except DefinitionError as e:
+            e.value = data
+            raise
         return arg
 
     def to_dict(self) -> dict:
@@ -450,10 +468,20 @@ class ArgData(Struct, omit_defaults=True):
         """
         Get the literal items of this arg, grouped like "option_dict"
 
+        A two level filter-order is a flat group of composite items, so the
+        generated literal rejects a secondary option that does not belong to its
+        primary item. The "option_command" of a filter-order-pair are entries of their
+        own, they are part of the literal too.
+
         Returns:
             list[list]: Literal items of each group, e.g. [['a', 'b'], ['c']]
         """
         if self.option_dict:
+            if self.dt in ('filter-order-item', 'filter-order-pair'):
+                items = expand_filter_order_items(self.option, self.option_dict)
+                if self.dt == 'filter-order-pair' and self.option_command:
+                    items.extend(self.option_command)
+                return [items]
             return [options for options in self.option_dict.values()]
         return [self.option]
 

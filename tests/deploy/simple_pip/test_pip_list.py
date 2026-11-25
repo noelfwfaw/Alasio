@@ -3,7 +3,7 @@ import os
 
 import pytest
 
-from alasio.config.entry.const import ModEntryInfo
+from alasio.config.entry.mod_entry import ModEntry, ModEntryModel
 from alasio.deploy.simple_pip import pip_list
 from alasio.deploy.simple_pip.pip_list import Distribution, PipList, normalize_name
 from alasio.deploy_dev.pack.encode_base import PackEncodeBase
@@ -169,10 +169,10 @@ class FakeMod:
     def __init__(self, *names):
         """
         Args:
-            *names (str): Names to declare in pack_update_deps
+            *names (str): Names to declare in pack_deps
         """
         self.name = 'alas'
-        self.entry = ModEntryInfo(name='alas', pack_update_deps=dict.fromkeys(names))
+        self.entry = ModEntry(data=ModEntryModel.build(name='alas', pack_deps=tuple(names)))
 
 
 def run_pack_list(names, root=SITE):
@@ -180,7 +180,7 @@ def run_pack_list(names, root=SITE):
     List the pack ledgers of a mod that declares the names.
 
     Args:
-        names (Iterable[str]): Names declared in pack_update_deps
+        names (Iterable[str]): Names declared in pack_deps
         root (str): Path of the site-packages directory. Defaults to SITE
 
     Returns:
@@ -194,7 +194,7 @@ def run_aggregate(names=(), root=SITE):
     List the distributions of a site-packages directory, the aggregate.
 
     Args:
-        names (Iterable[str]): Names declared in pack_update_deps of the
+        names (Iterable[str]): Names declared in pack_deps of the
             mod. Defaults to (), no ledger is declared
         root (str): Path of the site-packages directory. Defaults to SITE
 
@@ -651,6 +651,72 @@ class TestMinimalIo:
         assert opened == [f'{SITE}/demo-1.0.dist-info/METADATA']
 
 
+class TestFind:
+    """The lookup of one distribution by its normalized name."""
+
+    def test_dist_info(self, fs):
+        """The installation of the name is found."""
+        create_dist_info(fs, 'demo-1.0.dist-info', metadata('demo', '1.0'))
+        dist = PipList(SITE).find('demo')
+        assert (dist.name, dist.version, dist.dist_key) == ('demo', '1.0', 'demo')
+
+    @pytest.mark.parametrize('name', ['ruamel.yaml', 'ruamel_yaml', 'Ruamel.Yaml'])
+    def test_name_style(self, fs, name):
+        """The name is a dist-key, any case and separator style is the same lookup."""
+        create_dist_info(
+            fs, 'ruamel_yaml-0.18.6.dist-info', metadata('ruamel.yaml', '0.18.6'))
+        assert PipList(SITE).find(normalize_name(name)).version == '0.18.6'
+
+    def test_egg_info(self, fs):
+        """A legacy installation is found by the name of its entry."""
+        create_egg_info(fs, 'alasio.egg-info', metadata('alasio', '0.0.1'))
+        assert PipList(SITE).find('alasio').version == '0.0.1'
+
+    def test_missing(self, fs):
+        """A name the directory holds no entry of is None."""
+        create_dist_info(fs, 'demo-1.0.dist-info', metadata('demo', '1.0'))
+        assert PipList(SITE).find('httpx') is None
+
+    def test_missing_directory(self, fs):
+        """A directory that does not exist holds nothing, no error."""
+        assert PipList(SITE).find('demo') is None
+
+    def test_lowest_path_of_several_entries(self, fs):
+        """The entry list() keeps is the one find() answers: the lowest path."""
+        create_dist_info(fs, 'demo-2.0.dist-info', metadata('demo', '2.0'))
+        create_dist_info(fs, 'demo-1.0.dist-info', metadata('demo', '1.0'))
+        assert PipList(SITE).find('demo').version == '1.0'
+
+    def test_a_name_that_extends_the_lookup_is_not_matched(self, fs):
+        """The separator of the entry name decides the match, a distribution
+        whose name starts with the same letters is another one."""
+        create_dist_info(fs, 'demo_pkg-1.0.dist-info', metadata('demo_pkg', '1.0'))
+        create_dist_info(fs, 'demo2-1.0.dist-info', metadata('demo2', '1.0'))
+        assert PipList(SITE).find('demo') is None
+
+    def test_an_entry_of_another_name_is_not_found(self, fs):
+        """The metadata names the distribution of an entry, the same rule as
+        the listing."""
+        create_dist_info(fs, 'demo-1.0.dist-info', metadata('other', '1.0'))
+        assert PipList(SITE).find('demo') is None
+
+    def test_opens_the_metadata_of_the_match_only(self, fs, monkeypatch):
+        """The metadata of the other installations is never read."""
+        create_dist_info(fs, 'demo-1.0.dist-info', metadata('demo', '1.0'))
+        create_dist_info(fs, 'alasio-0.0.1.dist-info', metadata('alasio', '0.0.1'))
+        opened = []
+        real_open = builtins.open
+
+        def open_record(file, *args, **kwargs):
+            if isinstance(file, str) and file.startswith(SITE):
+                opened.append(file)
+            return real_open(file, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, 'open', open_record)
+        assert PipList(SITE).find('demo').version == '1.0'
+        assert opened == [f'{SITE}/demo-1.0.dist-info/METADATA']
+
+
 class TestLogging:
     def test_silent_on_a_healthy_directory(self, fs):
         """A listing of a healthy directory logs nothing."""
@@ -659,6 +725,72 @@ class TestLogging:
             assert len(run_list()) == 1
         assert capture.fd.logs == []
         assert capture.backend.logs == []
+
+
+class TestIterMetadataHeaders:
+    """The header parser the client, the release side and the pack_deps tool share."""
+
+    def test_repeated_headers_are_kept(self):
+        """Requires-Dist repeats once per dependency, a dict would lose all but one."""
+        content = (
+            'Metadata-Version: 2.1\n'
+            'Name: demo\n'
+            'Requires-Dist: a>=1\n'
+            'Requires-Dist: b\n'
+        )
+
+        assert list(pip_list.iter_metadata_headers(content)) == [
+            ('metadata-version', '2.1'),
+            ('name', 'demo'),
+            ('requires-dist', 'a>=1'),
+            ('requires-dist', 'b'),
+        ]
+
+    def test_the_body_is_not_read(self):
+        """The body holds the long description, the headers end at the empty line."""
+        content = 'Name: demo\n\nRequires-Dist: not-a-header\n'
+
+        assert list(pip_list.iter_metadata_headers(content)) == [('name', 'demo')]
+
+    def test_a_folded_continuation_is_joined(self):
+        content = 'Name: demo\nSummary: a summary\n  continued here\nVersion: 1.0\n'
+
+        assert list(pip_list.iter_metadata_headers(content)) == [
+            ('name', 'demo'),
+            ('summary', 'a summary continued here'),
+            ('version', '1.0'),
+        ]
+
+    def test_a_width_only_continuation(self):
+        """A line of the width only continues a folded value, it is not the body."""
+        content = 'Name: demo\nLicense: The MIT License\n        \n        Copyright 2020\n        \nVersion: 1.0\n'
+
+        assert list(pip_list.iter_metadata_headers(content)) == [
+            ('name', 'demo'),
+            ('license', 'The MIT License Copyright 2020'),
+            ('version', '1.0'),
+        ]
+
+    def test_the_line_endings(self):
+        """A file written on Windows is read, the line endings dropped."""
+        content = 'Name: demo\r\nVersion: 1.0\r\n\r\nbody\r\n'
+
+        assert list(pip_list.iter_metadata_headers(content)) == [
+            ('name', 'demo'),
+            ('version', '1.0'),
+        ]
+
+    def test_a_header_without_a_value(self):
+        content = 'X-Empty:\n part\nName: demo\n'
+
+        assert list(pip_list.iter_metadata_headers(content)) == [
+            ('x-empty', 'part'),
+            ('name', 'demo'),
+        ]
+
+    def test_an_empty_content(self):
+        assert list(pip_list.iter_metadata_headers('')) == []
+        assert list(pip_list.iter_metadata_headers('\n')) == []
 
 
 class TestReadHeaders:
@@ -688,6 +820,23 @@ class TestReadHeaders:
             'name': 'demo',
             'x-long': 'part 1 part 2',
             'x-empty': 'part 3',
+        }
+
+    def test_width_only_continuation(self, fs):
+        """A continuation line of the width only keeps the headers after it.
+
+        The License of a built METADATA is a long folded value, and the blank
+        lines inside it are written as spaces: the headers after it, e.g.
+        Requires-Dist, are still headers of the block.
+        """
+        file = f'{SITE}/demo-1.0.dist-info/METADATA'
+        fs.create_file(file, contents=(
+            'Name: demo\nLicense: The MIT License\n        \n        Copyright (c) 2020\n        \n'
+            'Requires-Dist: hpack<5,>=4.2\n\nbody\n'))
+        assert pip_list._read_headers(file) == {
+            'name': 'demo',
+            'license': 'The MIT License Copyright (c) 2020',
+            'requires-dist': 'hpack<5,>=4.2',
         }
 
     def test_duplicate_header(self, fs):

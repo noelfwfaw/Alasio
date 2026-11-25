@@ -5,7 +5,7 @@ The development server of the packs: it serves the whole pack folder of a run
 directory, with the names and the layout the packs have on the disk, so a pack
 can be fetched with curl or opened in a browser without a deployment. It only
 reads the folder, generating the packs is the job of the pack server itself,
-see PackRepoGen.
+see repo.
 
 The url mirrors the path under the run directory: the file
 
@@ -31,6 +31,7 @@ the run directory are served:
 
 import argparse
 import functools
+import sys
 
 import trio
 from hypercorn.config import Config
@@ -39,16 +40,12 @@ from starlette.applications import Starlette
 from starlette.routing import Mount
 from starlette.staticfiles import StaticFiles
 
-from alasio.deploy_dev.pack_server.gate import check_run_dir
+from alasio.deploy_dev.pack_server.gate import RunDirError, check_run_dir
+from alasio.deploy_dev.pack_server.repo_base import PACK_FOLDER, PACKREPO_FOLDER
+from alasio.deploy_dev.pack_server.repo_latest import LATEST_FILE
 from alasio.ext import env
 from alasio.ext.path import PathStr
 from alasio.logger import logger
-
-# folder of the repos in the run directory, see PackRepoModel
-PACK_FOLDER = 'pack'
-
-# folder of the packs of a repo, the subfolder of a repo folder
-PACKREPO_FOLDER = 'packrepo'
 
 # url prefix the packs are served under, the folder name
 PACK_URL = f'/{PACK_FOLDER}'
@@ -123,10 +120,16 @@ def create_config(args=None):
     parsed_args = parser.parse_args(args)
     if parsed_args.root:
         env.set_project_root(parsed_args.root)
+    # the check runs before the first log line, so a mistyped root is refused
+    # instead of being created by the log file, see run.main
+    try:
+        check_run_dir()
+    except RunDirError as e:
+        print(f'error: {e}', file=sys.stderr)
+        raise SystemExit(2) from None
     # the project root must be set before the first log: the log file of the
     # process is decided by the first write, see LogWriter.file
     logger.hr('Start', level=0)
-    check_run_dir()
     folder = pack_folder()
 
     config = Config()
@@ -147,7 +150,8 @@ async def serve_app(args=None):
     address = config.bind[0]
     logger.info(f'Serving "{folder}" at http://{address}{PACK_URL}/')
     for name in folder.iter_foldernames():
-        logger.info(f'http://{address}{PACK_URL}/{name}/{PACKREPO_FOLDER}/latest.pack')
+        logger.info(
+            f'http://{address}{PACK_URL}/{name}/{PACKREPO_FOLDER}/{LATEST_FILE}')
     await serve(create_app(folder), config)
 
 

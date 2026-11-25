@@ -4,6 +4,7 @@ name: CI
 #                                                                    +---> wheel
 # frontend (1) ------------------------------------------------------+
 # webapp   (1) ------------------------------------------------------+
+# smoke    (1) ------------------------------------------------------+
 #
 # The accelerator libraries are compiled once per platform by the speedup job
 # and handed to the python-tests matrix as speedup-<os>, so the 21 test jobs
@@ -372,11 +373,84 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # The Content-Security-Policy is the one thing that breaks the app silently
+  # and totally: a hash that does not match its inline script leaves a blank
+  # window, and no unit test can see it (the browser is the judge). This job
+  # builds both pages and loads them in the real engine, the electron 22 /
+  # chromium 108 the client ships. It runs beside frontend and webapp instead
+  # of extending them: it needs the electron binary they deliberately skip.
+  #
+  # Windows is the platform of the product: the engine runs there unmodified,
+  # with no display server and no extra shared libraries to install, so the
+  # smoke measures what the user actually gets.
+  #
+  # Each smoke runs three phases: the real build must load and boot with no
+  # violation; removing one hash must be blocked by the engine; removing the
+  # bootstrap hash must leave the app unstarted. The negative phases are what
+  # prove the policy is enforced instead of merely absent.
+  smoke:
+    name: smoke
+    runs-on: windows-latest
+    timeout-minutes: 30
+    # the workflow default shell is bash (the other jobs run on ubuntu); on
+    # windows powershell is the shell pnpm and node are set up for
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: pnpm/action-setup@v6.1.0
+        with:
+          version: "10.33.2"
+
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: |
+            frontend/pnpm-lock.yaml
+            webapp/pnpm-lock.yaml
+
+      # unlike the webapp job, the electron binary is the point of this job
+      - run: pnpm install --frozen-lockfile
+        working-directory: frontend
+
+      - run: pnpm install --frozen-lockfile
+        working-directory: webapp
+
+      - run: pnpm run build
+        working-directory: frontend
+
+      - run: pnpm run build
+        working-directory: webapp
+
+      # the frontend smoke borrows the electron of webapp, the only copy in
+      # the repo
+      - name: Smoke frontend
+        run: pnpm run smoke:csp
+        working-directory: frontend
+
+      - name: Smoke webapp
+        run: pnpm run smoke:csp
+        working-directory: webapp
+
+      # the locale packs are part of the electron distribution, which the webapp
+      # job deliberately does not download: the guard over them runs here, where
+      # the binary the client ships is installed
+      - name: Locale packs
+        run: pnpm exec vitest run main/locales.test.ts
+        working-directory: webapp
+
   wheel:
     name: wheel
-    needs: [python-tests, minimum, frontend, webapp]
+    needs: [python-tests, minimum, frontend, webapp, smoke]
     runs-on: ubuntu-22.04
     timeout-minutes: 30
+    # the last step tags the version it built, the tag is the only way a
+    # version reaches pypi, so this job is the one allowed to write to the repo
+    permissions:
+      contents: write
     steps:
       # the wheel builder reads the commit objects of .git, not the worktree
       - uses: actions/checkout@v5
@@ -425,15 +499,78 @@ jobs:
       - name: Verify wheel
         run: uv run --no-project --python .venv python -m alasio.deploy_dev.wheel verify dist
 
+      # The sdist is built and verified above but never published anywhere: it
+      # carries the alasio package tree only, so a wheel built from it would
+      # ship without the frontend and webapp the release wheel embeds. Only the
+      # exact artifact the matrix tested is distributed.
       - name: Checksums
-        run: sha256sum dist/*.whl dist/*.tar.gz > dist/SHA256SUMS
+        run: sha256sum dist/*.whl > dist/SHA256SUMS
 
       - uses: actions/upload-artifact@v7.0.2
         with:
           name: alasio-dist
           path: |
             dist/*.whl
-            dist/*.tar.gz
             dist/SHA256SUMS
           if-no-files-found: error
           retention-days: 30
+
+      # The tag is the release switch, and it is created here only: the last
+      # job of a run in which every gate above passed and the artifacts exist.
+      # An old tag on another commit means the version was not bumped, which is
+      # the normal state of a fix commit and releases nothing. The release
+      # workflow never creates a tag, it only publishes the one found here.
+      - name: Tag the built version
+        id: tag
+        if: github.ref == 'refs/heads/master'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          wheels=(dist/*.whl)
+          if [ "${#wheels[@]}" -ne 1 ]; then
+            echo "::error::expected exactly one wheel, found ${#wheels[@]}"
+            exit 1
+          fi
+          version=$(basename "${wheels[0]}")
+          version=${version#alasio-}
+          version=${version%-py3-none-any.whl}
+          tag="v$version"
+          sha=$(git rev-parse HEAD)
+
+          # git answers without an api call: a tag on this very commit means a
+          # rerun, a tag on any other commit means the version was not bumped,
+          # and no tag at all means this run is the release. The second pattern
+          # asks for the peeled ref of an annotated tag, so the last sha is the
+          # tagged commit either way.
+          existing=$(git ls-remote origin "refs/tags/$tag" "refs/tags/$tag^{}" | cut -f1 | tail -n1)
+          if [ -z "$existing" ]; then
+            gh api -X POST "repos/{owner}/{repo}/git/refs" \
+              -f ref="refs/tags/$tag" -f sha="$sha" > /dev/null
+            echo "Tagged $tag at $sha"
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          elif [ "$existing" = "$sha" ]; then
+            echo "$tag already points to $sha"
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::$tag already points to $existing, the version was not bumped, nothing is released"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Publishing is the continuation of this run, not a second run of the
+      # same checks: the artifacts only leave for pypi when this run tagged its
+      # own version. repository_dispatch is one of the two events a
+      # GITHUB_TOKEN may create, which is what makes the hand-off possible
+      # without a deploy key. A commit that did not bump the version stays a
+      # single run in the actions list instead of adding a skipped one.
+      - name: Trigger the release
+        if: steps.tag.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh api -X POST "repos/{owner}/{repo}/dispatches" --input - <<JSON
+          {"event_type": "alasio-release", "client_payload": {"run_id": "${{ github.run_id }}"}}
+          JSON

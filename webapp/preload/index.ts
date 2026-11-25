@@ -5,6 +5,8 @@ import {
   IPC_BACKEND_READY,
   IPC_BACKEND_START,
   IPC_CONFIRM_CLOSE,
+  IPC_EMBEDDED_ROUTE_GET_SYNC,
+  IPC_EMBEDDED_ROUTE_SET,
   IPC_SHARED_STATE_GET,
   IPC_SHARED_STATE_GET_SYNC,
   IPC_SHARED_STATE_SET_DPI_SCALING,
@@ -14,7 +16,9 @@ import {
   IPC_SHUTDOWN_STAGE,
   IPC_WINDOW_CONFIRM_CLOSE,
   IPC_WINDOW_HIDE,
+  IPC_WINDOW_IS_MAXIMIZED,
   IPC_WINDOW_MAXIMIZE,
+  IPC_WINDOW_MAXIMIZED_CHANGE,
   IPC_WINDOW_MINIMIZE,
 } from "../shared/ipc";
 
@@ -24,6 +28,15 @@ const api = {
   maximizeWindow: () => ipcRenderer.send(IPC_WINDOW_MAXIMIZE),
   hideWindow: () => ipcRenderer.send(IPC_WINDOW_HIDE),
   confirmClose: () => ipcRenderer.invoke(IPC_WINDOW_CONFIRM_CLOSE),
+  // Current maximize state, read once by the title bar on mount (the window
+  // can already be maximized before the renderer subscribes to the push).
+  isWindowMaximized: () => ipcRenderer.invoke(IPC_WINDOW_IS_MAXIMIZED) as Promise<boolean>,
+  // Fires on every maximize/unmaximize, whatever triggered it.
+  onWindowMaximizedChange: (callback: (maximized: boolean) => void) => {
+    const handler = (_: any, maximized: boolean) => callback(maximized);
+    ipcRenderer.on(IPC_WINDOW_MAXIMIZED_CHANGE, handler);
+    return () => ipcRenderer.removeListener(IPC_WINDOW_MAXIMIZED_CHANGE, handler);
+  },
 
   // Backend events
   onBackendLog: (callback: (log: string) => void) => {
@@ -62,6 +75,13 @@ const api = {
   setLanguage: (lang: string) => ipcRenderer.send(IPC_SHARED_STATE_SET_LANGUAGE, lang),
   setTheme: (theme: string) => ipcRenderer.send(IPC_SHARED_STATE_SET_THEME, theme),
   setDpiScaling: (dpiScaling: boolean) => ipcRenderer.send(IPC_SHARED_STATE_SET_DPI_SCALING, dpiScaling),
+
+  // Route of the embedded web app. The main process keeps it in memory, so a
+  // window reload reopens the page the user was on instead of the app root.
+  setEmbeddedRoute: (route: string) => ipcRenderer.send(IPC_EMBEDDED_ROUTE_SET, route),
+  // Synchronous variant: the iframe has to be mounted at the remembered route
+  // on the first paint, before any async round trip could resolve.
+  getEmbeddedRouteSync: () => ipcRenderer.sendSync(IPC_EMBEDDED_ROUTE_GET_SYNC) as string | null,
 
   // Backend lifecycle
   startBackend: () => ipcRenderer.invoke(IPC_BACKEND_START),

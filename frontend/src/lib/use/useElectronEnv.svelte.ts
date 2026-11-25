@@ -2,8 +2,8 @@
 //
 // The webapp loads the frontend in an iframe with `?embedded=electron` and
 // overlays its window controls (hide/minimize/maximize/close) at the top
-// right of the page. The frontend can reserve space for them in its own
-// header (see `electronEnv.shouldAvoid`).
+// right of the page. The width the header has to keep clear for them is
+// resolved by `$lib/window/frame.svelte`.
 //
 // There are two independent concepts:
 // - `isElectronSession`: the ?embedded=electron URL query injected by the
@@ -13,22 +13,14 @@
 //   `alasio:*` postMessage traffic from the host. Remote browser sessions
 //   never receive such messages and stay in per-client mode.
 //
+// Uplinks to the host live here too: `reportRoute` tells it which page to
+// reopen after a window reload (see the webapp's embeddedRoute module).
+//
 // NOTE: useLocalStorage is not reused here because its $effect runes cannot
 // be created at module top level (svelte 5 throws effect_orphan outside
 // component initialization). Persistence is done manually instead.
 
-export type WindowControlsAvoidMode = "auto" | "always" | "never";
-
-// Window controls: hide + minimize + maximize + close, each 36px (w-9) wide
-// with 4px (gap-1) gaps between them and 6px (pr-1.5) right margin,
-// plus 6px spacing from the header content on the left, so the buttons
-// have an even 6px margin on all four sides (the 6px vertical offset
-// inside the 48px (h-12) title bar)
-// 4 * 36 + 3 * 4 + 6 + 6 = 168
-export const WINDOW_CONTROLS_WIDTH = 168;
-
 const EMBEDDED_KEY = "alasio-embedded";
-const AVOID_KEY = "alasio-window-controls-avoid";
 
 function readStored<T>(key: string, fallback: T): T {
   try {
@@ -84,34 +76,29 @@ window.addEventListener("message", (event: MessageEvent) => {
   }
 });
 
-// Avoidance mode: always mirrors localStorage (single source of truth).
-// An electron session resets it to the default once at startup through the
-// setter (see below), so refresh restores the defaults while a later
-// non-electron visit keeps the last persisted setting.
-let avoidMode = $state<WindowControlsAvoidMode>(readStored(AVOID_KEY, "auto"));
-
 export const electronEnv = {
   get embedded() {
     return embedded;
   },
-
-  get avoidMode() {
-    return avoidMode;
-  },
-
-  set avoidMode(mode: WindowControlsAvoidMode) {
-    avoidMode = mode;
-    writeStored(AVOID_KEY, mode);
-  },
-
-  /** Whether the header should reserve space for the electron window controls */
-  get shouldAvoid() {
-    return avoidMode === "always" || (avoidMode === "auto" && (embedded || isElectron.value));
-  },
 };
 
-// Electron session: reset the avoidance mode to the default on every load
-// (through the setter, so the reset is persisted as well).
-if (isElectronSession) {
-  electronEnv.avoidMode = "auto";
+/**
+ * Report the route the page is on to the host (the webapp window).
+ *
+ * The host reopens it after the window is reloaded: a reload remounts the
+ * iframe at its URL, and without the route the app root opens the first
+ * configuration instead of the page the user was on. The host rebuilds the
+ * rest of the mount URL (theme, language, window controls) itself, so only
+ * the path is sent.
+ *
+ * Args:
+ *     route (str): Path of the current page, query and hash included
+ */
+export function reportRoute(route: string) {
+  // A remote browser has no host: posting goes to its own window. The query
+  // covers the first frames (no downlink arrived yet), `isElectron` covers the
+  // rest of the session -- the report is then sent again whenever a downlink
+  // proves the host is there.
+  if (!isElectronSession && !isElectron.value) return;
+  window.parent.postMessage({ type: "alasio:route", route }, "*");
 }

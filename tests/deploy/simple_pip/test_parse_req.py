@@ -10,8 +10,9 @@ option) is skipped, and two different versions of one name raise a ValueError.
 import pytest
 
 from alasio.deploy.simple_pip import parse_req
-from alasio.deploy.simple_pip.parse_req import Requirements
+from alasio.deploy.simple_pip.parse_req import DepInfo, Requirements
 from alasio.deploy.simple_pip.pip_list import PipList
+from alasio.logger import logger
 from alasio.testing.filesystem import fs  # noqa: F401
 
 # Root of the tests, a site-packages look-alike
@@ -26,6 +27,16 @@ def parse_requirements(content):
         dict[str, str]: PEP 503 normalized name -> exact version
     """
     return Requirements(content).dict_deps
+
+
+def parse_dep_infos(content):
+    """
+    dict_pins of a requirements content.
+
+    Returns:
+        dict[str, DepInfo]: PEP 503 normalized name -> pin and source
+    """
+    return Requirements(content).dict_pins
 
 
 class TestParsePin:
@@ -191,20 +202,26 @@ typing-extensions==4.12.2
         }
 
     def test_conflicting(self):
-        """Two different versions of one name raise a ValueError on the read."""
+        """Two different versions keep the first, the later one is a warning."""
         parser = Requirements('httpx==0.28.1\nhttpx==0.28.2')
-        with pytest.raises(ValueError, match='Conflicting versions of "httpx"'):
-            _ = parser.dict_deps
+        with logger.mock_capture_writer() as capture:
+            assert parser.dict_deps == {'httpx': '0.28.1'}
+        assert capture.concat() == """\
+WARNING | Conflicting versions of "httpx" in the requirements: "0.28.1" and "0.28.2", keeping "0.28.1"
+"""
 
     def test_conflicting_normalized(self):
         """The conflict is checked on the normalized name."""
         content = 'PyYAML==6.0.1\npyyaml==6.0.2'
-        with pytest.raises(ValueError, match='Conflicting versions of "pyyaml"'):
-            _ = parse_requirements(content)
+        with logger.mock_capture_writer() as capture:
+            assert parse_requirements(content) == {'pyyaml': '6.0.1'}
+        assert capture.concat() == """\
+WARNING | Conflicting versions of "pyyaml" in the requirements: "6.0.1" and "6.0.2", keeping "6.0.1"
+"""
 
 
 class TestSharedRules:
-    """The pin rules the release side reuses (alasio.deploy_dev.pack_server.parse_dep)."""
+    """The requirement text rules the release side reuses (alasio.deploy_dev.pack_server.parse_dep)."""
 
     def test_parse_requirement_keeps_the_name_as_written(self):
         """The pin holds the name as written, the caller normalizes it."""
@@ -217,12 +234,158 @@ class TestSharedRules:
         """A declaration that pins no exact version has no pin."""
         assert parse_req.parse_requirement('PyYAML>=6.0.1') is None
 
-    def test_build_pins(self):
-        """The pins are keyed by the normalized name."""
-        assert parse_req.build_pins([('PyYAML', '6.0.1'), ('ruamel.yaml', '0.18.6')]) == {
-            'pyyaml': '6.0.1',
-            'ruamel-yaml': '0.18.6',
-        }
+
+class TestFromLine:
+    """The whole requirement text: ranges, extras and markers included."""
+
+    def test_a_plain_name(self):
+        assert parse_req.RequirementSpec.from_line('numpy') == parse_req.RequirementSpec(name='numpy')
+
+    def test_a_range(self):
+        spec = parse_req.RequirementSpec.from_line('numpy>=1.24,<2')
+
+        assert spec.name == 'numpy'
+        # the text is kept as it is written, the parsed form is `specifiers`
+        assert spec.specifier == '>=1.24,<2'
+        assert str(spec.specifiers) == '<2,>=1.24'
+
+    def test_an_exact_pin_with_extras(self):
+        spec = parse_req.RequirementSpec.from_line('alasio[backend,image]==2.0.3')
+
+        assert spec == parse_req.RequirementSpec(
+            name='alasio', extras=('backend', 'image'), specifier='==2.0.3')
+
+    def test_the_name_is_kept_as_written(self):
+        assert parse_req.RequirementSpec.from_line('PyYAML==6.0').name == 'PyYAML'
+
+    def test_a_marker_is_kept_as_written(self):
+        spec = parse_req.RequirementSpec.from_line('colorama; sys_platform == "win32"')
+
+        assert spec.marker == 'sys_platform == "win32"'
+        assert spec.specifier == ''
+
+    def test_every_operator_of_pep440(self):
+        for operator in ('==', '!=', '<=', '>=', '<', '>', '~=', '==='):
+            specifier = f'{operator}1.2.3'
+            assert parse_req.RequirementSpec.from_line(f'demo{specifier}').specifier == specifier
+
+    def test_a_wildcard(self):
+        assert parse_req.RequirementSpec.from_line('demo==1.2.*').specifier == '==1.2.*'
+
+    def test_the_parenthesized_form(self):
+        """The legacy metadata of a distribution writes the specifier in parentheses."""
+        spec = parse_req.RequirementSpec.from_line('deprecation (<3.0,>=2.0.6)')
+
+        assert spec == parse_req.RequirementSpec(
+            name='deprecation', specifier='<3.0,>=2.0.6')
+
+    def test_the_parenthesized_form_of_a_bare_name(self):
+        assert parse_req.RequirementSpec.from_line('demo ()') == parse_req.RequirementSpec(name='demo')
+
+    def test_a_direct_reference(self):
+        spec = parse_req.RequirementSpec.from_line(
+            'demo @ https://example.com/demo-1.0-py3-none-any.whl')
+
+        assert spec.url == 'https://example.com/demo-1.0-py3-none-any.whl'
+        assert spec.specifier == ''
+
+    def test_a_direct_reference_with_extras_and_a_marker(self):
+        spec = parse_req.RequirementSpec.from_line(
+            'demo[cli] @ git+https://example.com/demo.git ; python_version < "3.9"')
+
+        assert spec.extras == ('cli',)
+        assert spec.url == 'git+https://example.com/demo.git'
+        assert spec.marker == 'python_version < "3.9"'
+
+    @pytest.mark.parametrize('text', [
+        '',
+        '--hash=sha256:abcdef',
+        '-r base.txt',
+        'not a requirement !',
+        'demo>>>1.2',
+        'demo[bad extra]==1.0',
+        'demo-==1.0',
+        # an empty specifier in the set, which packaging rejects too
+        'demo>=1.0,,<2.0',
+        'demo>=1.0,',
+        # a union of ranges, which a PEP 440 specifier cannot express
+        'demo>=1.0,<2.0||>=3.0',
+    ])
+    def test_not_a_requirement(self, text):
+        assert parse_req.RequirementSpec.from_line(text) is None
+
+    def test_the_conjunction_of_the_question(self):
+        """A range with an exclusion is one specifier set, in every order."""
+        spec = parse_req.RequirementSpec.from_line('demo>=1.0,<2.0,!=1.4.1')
+
+        assert spec.specifier == '>=1.0,<2.0,!=1.4.1'
+        assert spec.pin_version is None
+        assert str(spec.specifiers) == '!=1.4.1,<2.0,>=1.0'
+
+
+class TestPinVersion:
+    """The version a requirement pins exactly, the cached property of it."""
+
+    @pytest.mark.parametrize('specifier, expected', [
+        ('==0.28.1', '0.28.1'),
+        ('==1!2.0+local.1', '1!2.0+local.1'),
+        ('', None),
+        ('>=0.28.1', None),
+        ('<=0.28.1', None),
+        ('~=0.28.0', None),
+        ('!=0.28.1', None),
+        ('===0.28.1', None),
+        ('==1.2.*', None),
+        ('==1.0,==2.0', None),
+        ('>=1.0,<2.0', None),
+        ('!=1.4.1,<2.0,>=1.0', None),
+    ])
+    def test_pin_version(self, specifier, expected):
+        spec = parse_req.RequirementSpec.from_line(f'demo{specifier}')
+
+        assert spec is not None, specifier
+        assert spec.pin_version == expected
+
+    def test_it_is_cached(self):
+        """The version is read once and kept on the requirement."""
+        spec = parse_req.RequirementSpec.from_line('demo==1.0')
+
+        assert spec.pin_version == '1.0'
+        assert 'pin_version' in spec.__dict__
+
+
+class TestSpecs:
+    """The requirements of a file, the ranges included."""
+
+    def test_a_range_is_kept(self):
+        parser = parse_req.Requirements('numpy>=1.24\nhttpx==0.28.1\n')
+
+        assert parser.specs == [
+            parse_req.RequirementSpec(name='numpy', specifier='>=1.24'),
+            parse_req.RequirementSpec(name='httpx', specifier='==0.28.1'),
+        ]
+
+    def test_the_annotations_and_options_are_not_requirements(self):
+        content = """\
+--extra-index-url https://example.com/simple
+httpx==0.28.1
+    # via demo (pyproject.toml)
+    # from https://pypi.org/simple
+"""
+        parser = parse_req.Requirements(content)
+
+        assert [spec.name for spec in parser.specs] == ['httpx']
+
+    def test_the_pins_are_the_exact_ones(self):
+        parser = parse_req.Requirements('numpy>=1.24\nruff==0.16.0\n')
+
+        assert parser.dict_deps == {'ruff': '0.16.0'}
+        assert [spec.name for spec in parser.specs] == ['numpy', 'ruff']
+
+    def test_a_line_that_is_not_a_requirement_is_skipped(self):
+        parser = parse_req.Requirements('not a requirement !\nhttpx==0.28.1\n')
+
+        assert [spec.name for spec in parser.specs] == ['httpx']
 
 
 class TestWithPipList:
@@ -244,3 +407,558 @@ class TestDependencies:
         """The file is parsed with string work, no pip of any kind is imported nor run."""
         assert 'pip' not in vars(parse_req)
         assert 'importlib' not in vars(parse_req)
+
+
+class TestDepInfo:
+    def test_default_source(self):
+        """A DepInfo without a source is a pin of the official PyPI."""
+        assert DepInfo('httpx', '0.28.1') == DepInfo('httpx', '0.28.1', '')
+
+    def test_plain_requirements(self):
+        """A requirements file without annotations has no source."""
+        assert parse_dep_infos('httpx==0.28.1\npyyaml==6.0.1') == {
+            'httpx': DepInfo('httpx', '0.28.1', ''),
+            'pyyaml': DepInfo('pyyaml', '6.0.1', ''),
+        }
+
+    def test_name_normalized(self):
+        """The name of a DepInfo is the normalized name, the key of the dict."""
+        assert parse_dep_infos('PyYAML==6.0.1') == {
+            'pyyaml': DepInfo('pyyaml', '6.0.1', ''),
+        }
+
+    def test_views(self):
+        """dict_deps and dict_sources are the views of the same pins."""
+        content = """\
+httpx==0.28.1
+    # from https://py38deps.github.io/py38deps/simple/
+pyyaml==6.0.1
+    # from https://example.com/simple
+"""
+        parser = Requirements(content)
+        assert parser.dict_pins == {
+            'httpx': DepInfo(
+                'httpx', '0.28.1', 'https://py38deps.github.io/py38deps/simple'),
+            'pyyaml': DepInfo('pyyaml', '6.0.1', 'https://example.com/simple'),
+        }
+        assert parser.dict_deps == {'httpx': '0.28.1', 'pyyaml': '6.0.1'}
+        assert parser.dict_sources == {
+            'httpx': 'https://py38deps.github.io/py38deps/simple',
+            'pyyaml': 'https://example.com/simple',
+        }
+
+    def test_cached(self):
+        """The pins and their views are parsed on the first read and cached."""
+        parser = Requirements('httpx==0.28.1')
+        assert parser.dict_deps is parser.dict_deps
+        assert parser.dict_pins is parser.dict_pins
+        assert parser.dict_sources is parser.dict_sources
+
+    def test_generator_yields_dep_info(self):
+        """The pin iterator yields DepInfo objects in the file order."""
+        parser = Requirements('httpx==0.28.1\npyyaml==6.0.1\n')
+        assert list(parser._iter_dep_info()) == [
+            DepInfo('httpx', '0.28.1', ''),
+            DepInfo('pyyaml', '6.0.1', ''),
+        ]
+
+
+class TestExtraIndex:
+    @pytest.mark.parametrize('content, expected', [
+        ('--extra-index-url https://example.com/simple\nhttpx==0.28.1\n',
+         'https://example.com/simple'),
+        ('--extra-index-url=https://example.com/simple\nhttpx==0.28.1\n',
+         'https://example.com/simple'),
+        ('--extra-index-url https://example.com/simple\n# a comment\nhttpx==0.28.1\n',
+         'https://example.com/simple'),
+        ('--extra-index-url https://example.com/simple  # a comment\nhttpx==0.28.1\n',
+         'https://example.com/simple'),
+        ('\n  \n--extra-index-url https://example.com/simple\n',
+         'https://example.com/simple'),
+        ('\ufeff--extra-index-url https://example.com/simple\n',
+         'https://example.com/simple'),
+        ('--extra-index-url https://example.com/simple/\n',
+         'https://example.com/simple/'),
+    ])
+    def test_url(self, content, expected):
+        """The URL of the first --extra-index-url is returned."""
+        assert Requirements(content).extra_index == expected
+
+    @pytest.mark.parametrize('content', [
+        '',
+        '\n  \n',
+        'httpx==0.28.1\n',
+        '--index-url https://example.com/simple\nhttpx==0.28.1\n',
+        'httpx==0.28.1\n# --extra-index-url https://example.com/simple\n',
+        '--extra-index-url\n',
+    ])
+    def test_none(self, content):
+        """An index-url, a comment or a plain file declares no extra index."""
+        assert Requirements(content).extra_index == ''
+
+    def test_cached(self):
+        """The property is read on the first access and cached."""
+        parser = Requirements('--extra-index-url https://example.com/simple\n')
+        assert parser.extra_index is parser.extra_index
+
+
+class TestAnnotationStyles:
+    @pytest.mark.parametrize('content, expected', [
+        # uv --annotation-style=split, the real Alas2026 output
+        ("""\
+anyio==4.15.1
+    # via
+    #   httpx2
+    #   starlette
+    # from https://py38deps.github.io/py38deps/simple/
+""", 'https://py38deps.github.io/py38deps/simple'),
+        # uv --annotation-style=line
+        ("""\
+anyio==4.15.1
+    # via httpx2, starlette
+    # from https://py38deps.github.io/py38deps/simple
+""", 'https://py38deps.github.io/py38deps/simple'),
+        # pip-compile split style, a source annotation
+        ("""\
+anyio==4.15.1
+    # via
+    #   httpx2
+    #   starlette
+    # from https://example.com/simple
+""", 'https://example.com/simple'),
+        # pip-compile line style, a source annotation
+        ("""\
+anyio==4.15.1
+    # via httpx2, starlette
+    # from https://example.com/simple
+""", 'https://example.com/simple'),
+        # the source annotation before the via annotations
+        ("""\
+anyio==4.15.1
+    # from https://example.com/simple
+    # via httpx2, starlette
+""", 'https://example.com/simple'),
+        # a comment that is not an annotation does not break the association
+        ("""\
+anyio==4.15.1
+    # via
+    #   httpx2
+    # a comment
+    # from https://example.com/simple
+    #   starlette
+""", 'https://example.com/simple'),
+        # an annotation without indentation
+        ('anyio==4.15.1\n# from https://example.com/simple\n', 'https://example.com/simple'),
+        # an inline from annotation
+        ('anyio==4.15.1  # from https://example.com/simple', 'https://example.com/simple'),
+    ])
+    def test_source(self, content, expected):
+        """Every annotation style of uv and pip-compile is read."""
+        assert parse_dep_infos(content) == {
+            'anyio': DepInfo('anyio', '4.15.1', expected),
+        }
+
+    @pytest.mark.parametrize('content', [
+        # pip-compile split style without a source
+        """\
+click==8.1.7
+    # via
+    #   -r requirements.in
+    #   flask
+""",
+        # pip-compile line style without a source
+        """\
+click==8.1.7
+    # via -r requirements.in, flask
+""",
+        # the setup.py and pyproject.toml origins of pip-compile
+        """\
+click==8.1.7
+    # via flask (setup.py)
+    # via waitress (pyproject.toml)
+""",
+        # an inline via comment
+        'click==8.1.7  # via flask',
+        # the header of pip-compile
+        """\
+#
+# This file is autogenerated by pip-compile with Python 3.8
+# by the following command:
+#
+#    pip-compile requirements.in
+#
+click==8.1.7
+""",
+    ])
+    def test_without_source(self, content):
+        """The via annotations and the comments are not a source."""
+        assert parse_dep_infos(content) == {
+            'click': DepInfo('click', '8.1.7', ''),
+        }
+
+    def test_comment_line_is_not_split_again(self):
+        """A comment line is one comment, a later '#' is not a new annotation."""
+        content = """\
+httpx==0.28.1
+    # via flask # from https://example.com/simple
+"""
+        assert parse_dep_infos(content) == {
+            'httpx': DepInfo('httpx', '0.28.1', ''),
+        }
+
+    def test_inline_comment_is_not_split_again(self):
+        """Only the first inline comment is taken, a later '#' is not a new one."""
+        content = 'httpx==0.28.1  # via flask  # from https://example.com/simple\n'
+        assert parse_dep_infos(content) == {
+            'httpx': DepInfo('httpx', '0.28.1', ''),
+        }
+
+    def test_blank_line_does_not_end_the_pin(self):
+        """A blank line keeps the pin, the annotation can follow it."""
+        content = 'httpx==0.28.1\n\n    # from https://example.com/simple\n'
+        assert parse_dep_infos(content) == {
+            'httpx': DepInfo('httpx', '0.28.1', 'https://example.com/simple'),
+        }
+
+    def test_options_do_not_end_the_pin(self):
+        """An option line belongs to the file, not to the pin before it."""
+        content = """\
+httpx==0.28.1
+--extra-index-url https://example.com/simple
+    # from https://example.com/simple
+"""
+        assert parse_dep_infos(content) == {
+            'httpx': DepInfo('httpx', '0.28.1', 'https://example.com/simple'),
+        }
+
+    def test_hash_continuation(self):
+        """The --hash lines of a pip-compile output are not part of the pin."""
+        content = """\
+--extra-index-url https://example.com/simple
+
+certifi==2024.2.2 \\
+    --hash=sha256:aaaa \\
+    --hash=sha256:bbbb
+    # via requests
+    # from https://example.com/simple
+"""
+        assert parse_dep_infos(content) == {
+            'certifi': DepInfo('certifi', '2024.2.2', 'https://example.com/simple'),
+        }
+
+    def test_real_alas2026_fragment(self):
+        """The annotations of the real requirements file are read."""
+        content = """\
+# This file is generated by `python -m dev_tools.requirements_compile`, do not edit it by hand.
+#
+# `--index-url https://pypi.org/simple` is not in the file on purpose.
+
+--extra-index-url https://py38deps.github.io/py38deps/simple/
+
+adbutils==0.11.0
+    # via
+    #   azurlaneautoscript (pyproject.toml)
+    #   uiautomator2
+    # from https://pypi.org/simple
+anyio==4.15.1
+    # via
+    #   httpx2
+    #   starlette
+    # from https://py38deps.github.io/py38deps/simple/
+av==18.1.0
+    # via azurlaneautoscript (pyproject.toml)
+    # from https://py38deps.github.io/py38deps/simple/
+"""
+        assert parse_dep_infos(content) == {
+            'adbutils': DepInfo('adbutils', '0.11.0', ''),
+            'anyio': DepInfo(
+                'anyio', '4.15.1', 'https://py38deps.github.io/py38deps/simple'),
+            'av': DepInfo('av', '18.1.0', 'https://py38deps.github.io/py38deps/simple'),
+        }
+
+
+class TestSourceNormalization:
+    @pytest.mark.parametrize('annotation, expected', [
+        ('https://example.com/simple', 'https://example.com/simple'),
+        ('https://example.com/simple/', 'https://example.com/simple'),
+        ('https://example.com/simple//', 'https://example.com/simple'),
+        ('HTTPS://Example.COM/simple/', 'https://example.com/simple'),
+        ('https://example.com:443/simple', 'https://example.com/simple'),
+        ('http://example.com:80/simple', 'http://example.com/simple'),
+        ('https://example.com:8443/simple/', 'https://example.com:8443/simple'),
+        ('https://user:pass@Example.COM/simple/', 'https://user:pass@example.com/simple'),
+        ('https://example.com', 'https://example.com'),
+        ('https://example.com/', 'https://example.com'),
+        ('https://example.com/simple?token=abc', 'https://example.com/simple?token=abc'),
+        # the encoding of the path and the query is kept
+        ('https://example.com/simple%2Frepo/?token=a%20b',
+         'https://example.com/simple%2Frepo?token=a%20b'),
+        # a fragment is not part of an index base url
+        ('https://example.com/simple/#frag', 'https://example.com/simple'),
+        ('http://[::1]:8080/simple/', 'http://[::1]:8080/simple'),
+        # a default port is not a part of the identity of an index, an IPv6
+        # literal keeps its brackets
+        ('https://[::1]:443/simple/', 'https://[::1]/simple'),
+    ])
+    def test_normalized(self, annotation, expected):
+        """The scheme, host, default port and trailing slashes are normalized."""
+        content = f'httpx==0.28.1\n    # from {annotation}\n'
+        assert parse_dep_infos(content) == {
+            'httpx': DepInfo('httpx', '0.28.1', expected),
+        }
+
+
+class TestNormalizeIndexUrl:
+    """The url rule the parser and the release side share, see normalize_index_url."""
+
+    @pytest.mark.parametrize('url, expected', [
+        ('https://example.com/simple', 'https://example.com/simple'),
+        ('https://Example.com/simple/', 'https://example.com/simple'),
+        ('HTTPS://Example.COM/simple//', 'https://example.com/simple'),
+        ('https://example.com:443/simple', 'https://example.com/simple'),
+        ('http://example.com:80/simple/', 'http://example.com/simple'),
+        ('https://example.com:8443/simple/', 'https://example.com:8443/simple'),
+        ('https://example.com', 'https://example.com'),
+        ('https://user:pass@Example.COM/simple/', 'https://user:pass@example.com/simple'),
+        ('https://example.com/simple?token=abc', 'https://example.com/simple?token=abc'),
+        # the two spellings of one index normalize to one url
+        ('https://py38deps.github.io/py38deps/simple/', 'https://py38deps.github.io/py38deps/simple'),
+        ('HTTPS://Py38Deps.GitHub.io/py38deps/simple', 'https://py38deps.github.io/py38deps/simple'),
+    ])
+    def test_normalized(self, url, expected):
+        """The scheme and the host are lowercased, the default port and the trailing slash dropped."""
+        assert parse_req.normalize_index_url(url) == expected
+
+    @pytest.mark.parametrize('url', [
+        '',
+        'not a url',
+        # not an http(s) url
+        'ftp://example.com/simple',
+        'file:///wheels/simple',
+        'git+https://example.com/repo',
+        # no scheme or no host
+        'example.com/simple',
+        '//example.com/simple',
+    ])
+    def test_not_an_index(self, url):
+        """A text that is not an http(s) url has no normalized form."""
+        assert parse_req.normalize_index_url(url) == ''
+
+
+class TestOfficialSource:
+    @pytest.mark.parametrize('annotation', [
+        'https://pypi.org/simple',
+        'https://pypi.org/simple/',
+        'HTTPS://PyPI.ORG/simple',
+        'https://pypi.org:443/simple/',
+    ])
+    def test_undefined(self, annotation):
+        """The official PyPI is no source, the download side probes the mirrors."""
+        content = f'httpx==0.28.1\n    # from {annotation}\n'
+        assert parse_dep_infos(content) == {
+            'httpx': DepInfo('httpx', '0.28.1', ''),
+        }
+
+    def test_dict_sources(self):
+        """The official annotation is not in dict_sources."""
+        content = 'httpx==0.28.1\n    # from https://pypi.org/simple\n'
+        assert Requirements(content).dict_sources == {'httpx': ''}
+
+    def test_official_does_not_conflict(self):
+        """An official annotation is no source, it conflicts with nothing."""
+        content = """\
+httpx==0.28.1
+    # from https://pypi.org/simple
+    # from https://example.com/simple
+"""
+        assert parse_dep_infos(content) == {
+            'httpx': DepInfo('httpx', '0.28.1', 'https://example.com/simple'),
+        }
+
+
+class TestUndefinedSource:
+    @pytest.mark.parametrize('source', [
+        # a distribution file, not an index
+        'https://example.com/httpx-0.28.1-py3-none-any.whl',
+        'https://example.com/httpx-0.28.1.tar.gz',
+        'https://example.com/httpx-0.28.1.zip',
+        # a source that is not http(s)
+        'file:///wheels/simple',
+        'git+https://example.com/repo',
+        'ftp://example.com/simple',
+        # a malformed source
+        'pypi.org/simple',
+        'https://',
+        'https:///simple',
+        'https://example.com:bad/simple',
+    ])
+    def test_undefined(self, source):
+        """A source that is not an index is a warning, the source is undefined."""
+        content = f'httpx==0.28.1\n    # from {source}\n'
+        with logger.mock_capture_writer() as capture:
+            pins = parse_dep_infos(content)
+        assert pins == {'httpx': DepInfo('httpx', '0.28.1', '')}
+        assert capture.concat() == f"""\
+WARNING | The "# from" annotation of "httpx" is not an index url: {source!r}, the source is undefined
+"""
+
+
+class TestUnparseableSource:
+    def test_not_a_url(self):
+        """A '# from' text that is not a URL is a warning, the pin is official."""
+        content = 'httpx==0.28.1\n    # from <unknown>\n'
+        with logger.mock_capture_writer() as capture:
+            pins = parse_dep_infos(content)
+        assert pins == {'httpx': DepInfo('httpx', '0.28.1', '')}
+        assert capture.concat() == """\
+WARNING | The "# from" annotation of "httpx" is not an index url: '<unknown>', the source is undefined
+"""
+
+    def test_from_before_the_first_pin(self):
+        """A '# from' without a pin before it is ignored."""
+        content = '# from https://pypi.org/simple\nhttpx==0.28.1\n'
+        with logger.mock_capture_writer() as capture:
+            pins = parse_dep_infos(content)
+        assert pins == {'httpx': DepInfo('httpx', '0.28.1', '')}
+        assert capture.concat() == ''
+
+    def test_from_after_a_declaration_without_pin(self):
+        """A '# from' after a declaration that is not a pin is ignored."""
+        content = 'httpx>=0.28.1\n    # from https://pypi.org/simple\npyyaml==6.0.1\n'
+        with logger.mock_capture_writer() as capture:
+            pins = parse_dep_infos(content)
+        assert pins == {'pyyaml': DepInfo('pyyaml', '6.0.1', '')}
+        assert capture.concat() == ''
+
+    def test_extra_index_without_provided_source(self):
+        """An extra index without a provided source is one summary warning."""
+        content = """\
+--extra-index-url https://py38deps.github.io/py38deps/simple/
+httpx==0.28.1
+pyyaml==6.0.1
+"""
+        with logger.mock_capture_writer() as capture:
+            pins = parse_dep_infos(content)
+        assert pins == {
+            'httpx': DepInfo('httpx', '0.28.1', ''),
+            'pyyaml': DepInfo('pyyaml', '6.0.1', ''),
+        }
+        assert capture.concat() == """\
+WARNING | 2 pins have no provided source, treated as official: the requirements file declares the extra index "https://py38deps.github.io/py38deps/simple/"
+"""
+
+    def test_extra_index_with_a_provided_source(self):
+        """A pin from a provided source suppresses the summary warning."""
+        content = """\
+--extra-index-url https://py38deps.github.io/py38deps/simple/
+httpx==0.28.1
+    # from https://example.com/simple
+"""
+        with logger.mock_capture_writer() as capture:
+            pins = parse_dep_infos(content)
+        assert pins == {
+            'httpx': DepInfo('httpx', '0.28.1', 'https://example.com/simple'),
+        }
+        assert capture.concat() == ''
+
+    def test_extra_index_with_an_official_source(self):
+        """The official PyPI is no provided source, the summary warning stays."""
+        content = """\
+--extra-index-url https://py38deps.github.io/py38deps/simple/
+httpx==0.28.1
+    # from https://pypi.org/simple
+"""
+        with logger.mock_capture_writer() as capture:
+            pins = parse_dep_infos(content)
+        assert pins == {
+            'httpx': DepInfo('httpx', '0.28.1', ''),
+        }
+        assert capture.concat() == """\
+WARNING | 1 pins have no provided source, treated as official: the requirements file declares the extra index "https://py38deps.github.io/py38deps/simple/"
+"""
+
+
+class TestSourceConflicts:
+    def test_one_pin_two_sources(self):
+        """Two different '# from' annotations keep the first, the later one is a warning."""
+        content = """\
+httpx==0.28.1
+    # from https://example.com/simple
+    # from https://py38deps.github.io/py38deps/simple
+"""
+        with logger.mock_capture_writer() as capture:
+            pins = parse_dep_infos(content)
+        assert pins == {'httpx': DepInfo('httpx', '0.28.1', 'https://example.com/simple')}
+        assert capture.concat() == """\
+WARNING | Conflicting sources of "httpx" in the requirements: "https://example.com/simple" and "https://py38deps.github.io/py38deps/simple", keeping "https://example.com/simple"
+"""
+
+    def test_one_pin_two_spellings_of_the_same_source(self):
+        """Two spellings of one source are one source."""
+        content = """\
+httpx==0.28.1
+    # from https://example.com/simple
+    # from https://Example.COM/simple/
+"""
+        with logger.mock_capture_writer() as capture:
+            pins = parse_dep_infos(content)
+        assert pins == {
+            'httpx': DepInfo('httpx', '0.28.1', 'https://example.com/simple'),
+        }
+        assert capture.concat() == ''
+
+    def test_duplicated_pin_different_sources(self):
+        """Two lines of one pin with different sources keep the first source."""
+        content = """\
+httpx==0.28.1
+    # from https://example.com/simple
+httpx==0.28.1
+    # from https://py38deps.github.io/py38deps/simple
+"""
+        with logger.mock_capture_writer() as capture:
+            pins = parse_dep_infos(content)
+        assert pins == {'httpx': DepInfo('httpx', '0.28.1', 'https://example.com/simple')}
+        assert capture.concat() == """\
+WARNING | Conflicting sources of "httpx" in the requirements: "https://example.com/simple" and "https://py38deps.github.io/py38deps/simple", keeping "https://example.com/simple"
+"""
+
+    def test_duplicated_pin_with_one_source(self):
+        """An empty source does not overwrite the source of the other line."""
+        content = """\
+httpx==0.28.1
+httpx==0.28.1
+    # from https://example.com/simple
+"""
+        assert parse_dep_infos(content) == {
+            'httpx': DepInfo('httpx', '0.28.1', 'https://example.com/simple'),
+        }
+
+    def test_dict_deps_of_a_source_conflict(self):
+        """The version view parses the same pins, the source conflict is only a warning."""
+        content = """\
+httpx==0.28.1
+    # from https://example.com/simple
+    # from https://py38deps.github.io/py38deps/simple
+"""
+        parser = Requirements(content)
+        with logger.mock_capture_writer() as capture:
+            assert parser.dict_deps == {'httpx': '0.28.1'}
+            assert parser.dict_sources == {'httpx': 'https://example.com/simple'}
+        assert capture.concat() == """\
+WARNING | Conflicting sources of "httpx" in the requirements: "https://example.com/simple" and "https://py38deps.github.io/py38deps/simple", keeping "https://example.com/simple"
+"""
+
+    def test_duplicated_pin_different_versions(self):
+        """Two different versions keep the first, the later one is a warning."""
+        content = """\
+httpx==0.28.1
+    # from https://example.com/simple
+httpx==0.28.2
+    # from https://py38deps.github.io/py38deps/simple
+"""
+        with logger.mock_capture_writer() as capture:
+            pins = parse_dep_infos(content)
+        assert pins == {'httpx': DepInfo('httpx', '0.28.1', 'https://example.com/simple')}
+        assert capture.concat() == """\
+WARNING | Conflicting versions of "httpx" in the requirements: "0.28.1" and "0.28.2", keeping "0.28.1"
+"""

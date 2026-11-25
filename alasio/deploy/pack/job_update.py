@@ -412,17 +412,17 @@ class UpdateJob(JobBase):
                 # deleted marker, its target is removed in replace()
                 pending.append(PendingFile(info=info, tmp=''))
                 continue
-            # R / RM records move the source file: its deletion is
-            # scheduled here as a deleted marker and applied by
-            # replace_data() after every write of the batch (the
-            # pending order does not matter)
-            deleted = info.source_path if info.edit == 3 else ''
+            # the source of an R / RM record is removed by replace_data() after
+            # the target of the record is written, see JobBase.replace_data()
             current = self._read_current(target)
             result = self._matches(info, current)
             if result.match:
                 # the target file exists and passes the size + sha1 check
-                if deleted:
-                    self._append_deleted(pending, deleted)
+                if info.edit == 3 and info.source_path:
+                    # the record writes nothing, so replace_data() cannot derive
+                    # the move from the batch: its source is scheduled here
+                    pending.append(PendingFile(
+                        info=IdxInfo(path=info.source_path, edit=2), tmp=''))
                 if result.mode_matched:
                     # the content and the mode are verified, the record
                     # needs no tmp file and applies for no tmp name
@@ -442,8 +442,6 @@ class UpdateJob(JobBase):
                 # to the tmp file without reading the sources
                 tmp = self.tmp_file(path, info)
                 file_write(tmp, result.match_data)
-                if deleted:
-                    self._append_deleted(pending, deleted)
                 self.register_tmp(path, info, tmp)
                 pending.append(PendingFile(
                     info=info, tmp=tmp, mode=info.mode_decoded if info.mode == 1 else None))
@@ -464,8 +462,6 @@ class UpdateJob(JobBase):
             if not self._matches(info, self._read_current(tmp)).match:
                 # decompress and write to the tmp file
                 file_write(tmp, content)
-            if deleted:
-                self._append_deleted(pending, deleted)
             self.register_tmp(path, info, tmp)
             # the file is written by python with the default mode 666,
             # a 755 record is chmod-ed in replace()
@@ -623,6 +619,14 @@ class UpdateJob(JobBase):
         files the trusted index no longer has to the deletion list; a missing
         deletion in the pack therefore cannot leave an obsolete file behind.
 
+        The one tolerated case is a source of a target without a ledger: the
+        files of an installation are what its RECORD records (see
+        alasio.deploy.pack.source.InstalledSide), and a file the installation
+        does not record, or records with another checksum, is not verified.
+        The records that read such a source fail their own check and are
+        downloaded from the full pack, the rest of the update pack applies as
+        usual. A file that is not verified is downloaded, never patched.
+
         Returns:
             dict[str, IdxInfo]: The old local index records, the leftover
                 deletion base of _validate_remaining()
@@ -635,7 +639,13 @@ class UpdateJob(JobBase):
         new_index = await self._get_validated_index
         if new_index is None:
             return {}
-        old_fileinfo = await trio.to_thread.run_sync(self._old_fileinfo_from_index)
+        old_fileinfo = await trio.to_thread.run_sync(self._warm_old_fileinfo)
+        # The records of a local side are a description an installer wrote, not
+        # the record of a pack flow (see alasio.deploy.pack.local_side), so a
+        # claim of the pack about one of them is advisory. They are the only
+        # records a side supplies: a target with a ledger is read from the
+        # ledger whatever the side offers
+        advisory = not self.local_index.exists and bool(self.local_side.fileinfo)
         removable = {**old_fileinfo, **self.residue_fileinfo}
         trusted = new_index.fileinfo
         for path, info in self._decoder.fileinfo.items():
@@ -671,6 +681,15 @@ class UpdateJob(JobBase):
                 continue
             old = old_fileinfo.get(path)
             if old is None or old.size != ref.size or old.sha1 != ref.sha1:
+                if advisory:
+                    # The records that use this source check the content
+                    # themselves and are downloaded when it differs, see
+                    # _read_file(), so one source the side does not supply
+                    # never rebuilds the whole target
+                    logger.info(
+                        f'The local side does not supply the old file "{path}", '
+                        f'the records that use it are downloaded unless they match')
+                    continue
                 raise UpdateRecordError(
                     f'The update pack source "{path}" does not match the old index')
         return old_fileinfo
@@ -868,10 +887,14 @@ class UpdateJob(JobBase):
         ref = decoder.refinfo.get(source_path)
         if ref is None:
             raise SourceError(source_path)
-        current = self._read_current(self.root.joinpath(source_path))
-        if not current.exist:
-            raise SourceError(source_path)
-        data = current.data
+        # the old side of a target the caller declared may hide a file behind
+        # a different content, see alasio.deploy.pack.local_side
+        data = self._local_side_data(source_path)
+        if data is None:
+            current = self._read_current(self.root.joinpath(source_path))
+            if not current.exist:
+                raise SourceError(source_path)
+            data = current.data
         # the record size and sha1 are of the LF blob, a CRLF working
         # tree file is converted before the check
         if len(data) == ref.size and (not ref.sha1 or sha1(data).digest() == ref.sha1):
@@ -901,20 +924,3 @@ class UpdateJob(JobBase):
         if eol == 1:
             return content.replace(b'\r\n', b'\n')
         return content
-
-    @staticmethod
-    def _append_deleted(pending, path):
-        """
-        Schedule the deletion of a renamed source file.
-
-        replace_data() applies the deletion only after every write of
-        the batch (the pending order does not matter): the target of
-        the rename is written before its source is removed, so an
-        interruption never loses the file (a leftover source is
-        removed by the next run, which finds the target in place).
-
-        Args:
-            pending (list[PendingFile]): Pending list to append to
-            path (str): Path of the renamed source
-        """
-        pending.append(PendingFile(info=IdxInfo(path=path, edit=2), tmp=''))

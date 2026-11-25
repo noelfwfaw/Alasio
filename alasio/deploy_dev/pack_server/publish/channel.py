@@ -1,0 +1,927 @@
+"""
+The publication of one generation to one remote: resolve, write, verify, retire.
+
+The input is the record of the generator, not a directory listing: the published
+contract (`manifest.json`) names the files a mirror serves, and the barrier
+(`packrepo/latest.pack`) names the version a client switches to. The local side
+of that record is read by `LocalGeneration` (see local.py), shared by every
+mirror of the channel; this module only reads the remote.
+
+Every file is a pipeline of its own: what the mirror says about one key decides
+that key alone, so the files run concurrently and none of them waits for a
+decision about another. The one listing of the run is a shortcut, not a phase:
+a key it reports is decided without a request, a key it does not report is
+asked about directly.
+
+The order is the contract of a mirror:
+
+1. the content files of the manifest, a few at a time;
+2. the barrier, `packrepo/latest.pack`;
+3. the contract, `manifest.json`;
+4. the keys the new generation no longer serves.
+
+A client that reads the manifest therefore finds a complete generation, and the
+retire step runs only once the whole generation landed: a mirror that fails
+before step 3 keeps serving the previous generation, which is complete.
+
+What proves a file is what the mirror reports about the stored object: the MD5
+of the content as its ETag, or a checksum a HEAD reports. Nothing is ever
+downloaded to find out whether it is the right file, and a store that can prove
+neither is refused rather than published to.
+
+Every request carries a numbered line, `PUT 3/12 wheel/x.whl 1.18MB`, so a long
+run reads as a progress report instead of a silence that ends in a summary.
+"""
+
+import hashlib
+import itertools
+
+import msgspec
+import trio
+
+try:
+    BaseExceptionGroup
+except NameError:  # python 3.8 / 3.9
+    from exceptiongroup import BaseExceptionGroup
+
+from alasio.base.pretty import pretty_size
+from alasio.deploy_dev.pack_server.manifest import Manifest
+from alasio.deploy_dev.pack_server.model import ConfigError
+from alasio.deploy_dev.pack_server.publish.common import (
+    BARRIER_KEY, MANIFEST_KEY, MAX_CONCURRENCY, MD5_HEX, IncompleteStore, PublishError, SkipChannel, cache_control,
+    content_type, find_skip, first_failure, require_capabilities
+)
+from alasio.deploy_dev.pack_server.publish.retire import DeletePlan, SkipRetire, build_delete_plan
+from alasio.deploy_dev.store import BucketNotFound, ObjectNotFound, StoreError
+from alasio.ext.cache import cached_property_async_trio_lock
+from alasio.logger import logger
+from alasio.logger.utils import stringify_event
+
+# the status of one channel/remote pair, the value of UploadResult.status
+STATUS_OK = 'ok'
+STATUS_DRY_RUN = 'dry-run'
+STATUS_SKIPPED = 'skipped'
+STATUS_FAILED = 'failed'
+
+# the kind of a written file, for the log
+KIND_CONTENT = 'content'
+KIND_BARRIER = 'barrier'
+KIND_MANIFEST = 'manifest'
+
+# which answer of the mirror a RemoteState came from
+SOURCE_LIST = 'list'
+SOURCE_HEAD = 'head'
+SOURCE_ABSENT = 'absent'
+
+# the outcome of comparing one local file with what the mirror reports
+COMPARE_UPLOAD = 'upload'
+COMPARE_SAME = 'same'
+
+# the width of the size column of a progress line: '1023.99MB' is the widest
+# a pack reaches, and a shorter size is padded to keep the keys aligned
+SIZE_COLUMN = 8
+
+
+class UploadResult(msgspec.Struct):
+    """
+    What happened to one channel on one remote.
+
+    Attributes:
+        channel (str): Name of the workspace
+        remote (str): Name of the remote
+        status (str): STATUS_OK / STATUS_DRY_RUN / STATUS_SKIPPED / STATUS_FAILED
+        uploaded (int): Files written in this run
+        skipped (int): Files that were already on the mirror
+        size (int): Bytes written in this run
+        deleted (int): Keys of an older generation removed in this run
+        deleted_size (int): Bytes those keys held
+        reason (str): Why the pair was skipped or failed, '' otherwise
+    """
+
+    channel: str
+    remote: str
+    status: str
+    uploaded: int = 0
+    skipped: int = 0
+    size: int = 0
+    deleted: int = 0
+    deleted_size: int = 0
+    reason: str = ''
+
+    @property
+    def ok(self):
+        """
+        Returns:
+            bool: True when nothing failed
+        """
+        return self.status != STATUS_FAILED
+
+
+class _Entry:
+    """
+    The number of one file in the progress report.
+
+    A file may print twice, a HEAD and then the line of the decision, and the
+    two lines are one entry of the report: the number is allocated at the first
+    of them and reused by the second.
+
+    Attributes:
+        number (int): The entry, 0 while the file has printed nothing
+    """
+
+    __slots__ = ('_counter', 'number')
+
+    def __init__(self, counter):
+        """
+        Args:
+            counter (Iterator[int]): The counter of the report of this run
+        """
+        self._counter = counter
+        self.number = 0
+
+    def claim(self):
+        """
+        The number of this file, allocated the first time it is asked for.
+
+        Returns:
+            int: The entry of the file in the report
+        """
+        if not self.number:
+            self.number = next(self._counter)
+        return self.number
+
+    @classmethod
+    def single(cls, number):
+        """
+        The entry of a file that prints one line, at a number known up front.
+
+        Args:
+            number (int): The entry of that line in the report
+
+        Returns:
+            _Entry: The entry, its number already fixed
+        """
+        entry = cls(iter(()))
+        entry.number = number
+        return entry
+
+
+class RemoteState(msgspec.Struct):
+    """
+    What the mirror reports about one key, and what that proves.
+
+    Attributes:
+        info (ObjectInfo): The state of the object, None when the key is absent
+        md5 (str): Content MD5 the answer proves, '' when it proves none
+        source (str): SOURCE_LIST / SOURCE_HEAD / SOURCE_ABSENT, which answer
+            it was
+    """
+
+    info: "ObjectInfo" = None
+    md5: str = ''
+    source: str = SOURCE_LIST
+
+
+def compare(item, state):
+    """
+    Whether the local file has to be written again.
+
+    The size alone never proves a file: an object of the right length can hold
+    other bytes. A file is the same only when the mirror reports a digest that
+    equals its MD5.
+
+    Args:
+        item (UploadItem): The local file
+        state (RemoteState): What the mirror reports about its key
+
+    Returns:
+        str: COMPARE_SAME / COMPARE_UPLOAD
+    """
+    if state.info is None or state.info.size != item.size:
+        return COMPARE_UPLOAD
+    if state.md5 and state.md5 == item.md5:
+        return COMPARE_SAME
+    return COMPARE_UPLOAD
+
+
+class ChannelUpload:
+    """
+    One workspace on one remote: resolve, write, verify, retire.
+
+    The instance owns the store bound to the channel and the local generation
+    shared by every mirror of it: it does no local IO of its own, it awaits the
+    files of `LocalGeneration`, so three mirrors of one channel read and digest
+    the generation once.
+
+    Usage:
+        local = LocalGeneration(workspace)
+        upload = ChannelUpload(local, store, remote_name='cos-main', grace=3600)
+        result = await upload.run()
+    """
+
+    def __init__(self, local, store, remote_name='', grace=3600, concurrency=MAX_CONCURRENCY):
+        """
+        Args:
+            local (LocalGeneration): The generation to publish, shared by every
+                mirror of the channel
+            store (ObjectStore): The store bound to the workspace
+            remote_name (str): Name of the remote, for the log and the result
+            grace (int): Seconds a generation must have stopped being the
+                current one before its keys are removed. Defaults to 3600
+            concurrency (int): Requests in flight at once, 1 to MAX_CONCURRENCY
+        """
+        self.local = local
+        self.store = store
+        self.remote_name = remote_name
+        self.grace = int(grace)
+        if self.grace <= 0:
+            # a grace of zero retires the previous generation the moment the
+            # barrier moves, and a client that just read the old barrier would
+            # be served a 404 by its next request. The config refuses the value
+            # as well; this is the same refusal for a caller that builds the
+            # channel by hand
+            raise ValueError(f'grace must be > 0 seconds, got {self.grace}')
+        # the cap is a property of the tool, not of the config: more requests in
+        # flight than this only move the queue into the connection pool
+        self.concurrency = max(1, min(int(concurrency), MAX_CONCURRENCY))
+        # every remote operation of the run, the transfers and the lookups
+        # alike, comes out of this one budget
+        self.remote_limit = trio.Semaphore(self.concurrency)
+        # the progress report: entries announced, the denominator of every line
+        self.total = 0
+
+    @property
+    def channel(self):
+        """
+        Returns:
+            str: Name of the workspace
+        """
+        return self.local.workspace.name
+
+    def _where(self):
+        """
+        Returns:
+            str: The pair a message is about, e.g. '[cos-main] LmeSzinc_Repo_master'
+        """
+        return f'[{self.remote_name}] {self.channel}'
+
+    def _step(self, action, relative, size=None, note='', number=None):
+        """
+        Log one request or one decision, as a line of a progress report.
+
+        A request is logged before it is sent: a transfer of hundreds of
+        megabytes shows up while it is in flight instead of after it, and a run
+        that fails still shows what it was doing. The numbering is against the
+        count the run announced, so the last entry of a run reads `n/n`.
+
+        The size is a column of its own, wide enough for the largest unit a
+        pack reaches, so the keys of a report read as a column instead of
+        starting after a size of a different length.
+
+        Args:
+            action (str): 'SAME', 'PUT', 'HEAD' or 'DELETE'
+            relative (str): Key of the object
+            size (int): Size of the object in bytes, None for a line whose key
+                is not the object the report measures. Defaults to None
+            note (str): What the line says after the key, e.g. 'manifest'.
+                Defaults to ''
+            number (int): The entry this line belongs to, None for a request
+                outside the count, e.g. a HEAD of the barrier before the total
+                is known. Defaults to None
+        """
+        if number is None:
+            head = action
+        else:
+            head = f'{action} {number}/{self.total}'
+        # a line without a size keeps the column, or its key would start left
+        # of the keys above and below it
+        column = pretty_size(size).rjust(SIZE_COLUMN) if size is not None else ' ' * SIZE_COLUMN
+        suffix = f'  {note}' if note else ''
+        logger.info(f'  {head} {column} {relative}{suffix}')
+
+    def _etag_md5(self, info):
+        """
+        The content MD5 an ETag proves, '' when it proves none.
+
+        A store declares that the ETag of a single PUT is the MD5 of the
+        content; a bucket switched to a KMS key keeps answering with an ETag
+        that is not one, so the shape is checked as well.
+
+        Args:
+            info (ObjectInfo): What the mirror reports, None for an absent key
+
+        Returns:
+            str: The ETag when it is a usable MD5, '' otherwise
+        """
+        if info is None or not self.store.CAPABILITIES.etag_md5:
+            return ''
+        return info.etag if MD5_HEX.match(info.etag) else ''
+
+    @cached_property_async_trio_lock
+    async def snapshot(self):
+        """
+        The mirror as it was at the start of the run: one listing of the workspace.
+
+        Taken once per instance and shared by every lookup: the key that is in
+        it is decided from its values, the key that is not is absent from the
+        mirror (the lock of the channel keeps another writer out of the run).
+        The retire plan reads the same listing, so the generations a run writes
+        and retires are judged by one view of the mirror.
+
+        Returns:
+            ObjectListing: The objects and the clock of the server
+
+        Raises:
+            ConfigError: If the bucket of the remote does not exist: a remote
+                that has to be configured again, not a mirror that is down
+            PublishError: If the store cannot list the workspace. A store that
+                cannot list is not published to file by file: the failure is
+                the credential, the prefix or the network, and one request per
+                key would only make it slower and noisier
+        """
+        try:
+            return await self.store.list()
+        except BucketNotFound as e:
+            raise ConfigError(f'{self._where()}: {e}') from None
+        except Exception as e:  # noqa: BLE001 - one pair must not stop the run
+            raise PublishError(
+                f'{self._where()}: cannot list the workspace: {e}') from None
+
+    async def _resolve(self, item, entry=None):
+        """
+        What the mirror reports about one key, with the cheapest answer first.
+
+        The ladder, and each step is only taken when the one above cannot
+        decide:
+
+        1. the listing of the run: one request for the whole workspace, taken
+           once, and enough for every key whose ETag is an MD5. It is also how a
+           key that is not on the mirror is known to be absent, so a first
+           publication costs one listing and one PUT per file, no lookup;
+        2. a HEAD of the key: the same values for one object, when the listing
+           holds the key but cannot prove it;
+        3. nothing: a mirror that reports no comparable digest cannot prove the
+           file, and the run fails instead of guessing.
+
+        Args:
+            item (UploadItem): The local file
+            entry (_Entry): The entry of the file in the report, so a HEAD and
+                the line after it share the number. None for a lookup outside
+                the report, e.g. the barrier before the plan is known
+
+        Returns:
+            RemoteState: What the mirror reports and what it proves
+
+        Raises:
+            IncompleteStore: If the object has the size of the file and the
+                mirror reports no digest that can be compared
+        """
+        info = (await self.snapshot).objects.get(item.relative)
+        if info is None:
+            # the listing is the whole workspace at the start of the run, and
+            # the lock of the channel keeps another writer out of it: a key it
+            # does not hold is not on the mirror
+            return RemoteState(info=None, md5='', source=SOURCE_ABSENT)
+        md5 = self._etag_md5(info)
+        # a different size is a decision of its own: the file has to be
+        # written, and a HEAD would answer nothing new
+        if md5 or info.size != item.size:
+            return RemoteState(info=info, md5=md5, source=SOURCE_LIST)
+        try:
+            async with self.remote_limit:
+                # claimed right before the line: the number of a line is its
+                # position in the report, not the position of its key in the
+                # queue, so the report of a concurrent run stays in order
+                number = None if entry is None else entry.claim()
+                self._step('HEAD', item.relative, note='the stored object', number=number)
+                head = await self.store.head(item.relative)
+        except ObjectNotFound:
+            # the key went away between the listing and the lookup, or the
+            # listing named an object the store no longer holds
+            return RemoteState(info=None, md5='', source=SOURCE_ABSENT)
+        md5 = self._etag_md5(head)
+        if md5 or head.size != item.size:
+            return RemoteState(info=head, md5=md5, source=SOURCE_HEAD)
+        raise IncompleteStore(
+            f'{self._where()}: {item.relative} is on the mirror with the size of the local '
+            f'file but no digest that can be compared (etag="{head.etag}"), so the store '
+            f'cannot prove which of the two is the current one'
+        )
+
+    async def _verify(self, info, item, number):
+        """
+        Check that the object the mirror holds is the local file.
+
+        The evidence, cheapest first, and each kind is a statement about the
+        stored object rather than about the request that wrote it:
+
+        1. the ETag of a single PUT is the MD5 of the content, when the store
+           declares it (etag_md5). Comparing it costs nothing;
+        2. the store reports a digest of the stored object on a HEAD
+           (head_checksum), in the same form its PUT reported it. The value of
+           the PUT and the value of the HEAD are compared, so a key overwritten
+           after the write is caught without downloading the object and without
+           computing the digest here;
+        3. neither: the store cannot show that the write landed.
+
+        The size alone is never accepted: an object of the right length can
+        hold other bytes.
+
+        Args:
+            info (ObjectInfo): What the mirror reports about the written object
+            item (UploadItem): The local file
+            number (int): The entry of the progress report, for the HEAD line
+
+        Returns:
+            bool: True when the object is the local file
+
+        Raises:
+            IncompleteStore: If the mirror reports no digest of either kind
+            StoreError: If the HEAD fails
+        """
+        capabilities = self.store.CAPABILITIES
+        if self._etag_md5(info):
+            return info.etag == item.md5
+        if capabilities.head_checksum and info.checksum:
+            async with self.remote_limit:
+                self._step('HEAD', item.relative, note='the checksum of the stored object', number=number)
+                head = await self.store.head(item.relative)
+            if not head.checksum:
+                raise IncompleteStore(
+                    f'{self._where()}: {item.relative} was written but the HEAD of it '
+                    f'reports no checksum, although the store promises one'
+                )
+            return head.checksum == info.checksum
+        raise IncompleteStore(
+            f'{self._where()}: {item.relative} was written but neither its ETag '
+            f'("{info.etag}") nor a HEAD checksum proves it, so the store cannot show '
+            f'that the write landed'
+        )
+
+    async def _put(self, item, kind, entry):
+        """
+        Write one file and verify the answer of the mirror.
+
+        Args:
+            item (UploadItem): The file to write
+            kind (str): KIND_CONTENT / KIND_BARRIER / KIND_MANIFEST
+            entry (_Entry): The entry of the file in the report, claimed inside
+                the limit: the line is written once the transfer is allowed to
+                start, so a task that is still queued holds no entry and the
+                report stays in order
+
+        Raises:
+            PublishError: If the write fails or the object does not verify
+        """
+        note = kind if kind != KIND_CONTENT else ''
+        async with self.remote_limit:
+            number = entry.claim()
+            self._step('PUT', item.relative, item.size, note=note, number=number)
+            info = await self.store.put(
+                item.relative, item.file, item.size, item.md5,
+                content_type=content_type(item.relative),
+                cache_control=cache_control(item.relative),
+            )
+        if not await self._verify(info, item, number):
+            raise PublishError(
+                f'{self._where()}: {item.relative} was written but the mirror reports '
+                f'size={info.size} etag={info.etag}, expected size={item.size} md5={item.md5}'
+            )
+
+    async def _sync(self, relatives, dry_run=False):
+        """
+        Publish the content files of the generation, a few at a time.
+
+        Each file runs its own pipeline — resolve its key, compare, write it if
+        it differs — so a key the listing already proves costs no request at
+        all and a key it cannot prove is asked about while the others are being
+        written. The entry of a file in the report is claimed when the file
+        reaches it, so the lines of a concurrent run read as a progress bar.
+
+        Args:
+            relatives (List[str]): Keys of the content files, in manifest order
+            dry_run (bool): Report the decisions and write nothing. Defaults to
+                False
+
+        Returns:
+            list[tuple[str, UploadItem]]: (outcome, file) per key, in order
+
+        Raises:
+            SkipChannel: If a local file cannot be read
+            PublishError: If a write fails or does not verify
+        """
+
+        found = {}
+        # the entries of the report of this run, in the order the lines are
+        # written: the first content file is 1, and the barrier, the contract
+        # and the keys to retire continue from where the content stopped
+        counter = itertools.count(1)
+
+        async def one(relative):
+            item = await self.local.item(relative)
+            entry = _Entry(counter)
+            outcome = compare(item, await self._resolve(item, entry))
+            if outcome == COMPARE_SAME:
+                self._step('SAME', item.relative, item.size, number=entry.claim())
+            elif dry_run:
+                self._step('PUT', item.relative, item.size, number=entry.claim())
+            else:
+                await self._put(item, KIND_CONTENT, entry)
+            found[relative] = (outcome, item)
+
+        if self.concurrency == 1:
+            # one at a time, in the order of the manifest: the progress lines of
+            # a serial run follow the manifest, not the scheduler
+            for relative in relatives:
+                await one(relative)
+        else:
+            try:
+                async with trio.open_nursery() as nursery:
+                    for relative in relatives:
+                        nursery.start_soon(one, relative)
+            except BaseExceptionGroup as group:
+                raise first_failure(group) from None
+        return [found[relative] for relative in relatives]
+
+    def _skipped(self, error):
+        """
+        Log a refused generation and build its result.
+
+        Args:
+            error (SkipChannel): Why the workspace was refused
+
+        Returns:
+            UploadResult: The skipped result
+        """
+        logger.info(f'{self._where()}: skipped, {error}')
+        return UploadResult(
+            channel=self.channel, remote=self.remote_name, status=STATUS_SKIPPED,
+            reason=str(error))
+
+    def _failed(self, error):
+        """
+        Log a failed pair and build its result.
+
+        The log line is the reason only: a store failure is a fact of this pair
+        and not a bug of the run, so the run is not reported with a traceback.
+
+        Args:
+            error (StoreError): The request the store could not serve
+
+        Returns:
+            UploadResult: The failed result
+        """
+        reason = stringify_event(error)
+        logger.error(f'{self._where()}: {reason}')
+        return UploadResult(
+            channel=self.channel, remote=self.remote_name, status=STATUS_FAILED,
+            reason=reason)
+
+    def _refused(self, failure):
+        """
+        Turn the failure of a publish into what this run reports.
+
+        A nursery wraps the failures of its children, so the leaf is taken
+        first; a skip is a result of its own, a store that cannot serve the
+        workspace is a failed pair, and a bucket that does not exist is a
+        config error like everywhere else in the flow
+
+        Args:
+            failure (BaseException): The exception of the run, a group or a leaf
+
+        Returns:
+            UploadResult: The skipped or failed result
+
+        Raises:
+            BaseException: The failure, when it is not one of the above
+            ConfigError: If the bucket of the remote does not exist
+        """
+        if isinstance(failure, BaseExceptionGroup):
+            skip = find_skip(failure)
+            if skip is not None:
+                return self._skipped(skip)
+            failure = first_failure(failure)
+        if isinstance(failure, BucketNotFound):
+            raise ConfigError(f'{self._where()}: {failure}') from None
+        if isinstance(failure, StoreError):
+            return self._failed(failure)
+        raise failure
+
+    async def run(self, dry_run=False):
+        """
+        Publish the generation of the workspace to the remote, then retire.
+
+        A store that cannot serve a request is a failed pair, not an exception
+        of the run: the mirror keeps the previous generation, the other remotes
+        of the channel still publish, and the next run asks the store again.
+
+        Args:
+            dry_run (bool): Report the decisions and write nothing. Defaults to
+                False
+
+        Returns:
+            UploadResult: What was written, retired, or why the run was refused
+
+        Raises:
+            ConfigError: If the bucket of the remote does not exist
+            IncompleteStore: If the store cannot prove the objects it holds
+            PublishError: If a request fails
+        """
+        require_capabilities(self.store.CAPABILITIES, self._where())
+        # a run takes its own view of the mirror: a second run of the same
+        # instance decides on a fresh listing, not on the one before its writes
+        cached_property_async_trio_lock.pop(self, 'snapshot')
+        try:
+            manifest = await self.local.record
+        except SkipChannel as e:
+            return self._skipped(e)
+        try:
+            return await self._publish(manifest, dry_run)
+        except SkipChannel as e:
+            return self._skipped(e)
+        except (StoreError, BaseExceptionGroup) as failure:
+            # BucketNotFound is a StoreError of its own kind, and _refused()
+            # answers it with a ConfigError like every other read of the flow
+            return self._refused(failure)
+
+    async def _publish(self, manifest, dry_run):
+        """
+        The body of a run, with the generation warmed up beside it.
+
+        The files of the generation are read by `warmup()` tasks the caller
+        starts in a nursery of its own: the first request of the run goes out
+        while the head of the queue is being read, and the file the body asks
+        for first is the first one handed to a reader. A failure of the block
+        cancels the reads that have not finished, so a run that will not
+        publish does not read the rest of the disk.
+
+        Args:
+            manifest (Manifest): The published contract
+            dry_run (bool): Report the decisions and write nothing
+
+        Returns:
+            UploadResult: The result of the pair
+        """
+        await self.local.prepare()
+        async with trio.open_nursery() as nursery:
+            self.local.start(nursery)
+            listing = await self.snapshot
+
+            # the barrier and the contract are decided before the content
+            # starts: whether this run switches the version changes what is
+            # written, and the total of the progress report follows from both.
+            # The state of the contract is kept: it tells whether the mirror
+            # still serves the generation of this run, which decides whether
+            # the previous contract has to be read at all
+            barrier_item = await self.local.item(BARRIER_KEY)
+            contract_item = await self.local.item(MANIFEST_KEY)
+            barrier_outcome = compare(barrier_item, await self._resolve(barrier_item))
+            contract_state = await self._resolve(contract_item)
+            contract_outcome = compare(contract_item, contract_state)
+            write_barrier = barrier_outcome == COMPARE_UPLOAD
+            write_contract = contract_outcome == COMPARE_UPLOAD
+
+            content = [relative for relative in manifest.files if relative != BARRIER_KEY]
+            previous = await self._previous_files(
+                listing, contract_state, contract_item, manifest)
+            retire = self._retire_plan(manifest, listing, previous)
+            # the report is a progress bar: the entry of a line is its position
+            # in the report, taken when the line is about to be written. A
+            # position fixed by the queue would print out of order, because the
+            # tasks of a concurrent run are scheduled by trio, not by the
+            # manifest
+            self.total = len(manifest.files) + 1 + len(retire.keys)
+
+            # the content files are the entries 1..len(content), then the
+            # barrier and the contract
+            barrier_number = len(manifest.files)
+            contract_number = barrier_number + 1
+
+            rows = await self._sync(content, dry_run=dry_run)
+            uploaded = [item for outcome, item in rows if outcome == COMPARE_UPLOAD]
+            # every entry of the report that is not written is unchanged: the
+            # content files, the barrier and the contract alike
+            unchanged = (len(rows) - len(uploaded)
+                         + int(not write_barrier) + int(not write_contract))
+            size = sum(item.size for item in uploaded)
+            size += barrier_item.size if write_barrier else 0
+            size += contract_item.size if write_contract else 0
+            to_write = len(uploaded) + int(write_barrier) + int(write_contract)
+            logger.info(
+                f'{self._where()}: version={manifest.version} '
+                f'{to_write} to upload ({pretty_size(size)}), {unchanged} unchanged, '
+                f'{len(retire.keys)} to retire ({pretty_size(retire.size)})')
+
+            # the barrier and the contract land only once every content file did
+            for item, outcome, kind, number in (
+                (barrier_item, barrier_outcome, KIND_BARRIER, barrier_number),
+                (contract_item, contract_outcome, KIND_MANIFEST, contract_number),
+            ):
+                if outcome == COMPARE_SAME:
+                    self._step('SAME', item.relative, item.size, note=kind, number=number)
+                elif dry_run:
+                    self._step('PUT', item.relative, item.size, note=kind, number=number)
+                else:
+                    await self._put(item, kind, _Entry.single(number))
+
+            deleted_keys = await self._retire(
+                retire, listing, first_number=len(manifest.files) + 2, dry_run=dry_run)
+            # the bytes of the keys that are gone, not of the ones the plan
+            # announced: a delete that failed keeps its key, and a report that
+            # counted it would tell an operator that space was freed that the
+            # mirror still holds
+            deleted_size = sum(
+                listing.objects[relative].size for relative in deleted_keys)
+            return UploadResult(
+                channel=self.channel, remote=self.remote_name,
+                status=STATUS_DRY_RUN if dry_run else STATUS_OK,
+                uploaded=to_write, skipped=unchanged, size=size,
+                deleted=len(deleted_keys), deleted_size=deleted_size,
+            )
+
+    async def _previous_files(self, listing, state, item, manifest):
+        """
+        The files the mirror served when the run started, or None when unknown.
+
+        The retirement keeps the generation the mirror serves in addition to the
+        one this run publishes: it is the generation the clients that read the
+        barrier a moment ago are still downloading. Its file list is the
+        contract of the mirror, and the run did not read it yet.
+
+        The listing already answers it when it proves the remote contract is the
+        contract of this run: a run that changes nothing has nothing to retire
+        but the generation before, and that one is covered by both lists being
+        equal. So the read costs one request on a run that publishes a new
+        generation, and nothing at all on a run that publishes nothing.
+
+        A contract the run cannot read is not an error: the caller retires
+        nothing this round, because a generation whose file list is unknown must
+        not be deleted from. Only a store that cannot answer at all is one.
+
+        Args:
+            listing (ObjectListing): The mirror as it was before the writes
+            state (RemoteState): What the mirror reports about the contract
+            item (UploadItem): The local contract
+            manifest (Manifest): The generation this run publishes
+
+        Returns:
+            list[str]: The published files of the contract of the mirror, None
+                when the mirror holds none, or not one this run can trust
+
+        Raises:
+            StoreError: If the read fails
+        """
+        if state.md5 and state.md5 == item.md5:
+            # the ETag of the listing proves the mirror holds this very file, so
+            # its files are the files of this run
+            return manifest.files
+        if MANIFEST_KEY not in listing.objects:
+            # a first publication: no generation is being replaced
+            return None
+        try:
+            async with self.remote_limit:
+                # a line of its own, unnumbered: the plan it feeds is what the
+                # report counts, and the entries start once that is known
+                self._step('GET', MANIFEST_KEY, note='the contract of the mirror')
+                data = await self.store.get(MANIFEST_KEY)
+        except ObjectNotFound:
+            # the contract went away between the listing and the read
+            return None
+        if state.md5 and hashlib.md5(data).hexdigest() != state.md5:
+            # the contract was rewritten after the listing: the two name
+            # different generations, and neither is one this run can keep
+            logger.debug(
+                f'{self._where()}: no retire, {MANIFEST_KEY} changed between the '
+                f'listing and the read')
+            return None
+        try:
+            previous = Manifest.decode(data)
+        except msgspec.DecodeError as e:
+            logger.debug(
+                f'{self._where()}: no retire, {MANIFEST_KEY} of the mirror is not a '
+                f'manifest: {e}')
+            return None
+        if previous.channel != self.channel:
+            logger.debug(
+                f'{self._where()}: no retire, {MANIFEST_KEY} of the mirror names the '
+                f'channel "{previous.channel}"')
+            return None
+        return previous.files
+
+    def _retire_plan(self, manifest, listing, previous):
+        """
+        The keys of the mirror neither generation serves any more.
+
+        The plan is built from the listing taken before the writes, so a key
+        written by this run is never a candidate. The clock is the contract of
+        the listing, which is the current one: the generation it names stopped
+        being served when it landed, and every older generation stopped even
+        earlier.
+
+        - the contract is younger than the grace: the generation this run
+          replaces is still inside the window of the clients that read its
+          barrier, and nothing may go;
+        - the contract is older: every generation but the one it names has been
+          out of service for the grace, and all of them go at once. A channel
+          that publishes slower than the grace keeps the previous generation
+          only, and one that published faster drains the window in one round.
+
+        The generation the contract names is kept whatever the clock says: it
+        stops being served with this run, not when the contract landed. Its file
+        list comes from the contract of the mirror, see `_previous_files`.
+
+        A first publication has no contract in the listing and nothing to
+        retire; a mirror whose two records do not form one generation is
+        refused by the same rule.
+
+        Args:
+            manifest (Manifest): The generation that was published
+            listing (ObjectListing): The mirror as it was before the writes
+            previous (list[str]): The published files of the contract of the
+                mirror, None when it could not be read
+
+        Returns:
+            DeletePlan: The keys to delete, empty when nothing may go yet
+        """
+        try:
+            plan = build_delete_plan(
+                manifest.files, previous, listing, self.grace, listing.server_date,
+                capabilities_dirs=self.store.CAPABILITIES.dirs)
+        except SkipRetire as e:
+            # a mirror whose records do not name one generation is not one this
+            # run may delete from, and it is not a failure of the publication
+            logger.debug(f'{self._where()}: no retire, {e}')
+            return DeletePlan()
+        if plan.within_grace and not plan.keys:
+            logger.debug(
+                f'{self._where()}: no retire, the contract of the mirror is younger '
+                f'than the grace of {self.grace}s')
+        return plan
+
+    async def _retire(self, retire, listing, first_number, dry_run=False):
+        """
+        Delete the keys of the plan, a few at a time, keeping the run alive.
+
+        A failed delete is logged and counted out: the key stays, the next run
+        finds it again, and the other keys are still removed. The publication
+        itself already succeeded, so a delete never fails the pair.
+
+        Args:
+            retire (DeletePlan): The keys to delete
+            listing (ObjectListing): The listing the plan was built on, for the
+                size of each key
+            first_number (int): The entry of the first key of the plan
+            dry_run (bool): Report the keys and delete none. Defaults to False
+
+        Returns:
+            List[str]: The keys that are gone, in the order of the plan. A dry
+                run returns the keys of the plan: nothing was attempted, so the
+                plan is the honest answer
+        """
+        if not retire.keys:
+            return []
+        logger.hr(f'Cleanup {self.channel}', level=2)
+        # the entries of the round, in the order the lines are written
+        counter = itertools.count(first_number)
+
+        async def one(relative):
+            size = listing.objects[relative].size
+            if dry_run:
+                self._step('WOULD DELETE', relative, size, number=next(counter))
+                return relative
+            try:
+                async with self.remote_limit:
+                    # taken inside the limit: a task that is still queued has
+                    # no line yet, so it must not take an entry
+                    self._step('DELETE', relative, size, number=next(counter))
+                    await self.store.delete(relative)
+            except Exception as e:  # noqa: BLE001 - one key must not stop the rest
+                logger.warning(f'{self._where()}: cannot delete "{relative}": {e}')
+                return None
+            return relative
+
+        # a failed delete is caught here, so nothing in the nursery raises and
+        # the run is never cancelled by one key
+        if self.concurrency == 1:
+            results = [await one(relative) for relative in retire.keys]
+        else:
+            results = {}
+
+            async def task(relative):
+                results[relative] = await one(relative)
+
+            async with trio.open_nursery() as nursery:
+                for relative in retire.keys:
+                    nursery.start_soon(task, relative)
+            results = [results[relative] for relative in retire.keys]
+
+        if retire.folders:
+            logger.debug(
+                f'{self._where()}: remove {len(retire.folders)} empty folder(s)')
+            try:
+                await self.store.remove_dirs(retire.folders)
+            except Exception as e:  # noqa: BLE001 - an empty folder is cosmetic
+                logger.warning(
+                    f'{self._where()}: cannot remove {len(retire.folders)} empty '
+                    f'folder(s): {e}')
+        return [relative for relative in results if relative is not None]

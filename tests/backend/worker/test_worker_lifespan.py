@@ -9,9 +9,14 @@ import time
 
 import pytest
 
-from alasio.backend.worker.manager import WorkerManager, WorkerState
+from alasio.backend.worker.manager import WORKER_STOPPING_STATE, WorkerManager, WorkerState
+from alasio.logger import logger
 from alasio.testing.timeout import AssertTimeout
 from tests.backend.worker.const import *
+
+pytestmark = [
+    pytest.mark.parallel,
+]
 
 # ============================================================================
 # Fixtures
@@ -463,6 +468,44 @@ class TestResourceManagement:
         # Verify thread gone
         assert_recv_thread_gone([config])
 
+    def test_conn_close_unblocks_the_recv_thread(self):
+        """
+        Closing the pipe of a worker must wake its recv thread
+
+        The manager closes the pipe of an entry while its recv thread is blocked in
+        recv_bytes() (a failed spawn, a worker killed before its disconnect was
+        handled): on POSIX closing the fd does not interrupt a read blocked in another
+        thread, so conn_close() shuts the socket down first. Windows wakes the reader on
+        close alone, the thread must end on both.
+        """
+        import socket
+        from multiprocessing.connection import Connection
+
+        state = WorkerState(mod='WorkerTestScheduler', config='cfg_conn_close', state='idle')
+        left, right = socket.socketpair()
+        state.conn = Connection(left.detach())
+        peer = Connection(right.detach())
+        result = []
+
+        def read():
+            try:
+                result.append(state.conn.recv_bytes())
+            except (EOFError, OSError):
+                result.append(None)
+
+        try:
+            thread = threading.Thread(target=read, daemon=True)
+            thread.start()
+            # let the reader block in recv_bytes()
+            time.sleep(0.1)
+
+            state.conn_close()
+            thread.join(timeout=1)
+
+            assert not thread.is_alive(), 'conn_close() did not wake the recv thread'
+        finally:
+            peer.close()
+
     def test_repeated_start_stop_no_leak(self, manager):
         """测试重复启停不泄漏"""
         config = 'test_cycle'
@@ -494,6 +537,421 @@ class TestResourceManagement:
         assert len(manager.state) <= 1, "State leak after repeated cycles"
         assert_worker_gone([state])
         assert_recv_thread_gone([config])
+
+
+# ============================================================================
+# Disconnect Tests
+# ============================================================================
+
+class _LostStatusProcess:
+    """
+    A gone worker whose exit status can no longer be claimed
+
+    This is what the manager sees when the status of a child that already
+    exited was claimed elsewhere: multiprocessing reads the exit code out of
+    its Popen object and answers None, while is_alive() keeps answering True
+    (its poll() returns None instead of raising) and a join returns at once.
+    """
+
+    pid = 4321
+
+    def is_alive(self):
+        return True
+
+    def join(self, timeout=None):
+        return None
+
+    @property
+    def exitcode(self):
+        return None
+
+    def terminate(self):
+        pass
+
+    def kill(self):
+        pass
+
+
+class _ExitedProcess:
+    """
+    A gone worker whose exit status is still readable
+
+    Args:
+        exitcode (int): The exit code the process exited with
+    """
+
+    pid = 4322
+
+    def __init__(self, exitcode):
+        self._exitcode = exitcode
+        self.signals = []
+
+    def is_alive(self):
+        return False
+
+    def join(self, timeout=None):
+        return self._exitcode
+
+    @property
+    def exitcode(self):
+        return self._exitcode
+
+    def terminate(self):
+        self.signals.append('terminate')
+
+    def kill(self):
+        self.signals.append('kill')
+
+
+class _ExitingProcess:
+    """
+    A process whose fds are closed but whose exit status does not exist yet
+
+    This is the window the manager has to tell apart from a worker that is still
+    running: the kernel closes the fds of an exiting process first, and only
+    afterwards does the process become waitable. multiprocessing's join() waits on
+    the fd, so it returns in this window while exitcode still answers None.
+
+    Args:
+        exitcode (int): The code the process exits with
+        polls (int): Number of status reads that answer None before the code exists
+    """
+
+    pid = 4323
+
+    def __init__(self, exitcode=0, polls=2):
+        self._exitcode = exitcode
+        self._polls = polls
+        self.signals = []
+
+    def is_alive(self):
+        return self._polls > 0
+
+    def join(self, timeout=None):
+        # the fd notification is already there
+        return None
+
+    @property
+    def exitcode(self):
+        if self._polls > 0:
+            self._polls -= 1
+            return None
+        return self._exitcode
+
+    def terminate(self):
+        self.signals.append('terminate')
+
+    def kill(self):
+        self.signals.append('kill')
+
+
+class _StuckProcess:
+    """A worker whose pipe broke but which keeps running until it is terminated"""
+
+    pid = 4324
+
+    def __init__(self):
+        self.signals = []
+        self._exitcode = None
+
+    def is_alive(self):
+        return self._exitcode is None
+
+    def join(self, timeout=None):
+        return None
+
+    @property
+    def exitcode(self):
+        return self._exitcode
+
+    def terminate(self):
+        self.signals.append('terminate')
+        self._exitcode = -15
+
+    def kill(self):
+        self.signals.append('kill')
+        self._exitcode = -9
+
+
+class _UnresponsiveProcess:
+    """A worker that ignores terminate() and only ends when it is killed"""
+
+    pid = 4325
+
+    def __init__(self):
+        self.signals = []
+        self._exitcode = None
+
+    def is_alive(self):
+        return self._exitcode is None
+
+    def join(self, timeout=None):
+        return None
+
+    @property
+    def exitcode(self):
+        return self._exitcode
+
+    def terminate(self):
+        self.signals.append('terminate')
+
+    def kill(self):
+        self.signals.append('kill')
+        self._exitcode = -9
+
+
+class TestWorkerDisconnect:
+    """How the disconnect handler reads the exit status of a gone worker"""
+
+    @pytest.fixture(autouse=True)
+    def fast_timeouts(self, monkeypatch):
+        """
+        Shorten the waits of the disconnect handler
+
+        The stand-in processes of this class decide every scenario themselves, so
+        the production timeouts would only slow the tests down. They stay long
+        enough for the stand-in that becomes reapable after a few polls.
+        """
+        monkeypatch.setattr('alasio.backend.worker.manager.EXIT_WAIT_TIMEOUT', 0.1)
+        monkeypatch.setattr('alasio.backend.worker.manager.KILL_TERMINATE_TIMEOUT', 0.05)
+        monkeypatch.setattr('alasio.backend.worker.manager.KILL_FORCE_TIMEOUT', 0.05)
+
+    @staticmethod
+    def disconnect(manager, state_before, process, config, pending_restart=False):
+        """
+        Run the disconnect handler on an entry in the given state
+
+        Args:
+            manager (WorkerManager): Manager of the test
+            state_before (str): State the entry is in when its pipe breaks
+            process: Stand-in for the process of the worker
+            config (str): Config name
+            pending_restart (bool): Whether the entry is parked for a restart
+
+        Returns:
+            WorkerState: The entry, after the handler decided its state
+        """
+        state = WorkerState(mod='WorkerTestScheduler', config=config, state=state_before,
+                            pending_restart=pending_restart)
+        state.process = process
+        manager.state[config] = state
+        manager._handle_disconnect(state)
+        return state
+
+    @pytest.mark.parametrize('state_before', WORKER_STOPPING_STATE)
+    def test_a_status_that_could_not_be_read_ends_a_requested_stop_as_idle(self, manager, state_before):
+        """
+        A worker that was told to stop and is gone ends as a clean stop
+
+        The exit status of a process can only be claimed once, and the manager
+        reads it from multiprocessing, which swallows the error of a status that
+        was already claimed elsewhere (see _handle_disconnect). A status that
+        could not be read says nothing about why the worker ended, so an entry
+        the manager itself was stopping must not turn into an error.
+        """
+        state = self.disconnect(manager, state_before, _LostStatusProcess(), 'cfg_lost_status')
+
+        assert state.state == 'idle'
+        assert state.process is None
+
+    @pytest.mark.parametrize('state_before', ['starting', 'running', 'scheduler-waiting'])
+    def test_a_status_that_could_not_be_read_is_an_error_without_a_stop_request(self, manager, state_before):
+        """A worker nobody asked to stop must not pass for a clean stop"""
+        state = self.disconnect(manager, state_before, _LostStatusProcess(), 'cfg_lost_crash')
+
+        assert state.state == 'error'
+
+    def test_a_worker_that_is_still_exiting_is_waited_for(self, manager):
+        """
+        The window between the closed fds and the exit status must not read as a failure
+
+        A worker whose entry returned closes its pipe while its process is still
+        exiting: join() is already answered by the fd notification, while the exit
+        status does not exist yet. A single non-blocking read turns that completed
+        worker into an error; waiting for the status reads the 0 it exited with.
+        """
+        process = _ExitingProcess(exitcode=0, polls=2)
+        state = self.disconnect(manager, 'running', process, 'cfg_exiting')
+
+        assert state.state == 'idle'
+        assert process.signals == []
+
+    def test_a_worker_that_keeps_running_after_its_pipe_broke_is_terminated(self, manager):
+        """
+        A worker that did not stop by itself is stopped, and that stop is its status
+
+        The grace the manager gives a worker after its pipe broke must not turn a
+        worker that is still there into a clean stop: it is terminated, and the
+        status the terminate produces is what the entry ends with.
+        """
+        process = _StuckProcess()
+        state = self.disconnect(manager, 'running', process, 'cfg_stuck')
+
+        assert process.signals == ['terminate']
+        assert state.state == 'error'
+
+    def test_an_exit_code_of_zero_ends_as_idle(self, manager):
+        """A worker that exited by itself with 0 was never a failure"""
+        state = self.disconnect(manager, 'running', _ExitedProcess(0), 'cfg_exit_zero')
+
+        assert state.state == 'idle'
+
+    def test_a_crash_is_an_error_even_under_a_stop_request(self, manager):
+        """An exit status that was read and is not 0 stays a failure of the worker"""
+        state = self.disconnect(manager, 'scheduler-stopping', _ExitedProcess(1), 'cfg_crash')
+
+        assert state.state == 'error'
+
+    @pytest.mark.parametrize('park_state', ['restarting', 'updating'])
+    def test_a_pending_restart_parks_the_entry(self, manager, park_state):
+        """The restart keeps its own state, whatever the exit status says"""
+        manager.park_state = park_state
+        state = self.disconnect(manager, 'scheduler-stopping', _LostStatusProcess(), 'cfg_parked',
+                                pending_restart=True)
+
+        assert state.state == park_state
+
+    def test_the_unreadable_status_is_logged(self, manager):
+        """
+        The status that could not be read is recorded with what is known
+
+        A failing worker that is reported as a clean stop must leave the
+        evidence behind: the process, whether it still looks alive and the
+        state the entry was stopping from are what a later investigation has.
+        """
+        with logger.mock_capture_writer() as capture:
+            self.disconnect(manager, 'scheduler-stopping', _LostStatusProcess(), 'cfg_lost_status')
+
+        assert capture.concat() == """\
+INFO | [WorkerManager] Graceful killing process: "cfg_lost_status"
+INFO | [WorkerManager] Worker did not terminate, force killing process: "cfg_lost_status"
+INFO | [WorkerManager] Worker still alive after force-kill: "cfg_lost_status"
+INFO | [WorkerManager] Worker stopped: cfg_lost_status, exitcode=None
+WARNING | [WorkerManager] No exit status to read for "cfg_lost_status": pid=4321, alive=True, state=scheduler-stopping
+"""
+
+
+class TestProcessWaitExit:
+    """Reading the exit status only once the process is reapable"""
+
+    @staticmethod
+    def state_with(process):
+        """
+        An entry holding the given process
+
+        Args:
+            process: Stand-in for the process of the worker
+
+        Returns:
+            WorkerState: The entry
+        """
+        state = WorkerState(mod='WorkerTestRun3', config='cfg_wait_exit', state='running')
+        state.process = process
+        return state
+
+    def test_no_process_has_no_status(self):
+        """An entry without a process has nothing to wait for"""
+        state = WorkerState(mod='WorkerTestRun3', config='cfg_no_process', state='running')
+
+        assert state.process_wait_exit(timeout=1) is None
+
+    def test_a_status_that_exists_is_read_at_once(self):
+        """A reaped process answers on the first read"""
+        state = self.state_with(_ExitedProcess(0))
+
+        assert state.process_wait_exit(timeout=1) == 0
+
+    def test_the_wait_ends_when_the_status_appears(self):
+        """A process that is still exiting is waited for, not abandoned"""
+        state = self.state_with(_ExitingProcess(exitcode=0, polls=3))
+
+        assert state.process_wait_exit(timeout=1) == 0
+
+    def test_a_status_that_never_appears_ends_at_the_deadline(self):
+        """The wait is bounded: an unreadable status does not hang the caller"""
+        state = self.state_with(_LostStatusProcess())
+
+        start = time.monotonic()
+        assert state.process_wait_exit(timeout=0.2) is None
+        assert 0.15 < time.monotonic() - start < 2.0
+
+    def test_the_default_timeout_reads_once(self):
+        """A call without a timeout does not wait, it only looks at the status"""
+        state = self.state_with(_ExitingProcess(exitcode=0, polls=2))
+
+        start = time.monotonic()
+        assert state.process_wait_exit() is None
+        assert time.monotonic() - start < 0.05
+
+    def test_the_poll_uses_the_precise_sleep(self, monkeypatch):
+        """The poll interval is passed to the precise sleep of the project
+
+        time.sleep() rounds a sub-millisecond remainder up to a whole
+        millisecond on Windows and quantizes the wake-up to the system timer
+        tick, which is the same order as the whole poll interval here.
+        """
+        from alasio.backend.worker import manager as manager_module
+
+        calls = []
+        monkeypatch.setattr(manager_module, 'sleep', calls.append)
+        state = self.state_with(_LostStatusProcess())
+
+        assert state.process_wait_exit(timeout=0.05) is None
+
+        assert calls
+        assert all(0 < seconds <= manager_module.EXIT_POLL_INTERVAL for seconds in calls)
+
+    def test_the_deadline_is_measured_with_the_high_resolution_clock(self, monkeypatch):
+        """The deadline does not depend on the 15.6ms tick of time.monotonic()
+
+        The whole timeout of a poll is a few tens of milliseconds, so a clock
+        that only advances on the system tick would stretch it by a tick. The
+        wait is driven by perf_counter(), which advances by the requested
+        duration of every poll.
+        """
+        from alasio.backend.worker import manager as manager_module
+
+        precise = [0.0]
+        calls = []
+
+        def fake_sleep(seconds):
+            calls.append(seconds)
+            precise[0] += seconds
+            if len(calls) > 100:
+                raise AssertionError('the wait did not follow perf_counter()')
+
+        # monotonic is frozen: a deadline read from it would never arrive
+        monkeypatch.setattr(manager_module.time, 'perf_counter', lambda: precise[0])
+        monkeypatch.setattr(manager_module.time, 'monotonic', lambda: 0.0)
+        monkeypatch.setattr(manager_module, 'sleep', fake_sleep)
+        state = self.state_with(_LostStatusProcess())
+
+        assert state.process_wait_exit(timeout=0.05) is None
+        assert precise[0] >= 0.05
+
+    def test_a_graceful_kill_of_a_gone_process_only_reads_its_status(self):
+        """A process that ended by itself is never signaled, its status is the answer"""
+        process = _ExitedProcess(0)
+        state = self.state_with(process)
+
+        assert state.process_graceful_kill() == 0
+        assert process.signals == []
+
+    def test_a_force_kill_of_a_gone_process_only_reads_its_status(self):
+        """A process that ended by itself is not killed again"""
+        process = _ExitedProcess(0)
+        state = self.state_with(process)
+
+        assert state.process_kill() == 0
+        assert process.signals == []
+
+    def test_an_unresponsive_process_is_escalated_to_kill(self):
+        """A process that ignores terminate() is killed, and the kill is its status"""
+        process = _UnresponsiveProcess()
+        state = self.state_with(process)
+
+        assert state.process_graceful_kill(terminate_timeout=0.05, kill_timeout=0.05) == -9
+        assert process.signals == ['terminate', 'kill']
 
 
 # ============================================================================

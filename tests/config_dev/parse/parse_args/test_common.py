@@ -10,7 +10,7 @@ import pytest
 from msgspec import UNSET
 
 from alasio.config_dev.parse.base import DefinitionError
-from alasio.config_dev.parse.parse_args import preprocess_arg
+from alasio.config_dev.parse.parse_args import ArgData, preprocess_arg
 from tests.config_dev.parse.parse_args.helpers import parse_arg
 
 
@@ -95,7 +95,7 @@ class TestRange:
     def test_int_range(self):
         arg = parse_arg("""\
 dt: input-int
-value: 1000
+value: 10
 range: 1~15
 """)
         assert arg.ge == 1
@@ -111,6 +111,35 @@ range: 0.0~1.0
         assert arg.ge == 0.0
         assert arg.le == 1.0
 
+    def test_default_value_must_be_in_range(self):
+        """A default value outside of the range would fail when a config loads."""
+        with pytest.raises(DefinitionError) as e:
+            parse_arg("""\
+dt: input-int
+value: 1000
+range: 1~15
+""")
+        assert e.value.msg == 'Default value 1000 violates le=15'
+
+    def test_range_on_literal_is_rejected(self):
+        """A literal datatype has no range, its value is an item of "option"."""
+        with pytest.raises(DefinitionError) as e:
+            parse_arg("""\
+value: option-a
+option: [option-a, option-b]
+range: 0~1
+""")
+        assert e.value.msg == 'datatype "select" is a literal, it must not have range constraint "ge"'
+
+    def test_range_needs_a_numeric_value(self):
+        with pytest.raises(DefinitionError) as e:
+            parse_arg("""\
+dt: input
+value: text
+range: 0~1
+""")
+        assert e.value.msg == 'Range constraint "ge" requires a numeric default value, got \'text\''
+
     def test_invalid_range(self):
         with pytest.raises(DefinitionError) as e:
             parse_arg("""\
@@ -119,6 +148,46 @@ value: 5
 range: a~b
 """)
         assert 'Cannot parse range "a~b"' in str(e.value)
+
+    def test_range_is_removed_after_expansion(self):
+        """`range` is a yaml-only shorthand, it must not reach ArgData."""
+        arg = parse_arg("""\
+dt: input-int
+value: 5
+range: 1~15
+""")
+        assert arg.to_dict() == {
+            'dt': 'input-int', 'value': 5, 'ge': 1, 'le': 15,
+        }
+
+    def test_input_data_is_not_mutated(self):
+        data = {'dt': 'input-int', 'value': 5, 'range': '1~15'}
+        arg = ArgData.from_arg_data(data)
+        assert data == {'dt': 'input-int', 'value': 5, 'range': '1~15'}
+        assert arg.ge == 1
+        assert arg.le == 15
+
+
+class TestUnknownFields:
+    """ArgData forbids unknown fields, a typo must not be dropped silently."""
+
+    def test_unknown_field_is_rejected(self):
+        with pytest.raises(DefinitionError) as e:
+            parse_arg("""\
+dt: input
+value: text
+modo: typo
+""")
+        assert e.value.msg == 'ValidationError(Object contains unknown field `modo`)'
+
+    def test_unknown_field_in_shorthand_is_rejected(self):
+        with pytest.raises(DefinitionError) as e:
+            parse_arg("""\
+value: 1
+range: 1~15
+modo: typo
+""")
+        assert e.value.msg == 'ValidationError(Object contains unknown field `modo`)'
 
 
 class TestLayout:

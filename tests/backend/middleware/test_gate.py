@@ -5,15 +5,19 @@ The middleware is the single web entrance: rule A (no password -> only
 electron token passes), rule B (lan mode -> lan sources only) and the
 login layer (JWT cookie) run inside one middleware in a fixed order
 (admission first, then login). It must never be split or reordered.
+
+The login layer keeps the endpoints that authenticate themselves and the
+requests carrying a valid electron token out: that token is the desktop
+client's own credential, because the page it embeds lives in an iframe of
+app://bundle where the browser never stores the SameSite=strict cookie.
 """
 
 import json
 
 import pytest
-from starlette.datastructures import URL
 
 from alasio.backend.auth.auth import JWT_MANAGER
-from alasio.backend.middleware.gate import DeploymentGateMiddleware
+from alasio.backend.middleware.gate import DeploymentGateMiddleware, _request_netloc
 from alasio.backend.mpipe.token_backend import token_table
 
 
@@ -173,7 +177,8 @@ def auth_env(monkeypatch):
     # setitem on the instance dict shadows the cached_property without
     # evaluating it: setattr() reads the attribute to check it exists, which
     # would open the user deploy.yaml and gui.db
-    monkeypatch.setitem(JWT_MANAGER.__dict__, 'secret', b'test-secret')
+    # 32 bytes or more: pyjwt warns below the RFC 7518 Section 3.2 minimum for HS256
+    monkeypatch.setitem(JWT_MANAGER.__dict__, 'secret', b'test-secret' * 4)
     monkeypatch.setitem(JWT_MANAGER.__dict__, 'pwd', '')
     yield
     monkeypatch.undo()
@@ -285,16 +290,18 @@ class TestRuleAWeakPassword:
     @pytest.mark.trio
     async def test_weak_password_with_electron_token_passes(self, gate, monkeypatch):
         # treated as unset: the local electron client still passes rule A.
-        # /api/test with the electron token but no JWT is admitted by rule
-        # A and then answered 401 by the login layer (not the 403 refusal)
+        # /api/test with the electron token but no JWT passes the login
+        # layer too: the token is the desktop client's own credential (it
+        # embeds the page in an iframe of app://bundle, a third-party
+        # context that never stores the SameSite=strict login cookie)
         set_password(monkeypatch, self.WEAK)
         token_table.seed_from_supervisor(('tok1',))
         mw, app = gate()
         sent = await call_gate(mw, make_http_scope(headers=[(b'x-alasio-token', b'tok1')]))
-        assert status_of(sent) == 401
-        assert not app.called
-        # the real electron flow renews its JWT through /api/auth/renew,
-        # which is exempt from the login layer: rule A is the only gate
+        assert status_of(sent) == 200
+        assert app.called
+        # the renewal endpoint stays exempt as well (it is what issues the
+        # JWT a remote browser holds)
         sent = await call_gate(mw, make_http_scope(
             path='/api/auth/renew', headers=[(b'x-alasio-token', b'tok1')]))
         assert status_of(sent) == 200
@@ -393,6 +400,30 @@ class TestLoginLayer:
         assert app.called
 
     @pytest.mark.trio
+    async def test_electron_token_skips_login(self, gate, monkeypatch):
+        # The desktop client embeds the page in an iframe of app://bundle, a
+        # third-party context where the browser never stores the
+        # SameSite=strict login cookie: its requests carry the electron
+        # token instead, the same proof the ws handshake accepts
+        set_password(monkeypatch)
+        token_table.seed_from_supervisor(('tok1',))
+        mw, app = gate()
+        await call_gate(mw, make_http_scope(headers=[(b'x-alasio-token', b'tok1')]))
+        assert app.called
+
+    @pytest.mark.trio
+    async def test_forged_electron_token_still_401(self, gate, monkeypatch):
+        # the exemption follows the token table, not the header: a cross-site
+        # page cannot forge the header into a capability, and it carries no
+        # JWT cookie either (SameSite=strict), so a cross-site request is
+        # refused exactly as it was before
+        set_password(monkeypatch)
+        mw, app = gate()
+        sent = await call_gate(mw, make_http_scope(headers=[(b'x-alasio-token', b'forged')]))
+        assert status_of(sent) == 401
+        assert not app.called
+
+    @pytest.mark.trio
     async def test_ws_scope_not_login_gated(self, gate, monkeypatch):
         # the ws handshake validates the JWT inside serve() so it can
         # close(4001) after accept; the middleware must pass it through
@@ -403,34 +434,63 @@ class TestLoginLayer:
         assert app.called
 
 
-def _host_header_is_sanitized():
-    """
-    Check whether starlette drops a host header that fails its host
-    syntax check (1.0.1+) and builds the url from the server address.
+class TestRequestNetloc:
+    """The authority of the redirect target: the host header or the server."""
 
-    Returns:
-        bool: True when a malformed host header still builds a valid url
-    """
-    scope = {
-        'type': 'http',
-        'scheme': 'http',
-        'path': '/api/test',
-        'query_string': b'',
-        'headers': [(b'host', b'[bad')],
-        'server': ('127.0.0.1', 22267),
-    }
-    try:
-        URL(scope=scope).hostname
-    except ValueError:
-        # the raw header value was used as the url host and it is not
-        # a host, so the url cannot be built at all
-        return False
-    return True
+    @pytest.mark.parametrize('host_header, netloc', [
+        # a reg name, with or without the port
+        (b'example.com', 'example.com'),
+        (b'example.com:22267', 'example.com:22267'),
+        (b'127.0.0.1:22267', '127.0.0.1:22267'),
+        # a bracketed ipv6 address keeps its brackets
+        (b'[::1]', '[::1]'),
+        (b'[::1]:22267', '[::1]:22267'),
+        # the value is taken as sent, the case of the host included
+        (b'Example.COM:80', 'Example.COM:80'),
+    ])
+    def test_host_header(self, host_header, netloc):
+        """A host header that is an authority is the one of the target."""
+        scope = make_http_scope(headers=[(b'host', host_header)])
+        assert _request_netloc(scope) == netloc
 
+    @pytest.mark.parametrize('host_header', [
+        # an unclosed ipv6 bracket
+        b'[bad',
+        # a space, not a host character
+        b'a b',
+        # a path, a userinfo, a query and a fragment hidden in the header
+        b'evil.com/x', b'user@evil.com', b'example.com?x=1', b'example.com#f',
+        # a port out of range, an empty and a unicode host
+        b'example.com:99999', b'', '例子.测试'.encode('utf-8'),
+    ])
+    def test_invalid_host_header_falls_back_to_the_server(self, host_header):
+        """A header that is not an authority is dropped, the server is used."""
+        scope = make_http_scope(headers=[(b'host', host_header)])
+        assert _request_netloc(scope) == '127.0.0.1:22267'
 
-# 0.44.0 (the last upstream version with python 3.8 support) keeps the
-# raw host header, 1.6.0 (the py38deps backport) sanitizes it
-HOST_HEADER_SANITIZED = _host_header_is_sanitized()
+    def test_no_host_header(self):
+        """Without a host header the server address is the authority."""
+        assert _request_netloc(make_http_scope()) == '127.0.0.1:22267'
+
+    def test_nothing_to_redirect_to(self):
+        """Neither a usable header nor a server address: no authority."""
+        assert _request_netloc(make_http_scope(headers=[(b'host', b'[bad')], server=None)) is None
+        assert _request_netloc(make_http_scope(server=None)) is None
+
+    @pytest.mark.parametrize('scheme, server, netloc', [
+        # a bare ipv6 address gets the brackets an authority needs
+        ('http', ('::1', 22267), '[::1]:22267'),
+        ('ws', ('::1', 22267), '[::1]:22267'),
+        # the port of the scheme is left out, like the url of the scope
+        ('http', ('127.0.0.1', 80), '127.0.0.1'),
+        ('http', ('127.0.0.1', 81), '127.0.0.1:81'),
+        # an already bracketed address is kept as it is
+        ('http', ('[::1]', 22267), '[::1]:22267'),
+    ])
+    def test_server_netloc(self, scheme, server, netloc):
+        """The server address of the scope builds the authority."""
+        scope = make_http_scope(scheme=scheme, server=server)
+        assert _request_netloc(scope) == netloc
 
 
 class TestRuleC:
@@ -469,32 +529,20 @@ class TestRuleC:
         assert headers[b'location'] == b'https://example.com:22267/api/test?x=1&y=2'
         assert not app.called
 
-    @pytest.mark.skipif(HOST_HEADER_SANITIZED, reason='starlette 1.0.1+ sanitizes the host header')
-    @pytest.mark.trio
-    async def test_redirect_refused_when_host_malformed(self, gate):
-        # 0.44.0 keeps the raw host header value: a malformed one cannot
-        # build a redirect target, the request is refused with 400
-        mw, app = gate(ssl=True)
-        sent = await call_gate(mw, make_http_scope(
-            scheme='http',
-            headers=[(b'host', b'[bad')],
-        ))
-        assert status_of(sent) == 400
-        assert not app.called
-
-    @pytest.mark.skipif(not HOST_HEADER_SANITIZED, reason='starlette < 1.0.1 keeps the raw host header')
     @pytest.mark.parametrize('host_header', [
         # a malformed host header, an unclosed ipv6 bracket
         b'[bad',
-        # a host header http cannot carry: the host is the punycode of
-        # the idn (0.44.0 echoes the raw utf-8 form into the url)
+        # a host header http cannot carry: the host is the punycode of the idn
         '例子.测试'.encode('utf-8'),
+        # a header that would move the redirect target out of the host
+        b'evil.com/x',
+        b'user@evil.com',
     ])
     @pytest.mark.trio
     async def test_redirect_ignores_invalid_host(self, gate, host_header):
-        # 1.0.1+ drops a host header that fails its host syntax check and
-        # builds the url from the server address: the connection is still
-        # upgraded, the header value never reaches the redirect target
+        # a host header that is not a host is dropped and the url is built
+        # from the server address: the connection is still upgraded, the
+        # header value never reaches the redirect target
         mw, app = gate(ssl=True)
         sent = await call_gate(mw, make_http_scope(
             scheme='http',
@@ -503,6 +551,24 @@ class TestRuleC:
         status_code, headers = redirect_of(sent)
         assert status_code == 308
         assert headers[b'location'] == b'https://127.0.0.1:22267/api/test'
+        assert not app.called
+
+    @pytest.mark.parametrize('host_header, location', [
+        (b'example.com:22267', b'https://example.com:22267/api/test'),
+        (b'[::1]:22267', b'https://[::1]:22267/api/test'),
+    ])
+    @pytest.mark.trio
+    async def test_redirect_keeps_a_valid_host(self, gate, host_header, location):
+        # a host header that is a host (a bracketed ipv6 address included)
+        # is the authority of the redirect target
+        mw, app = gate(ssl=True)
+        sent = await call_gate(mw, make_http_scope(
+            scheme='http',
+            headers=[(b'host', host_header)],
+        ))
+        status_code, headers = redirect_of(sent)
+        assert status_code == 308
+        assert headers[b'location'] == location
         assert not app.called
 
     @pytest.mark.trio
@@ -515,17 +581,18 @@ class TestRuleC:
         assert not app.called
 
     @pytest.mark.trio
-    async def test_redirect_refused_when_server_address_is_bare_ipv6(self, gate):
-        # a bare ipv6 server address yields no hostname (an url
-        # authority needs the brackets), the url would be unusable:
-        # 400 instead of a redirect target the browser cannot resolve
+    async def test_redirect_of_a_bare_ipv6_server_address(self, gate):
+        # a bare ipv6 address of the server is bracketed by the middleware:
+        # the redirect target is a usable url the browser can resolve
         mw, app = gate(ssl=True)
         sent = await call_gate(mw, make_http_scope(
             scheme='http',
             headers=[(b'host', b'[bad')],
             server=('::1', 22267),
         ))
-        assert status_of(sent) == 400
+        status_code, headers = redirect_of(sent)
+        assert status_code == 308
+        assert headers[b'location'] == b'https://[::1]:22267/api/test'
         assert not app.called
 
     @pytest.mark.trio

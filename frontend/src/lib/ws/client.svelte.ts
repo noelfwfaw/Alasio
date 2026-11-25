@@ -1,4 +1,4 @@
-import { browser } from "$app/environment";
+import { browser } from "$app/env";
 import { goto, invalidateAll } from "$app/navigation";
 import { deepDel, deepSet } from "./deep";
 import type { RequestEvent, ResponseEvent } from "./event";
@@ -104,10 +104,12 @@ export class WebsocketManager {
   connectionGeneration = $state(0);
 
   /**
-   * Tracks which topics have received their initial 'full' message,
-   * serving as a stable signal for subscription readiness.
-   * Key is topic name, value is boolean. This is decoupled from the topic data itself
-   * to avoid triggering effects on high-frequency data updates.
+   * Tracks which topics are usable on the live connection: their subscribe
+   * message has been sent on it, so the server accepts rpcs of the topic from
+   * that point on. Cleared when the connection drops, so a resilient operation
+   * sees the re-subscription of the next connection as a new one. Decoupled
+   * from the topic data itself to avoid triggering effects on high-frequency
+   * data updates.
    */
   topicReady = $state<Record<string, boolean>>({});
 
@@ -222,7 +224,10 @@ export class WebsocketManager {
       // re-subscriptions below refill every topic from the new session.
       this.#clearAll();
 
-      // Immediately mark all default topics as "ready".
+      // A connection subscribes from scratch: the default topics are already
+      // registered server-side, the active subscriptions are re-sent below.
+      // A topic counts as ready (rpcs for it are accepted) once its subscribe
+      // message is on the wire, since both travel in order over one socket.
       for (const topic of this.#options.defaultSubscriptions) {
         this.topicReady[topic] = true;
       }
@@ -231,13 +236,18 @@ export class WebsocketManager {
       for (const topic in this.subscriptions) {
         if (this.subscriptions[topic] > 0) {
           this.#send({ t: topic });
+          this.topicReady[topic] = true;
         }
       }
 
-      // Send any messages that were queued while disconnected.
-      while (this.#messageQueue.length > 0) {
-        const message = this.#messageQueue.shift();
-        if (message) this.#send(message);
+      // Send the messages that were queued while disconnected. The queue is
+      // taken as a whole: a send may queue again (the socket closed in the
+      // meantime), and the message must land in the queue of the next
+      // connection instead of looping through this one.
+      const queued = this.#messageQueue;
+      this.#messageQueue = [];
+      for (const message of queued) {
+        this.#send(message);
       }
     };
 
@@ -747,22 +757,57 @@ export class WebsocketManager {
     this.#reconnectTimeout = setTimeout(() => this.connect(), delay);
   }
 
+  /** The socket of the live connection, or null when there is none. */
+  get #openSocket(): WebSocket | null {
+    const ws = this.#ws;
+    return ws !== null && ws.readyState === WebSocket.OPEN ? ws : null;
+  }
+
   /**
-   * Sends a payload to the WebSocket server or queues it if disconnected.
+   * Whether a connection is open. An rpc can only be answered while one is, and
+   * an rpc that runs out of time afterwards was lost with its connection rather
+   * than left unanswered by the server.
+   */
+  isConnected(): boolean {
+    return this.#openSocket !== null;
+  }
+
+  /**
+   * Sends a payload to the WebSocket server, or queues it until a connection
+   * is open.
+   *
+   * Args:
+   *     payload (RequestEvent): Message to send
    */
   #send(payload: RequestEvent) {
-    if (this.#ws?.readyState === WebSocket.OPEN) {
-      try {
-        const message = JSON.stringify(payload);
-        this.#ws.send(this.#encoder.encode(message));
-      } catch (e) {
-        console.error("Failed to serialize or send message:", payload, e);
-      }
-    } else {
+    const ws = this.#openSocket;
+    if (ws === null) {
       // Queue the message if the connection is not open.
       this.#messageQueue.push(payload);
       this.connect();
+      return;
     }
+    try {
+      ws.send(this.#encoder.encode(JSON.stringify(payload)));
+    } catch (e) {
+      console.error("Failed to serialize or send message:", payload, e);
+    }
+  }
+
+  /**
+   * Whether the subscription of a topic is established on the live connection:
+   * its subscribe message has been sent on it. Both messages travel in order
+   * over one socket, so the server accepts rpcs of the topic from that point
+   * on. Reactive: reading it inside an effect follows the connection changes.
+   *
+   * Args:
+   *     topic (str): Topic name
+   *
+   * Returns:
+   *     bool: True when the topic is usable on the current connection
+   */
+  isTopicReady(topic: string): boolean {
+    return this.topicReady[topic] === true;
   }
 
   // --- Implementation of RpcContext ---
@@ -798,8 +843,11 @@ export class WebsocketManager {
     // the `onopen` handler is responsible for sending the initial subscription message.
     // For testing purposes, `forceSend` allows bypassing this check.
     if (forceSend || (currentCount === 0 && !this.#options.defaultSubscriptions.includes(topic))) {
-      if (this.#ws?.readyState === WebSocket.OPEN) {
+      // While the connection is down the subscribe waits for onopen, which
+      // sends it before anything else queued.
+      if (this.isConnected()) {
         this.#send({ t: topic });
+        this.topicReady[topic] = true;
       }
     }
   }
@@ -822,7 +870,16 @@ export class WebsocketManager {
     const shouldSendUnsubMessage = forceSend || (currentCount === 1 && !forceSend);
 
     if (shouldSendUnsubMessage) {
-      this.#send({ t: topic, o: "unsub" });
+      // Only the live connection needs to hear about the unsub: a topic is
+      // subscribed per connection, so one that is not open has nothing to
+      // cancel, and its subscriptions are rebuilt from `subscriptions` when it
+      // opens. Queuing the unsub would let it arrive *after* the subscribe of a
+      // page that was re-mounted before the socket opened, silently dropping
+      // the fresh subscription (the next rpc then fails with "Cannot do RPC
+      // before subscribing topic").
+      if (this.isConnected()) {
+        this.#send({ t: topic, o: "unsub" });
+      }
 
       // If the subscription count is now 0, clean up the topic data
       if ((this.subscriptions[topic] || 0) <= 0) {
@@ -839,7 +896,12 @@ export class WebsocketManager {
   };
 
   /**
-   * A raw send method for direct use, e.g., in a testing UI.
+   * A raw send method for direct use, e.g., in a testing UI. It is the one
+   * caller that queues while disconnected: an rpc is never queued (see
+   * createRpc), and a subscription is re-sent by the connection itself.
+   *
+   * Args:
+   *     payload (RequestEvent): Message to send
    */
   sendRaw(payload: RequestEvent) {
     this.#send(payload);
